@@ -495,15 +495,22 @@ struct MoE_Scatter_Prefix_Kernel {
             simd<int32_t, 32> counts = gather<int32_t, 32>(
                 experts_token_count + base, lane * (uint32_t)sizeof(int32_t), m);
             counts.merge(0, !m);
+
+            // The scan is serial, but its results are not: accumulate the
+            // exclusive offsets into a register and commit the chunk as one
+            // masked scatter rather than a dword store per expert. At 512
+            // experts that is 16 messages instead of 512.
+            simd<uint32_t, 32> starts = 0;
             #pragma unroll
             for (int i = 0; i < 32; i++) {
                 if (i >= valid) break;
                 int32_t c = counts[i];
                 if (c > max_count) max_count = c;
-                simd<uint32_t, 1> val = running_sum;
-                block_store<uint32_t, 1>(expert_start + base + i, val);
+                starts[i] = running_sum;
                 running_sum += (uint32_t)c;
             }
+            scatter<uint32_t, 32>(expert_start + base,
+                                  lane * (uint32_t)sizeof(uint32_t), starts, m);
         }
         simd<uint32_t, 1> total_val = running_sum;
         block_store<uint32_t, 1>(expert_start + num_experts, total_val);

@@ -94,3 +94,27 @@ def test_header_masks_the_tail_load(path):
     assert "simd_mask<32>m=lane>=(uint32_t)valid" not in t, (
         "inverted mask: this loads the lanes past num_experts"
     )
+
+
+@pytest.mark.parametrize("path", _HEADERS, ids=lambda p: p.parents[3].name)
+def test_prefix_commits_each_chunk_as_one_scatter(path):
+    """The scan is serial; its stores are not.
+
+    A dword store per expert is one message each, and the kernel runs as a
+    single work-item between two full-width kernels on every MoE layer, so the
+    whole grid waits on it. num_experts reaches 512 here. Accumulating the
+    offsets in a register and committing 32 lanes at a time keeps the scan
+    order identical while cutting the message count by 32x.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    src = path.read_text()
+    start = src.index("struct MoE_Scatter_Prefix_Kernel")
+    end = src.index("struct", start + 10)
+    t = tokens(src[start:end])
+    assert "block_store<uint32_t,1>(expert_start+base+i," not in t, (
+        "per-expert dword store is back; the chunk must commit as one scatter"
+    )
+    assert "scatter<uint32_t,32>(expert_start+base," in t, (
+        "the chunk's offsets must be committed with a masked 32-lane scatter"
+    )
