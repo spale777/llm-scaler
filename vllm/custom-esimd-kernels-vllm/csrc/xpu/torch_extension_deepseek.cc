@@ -52,6 +52,11 @@ void launch_act_quant(
     double qmax,
     double amax_floor);
 
+void launch_o_group_proj(
+    torch::Tensor& x,
+    torch::Tensor& w,
+    torch::Tensor& out);
+
 void launch_noaux_tc_topk(
     torch::Tensor& logits, 
     torch::Tensor& bias, 
@@ -289,6 +294,29 @@ std::tuple<torch::Tensor, torch::Tensor> deepseek_v41_act_quant(
     return std::make_tuple(y, s);
 }
 
+torch::Tensor deepseek_v41_o_group_proj(
+    torch::Tensor x,
+    torch::Tensor w)
+{
+    CHECK_INPUT(x);
+    CHECK_INPUT(w);
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 &&
+                w.scalar_type() == torch::kFloat32,
+                "deepseek_v41_o_group_proj: x and w must be Float32");
+    TORCH_CHECK(x.dim() == 3, "expected x [T, G, D], got ", x.dim(), "D");
+    // Block diagonal: one [D, R] weight per group, not one dense
+    // [G*D, G*R]. Passing a dense weight here would mix the groups.
+    TORCH_CHECK(w.dim() == 3, "expected w [G, R, D], got ", w.dim(), "D");
+    TORCH_CHECK(w.size(0) == x.size(1),
+                "w has ", w.size(0), " groups for x's ", x.size(1));
+    TORCH_CHECK(w.size(2) == x.size(2),
+                "w per-group input dim ", w.size(2), " != x's ", x.size(2));
+
+    auto out = torch::empty({x.size(0), x.size(1), w.size(1)}, x.options());
+    launch_o_group_proj(x, w, out);
+    return out;
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
     m.def("deepseek_v41_fp4_gemm", &deepseek_v41_fp4_gemm);
     m.def("deepseek_v41_noaux_tc_topk", &deepseek_v41_noaux_tc_topk);
@@ -297,6 +325,7 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
     m.def("deepseek_v41_sparse_attn", &deepseek_v41_sparse_attn);
     m.def("deepseek_v41_engram_gate", &deepseek_v41_engram_gate);
     m.def("deepseek_v41_act_quant", &deepseek_v41_act_quant);
+    m.def("deepseek_v41_o_group_proj", &deepseek_v41_o_group_proj);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

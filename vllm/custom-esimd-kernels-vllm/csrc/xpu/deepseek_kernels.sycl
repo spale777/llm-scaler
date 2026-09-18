@@ -13,6 +13,7 @@
 #include "../deepseek_v41/sparse_attn.h"
 #include "../deepseek_v41/engram_gate.h"
 #include "../deepseek_v41/act_quant.h"
+#include "../deepseek_v41/o_groups.h"
 
 using namespace sycl::ext::intel::esimd;
 using fp16 = sycl::half;
@@ -279,4 +280,36 @@ void launch_act_quant(torch::Tensor& x, torch::Tensor& y, torch::Tensor& s,
                                "32, 64 or 128, got ", group_size);
     }
 #undef DSQ_LAUNCH
+}
+
+
+void launch_o_group_proj(torch::Tensor& x, torch::Tensor& w,
+                         torch::Tensor& out) {
+    const int T = (int)x.size(0);
+    const int G = (int)x.size(1);
+    const int D = (int)x.size(2);
+    const int R = (int)w.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    const float* xp = reinterpret_cast<const float*>(x.data_ptr());
+    const float* wp = reinterpret_cast<const float*>(w.data_ptr());
+    float* op = reinterpret_cast<float*>(out.data_ptr());
+
+    switch (D) {
+        case 512:
+            dsv41_ogroups::launch_o_group_proj<512>(sq, xp, wp, op, T, G, R);
+            break;
+        case 256:
+            dsv41_ogroups::launch_o_group_proj<256>(sq, xp, wp, op, T, G, R);
+            break;
+        case 128:
+            dsv41_ogroups::launch_o_group_proj<128>(sq, xp, wp, op, T, G, R);
+            break;
+        case 64:
+            dsv41_ogroups::launch_o_group_proj<64>(sq, xp, wp, op, T, G, R);
+            break;
+        default:
+            TORCH_CHECK(false, "deepseek_v41_o_group_proj: per-group input dim "
+                               "must be 64, 128, 256 or 512, got ", D);
+    }
 }

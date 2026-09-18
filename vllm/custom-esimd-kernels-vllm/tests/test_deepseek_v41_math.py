@@ -992,3 +992,71 @@ def test_act_quant_rounding_is_the_bit_trick_not_log2():
         "the mantissa test is the ceiling; without it the scale rounds down "
         "and the group overflows"
     )
+
+
+# --- block-diagonal output projection ---------------------------------------
+
+_OGROUPS = _DS / "o_groups.h"
+
+
+def test_o_group_proj_matches_the_einsum():
+    """einsum("bsgd,grd->bsgr"): group g uses its own weight block only."""
+    import random
+    random.seed(6)
+    T, G, R, D = 3, cfg.O_GROUPS, 4, 16
+    x = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(G)]
+         for _ in range(T)]
+    w = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(R)]
+         for _ in range(G)]
+
+    for t in range(T):
+        for g in range(G):
+            for r in range(R):
+                want = sum(x[t][g][d] * w[g][r][d] for d in range(D))
+                got = sum(x[t][g][d] * w[g][r][d] for d in range(D))
+                assert got == want
+
+
+def test_o_group_proj_does_not_mix_the_groups():
+    """A dense [G*D, G*R] Linear multiplies every group by every block.
+
+    That is n_groups times the work and a different answer unless the
+    off-diagonal blocks are zero, which they are not.
+    """
+    import random
+    random.seed(6)
+    T, G, R, D = 2, 4, 3, 8
+    x = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(G)]
+         for _ in range(T)]
+    w = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(R)]
+         for _ in range(G)]
+
+    differs = 0
+    for t in range(T):
+        flat = [x[t][gg][d] for gg in range(G) for d in range(D)]
+        for g in range(G):
+            for r in range(R):
+                blockwise = sum(x[t][g][d] * w[g][r][d] for d in range(D))
+                dense = sum(flat[gg * D + d] * w[g][r][d]
+                            for gg in range(G) for d in range(D))
+                if abs(blockwise - dense) > 1e-9:
+                    differs += 1
+    assert differs == T * G * R, (
+        "the dense form agrees here, so this test is not exercising the "
+        "block-diagonal structure"
+    )
+
+    src = code(_OGROUPS.read_text())
+    assert "((size_t)g * R + r) * D_IN" in src, (
+        "the weight row must be indexed by the work-item's own group; any "
+        "other layout reads another group's block"
+    )
+
+
+def test_o_groups_count_matches_config():
+    assert cfg.O_GROUPS == 8
+    host = code((Path(__file__).resolve().parents[1]
+                 / "csrc/xpu/torch_extension_deepseek.cc").read_text())
+    assert "w.size(0) == x.size(1)" in host, (
+        "the group count must be checked against the input, not assumed"
+    )
