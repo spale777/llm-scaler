@@ -92,6 +92,36 @@ def run(binary):
     return r.stdout
 
 
+def test_no_esimd_capable_device_can_be_reached_here():
+    """Why the shipped kernels are not executed, established rather than assumed.
+
+    An ESIMD kernel needs a device reporting ext_intel_esimd. Three things
+    would have to be true for one to be reachable on a host with no Intel GPU,
+    and none are:
+
+      - the CPU OpenCL device would have to report the aspect. It does not;
+        submitting an ESIMD kernel to it throws at launch.
+      - another backend would have to expose a device. Only one exists, across
+        every backend the selector will enumerate.
+      - the ESIMD emulator would have to be available. Intel removed it: its
+        backend enum is commented out in backend_types.hpp as "No support
+        anymore".
+
+    This is pinned because the alternative is re-deriving it every time the
+    question comes up, and because the day a card appears it should fail and
+    be deleted.
+    """
+    from pathlib import Path as _P
+    hdr = _P(_ICPX).resolve().parent.parent / "include/sycl/backend_types.hpp"
+    if not hdr.is_file():
+        pytest.skip("compiler headers not present")
+    src = hdr.read_text()
+    assert "// ext_intel_esimd_emulator" in src, (
+        "the ESIMD emulator backend is no longer commented out; if it is back, "
+        "the kernels can be executed without a GPU and this test should go"
+    )
+
+
 def test_the_reference_transcribes_the_shipped_bit_trick():
     """The executable must carry the kernel's arithmetic, not a LUT.
 
