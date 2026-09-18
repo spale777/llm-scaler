@@ -24,8 +24,14 @@ _POW2_TAILS = (8, 16, 32, 64, 128)
 def _hw_threads():
     """Read the occupancy target out of the header, so the mirror cannot
     drift from the dispatcher it stands in for."""
-    m = re.search(r"BMG_HW_THREADS\s*=\s*(\d+)", _HEADERS[0].read_text())
-    assert m, "BMG_HW_THREADS not found in fp8_GEMV_bmg.h"
+    # The constant lives in bmg_occupancy.h, shared by every dispatcher that
+    # sizes a grid against the thread count. It is now the fallback for when the
+    # driver will not report the Xe core count; the mirror below models that
+    # fallback, which is B70's figure.
+    occ = _HEADERS[0].parent / "bmg_occupancy.h"
+    src = occ.read_text() if occ.exists() else _HEADERS[0].read_text()
+    m = re.search(r"BMG_HW_THREADS\s*=\s*(\d+)", src)
+    assert m, "BMG_HW_THREADS not found in bmg_occupancy.h"
     return int(m.group(1))
 
 

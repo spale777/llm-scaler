@@ -4,6 +4,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include "bmg_occupancy.h"
 #include <cstdlib>
 
 using namespace sycl::ext::intel::esimd;
@@ -1409,7 +1410,7 @@ inline void dpas_v7_auto_dispatch(
     // Target ~320-640 total threads. K_THREADS=4 sweet spot for most shapes,
     // but K_THREADS=2 better for large N (N>2560) to avoid SLM reduction overhead.
     // K_THREADS=8 tested and was worse (too much SLM reduction cost).
-    int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
+    int k_threads = std::max(1, std::min(4, bmg_hw_threads(q) / std::max(n_wgs, 1)));
     // Fixup must precede the walk, and the walk halves: k_threads stays in
     // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
@@ -1699,7 +1700,7 @@ inline void dpas_v11_auto_dispatch(
     // For small N, fall back to 1 (= V9 behavior)
     int n_wgs = (n_16 + n_threads - 1) / n_threads;
 
-    int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs * n_threads, 1)));
+    int k_threads = std::max(1, std::min(4, bmg_hw_threads(q) / std::max(n_wgs * n_threads, 1)));
     // Fixup before the walk, and halve -- same invariant as the V9 site, and it
     // must also hold across the k_threads*n_threads > 16 loop below.
     if (k_threads == 3) k_threads = 2;
@@ -3401,7 +3402,7 @@ inline void dpas_v13_auto_dispatch(
     sycl::queue& q) {
     int m_tiles = ((int)M + 7) / 8;
     int n_wgs = ((int)N + 15) / 16;
-    int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
+    int k_threads = std::max(1, std::min(4, bmg_hw_threads(q) / std::max(n_wgs, 1)));
     // Fixup must precede the walk, and the walk halves: k_threads stays in
     // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
@@ -3657,7 +3658,7 @@ inline void dpas_v10_auto_dispatch(
         n_wgs = ((int)N + n_per_wg - 1) / n_per_wg;
     }
 
-    int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
+    int k_threads = std::max(1, std::min(4, bmg_hw_threads(q) / std::max(n_wgs, 1)));
     // Fixup must precede the walk, and the walk halves: k_threads stays in
     // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
@@ -3745,7 +3746,7 @@ inline void dpas_v9_auto_dispatch(
     sycl::queue& q) {
     int m_tiles = ((int)M + 7) / 8;
     int n_wgs = ((int)N + 15) / 16;
-    int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
+    int k_threads = std::max(1, std::min(4, bmg_hw_threads(q) / std::max(n_wgs, 1)));
     // Fixup must precede the walk, and the walk halves: k_threads stays in
     // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;

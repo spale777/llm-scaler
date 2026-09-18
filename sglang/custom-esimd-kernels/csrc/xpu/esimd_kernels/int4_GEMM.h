@@ -3,6 +3,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include "bmg_occupancy.h"
 
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::esimd::xmx;
@@ -294,7 +295,7 @@ inline void GEMM_int4_pgrp_host(
     sycl::queue& q) {
     int m_tiles = ((int)M + 7) / 8;
     int n_wgs = ((int)N + 15) / 16;
-    int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
+    int k_threads = std::max(1, std::min(4, bmg_hw_threads(q) / std::max(n_wgs, 1)));
     while (k_threads > 1 && ((int)K % (k_threads * INT4_GEMM_GROUP_SIZE) != 0)) k_threads--;
     if (k_threads == 3) {
         // Avoid the 3-thread variant only after preserving whole scale groups

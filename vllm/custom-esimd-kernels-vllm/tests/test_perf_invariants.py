@@ -25,6 +25,22 @@ _OCCUPANCY = [
     _SGL / "xpu/esimd_kernels/fp8_GEMM_blockscale.h",
 ]
 
+# The thread target and its fallback live in one shared header per tree; the
+# dispatchers include it rather than each carrying a copy.
+_OCCUPANCY_HDR = [
+    _VLLM / "xpu/esimd_kernels/bmg_occupancy.h",
+    _SGL / "xpu/esimd_kernels/bmg_occupancy.h",
+]
+
+
+def _occ_text(path):
+    """The dispatcher's source plus the occupancy header it includes."""
+    src = path.read_text()
+    hdr = path.parent / "bmg_occupancy.h"
+    if hdr.exists() and "bmg_occupancy.h" in src:
+        src = hdr.read_text() + src
+    return src
+
 
 def _ids(p):
     return f"{p.parents[3].name}/{p.name}"
@@ -70,8 +86,7 @@ def test_occupancy_target_is_named_and_correct(path):
     """B70 is 32 Xe cores x 8 engines x 8 threads."""
     if not path.exists():
         pytest.skip(f"{path} not present")
-    src = path.read_text()
-    c = code(src)
+    c = code(_occ_text(path))
     assert re.search(r"BMG_HW_THREADS\s*=\s*\d+", c), (
         "occupancy target should be a named constant"
     )
@@ -96,7 +111,7 @@ def test_thread_target_is_read_from_the_device(path):
     """
     if not path.exists():
         pytest.skip(f"{path} not present")
-    c = code(path.read_text())
+    c = code(_occ_text(path))
     assert "max_compute_units" in c, (
         f"{path.name}: the thread target is not derived from the device, so a "
         "B60 is dispatched as though it were a B70"

@@ -1142,7 +1142,7 @@ def test_int4_gemm_k_split_never_overruns_the_row():
             "walk uses k_threads--); an extra write overrides the split the "
             "pins below describe"
         )
-        for needle in ("std::min(4, 640 / std::max(n_wgs, 1))",
+        for needle in ("std::min(4, bmg_hw_threads(q) / std::max(n_wgs, 1))",
                        "while (k_threads > 1 && ((int)K % (k_threads * "
                        "INT4_GEMM_GROUP_SIZE) != 0)) k_threads--;",
                        "k_threads = ((int)K % (2 * INT4_GEMM_GROUP_SIZE) == 0) "
@@ -1154,9 +1154,13 @@ def test_int4_gemm_k_split_never_overruns_the_row():
     assert any(p.exists() for p in _INT4_GEMM), "neither int4_GEMM.h is present"
 
     gs = 128
-    def k_threads(n, k):
+    # The host asks the device for its thread count now, so the sweep runs over
+    # every target a Battlemage part can report rather than one literal: the
+    # overrun property below must hold on B60 and B70 alike.
+    TARGETS = (1280, 2048)
+    def k_threads(n, k, target=2048):
         n_wgs = (n + 15) // 16
-        kt = max(1, min(4, 640 // max(n_wgs, 1)))
+        kt = max(1, min(4, target // max(n_wgs, 1)))
         while kt > 1 and k % (kt * gs) != 0:
             kt -= 1
         if kt == 3:
@@ -1164,9 +1168,10 @@ def test_int4_gemm_k_split_never_overruns_the_row():
         return kt
 
     bad = []
-    for n in (16, 64, 256, 512, 1024, 2048, 4096):
+    for target in TARGETS:
+      for n in (16, 64, 256, 512, 1024, 2048, 4096):
         for k in range(gs, 16385, gs):
-            kt = k_threads(n, k)
+            kt = k_threads(n, k, target)
             kpt = k // kt
             if kt * kpt != k:
                 bad.append((n, k, kt, "K not covered"))
@@ -1934,7 +1939,9 @@ def test_bmg_ladder_covers_every_arm_its_selector_emits(path):
     # counts. _select_bmg models the default, so that default must stay 2048
     # (B70) and the parameter must actually default to it -- otherwise the
     # sweep below describes a selector no device gets.
-    assert re.search(r"BMG_HW_THREADS = 2048", c), (
+    occ = path.parent / "bmg_occupancy.h"
+    occ_c = code(occ.read_text()) if occ.exists() else c
+    assert re.search(r"BMG_HW_THREADS = 2048", occ_c), (
         "BMG_HW_THREADS changed; _select_bmg hardcodes 2048"
     )
     assert "int hw_threads = BMG_HW_THREADS)" in c, (

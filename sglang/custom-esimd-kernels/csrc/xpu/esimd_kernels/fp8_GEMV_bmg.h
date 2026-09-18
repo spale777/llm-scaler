@@ -18,43 +18,7 @@
 #pragma once
 #include "utils.h"
 
-// B70 (BMG-G31) has 32 Xe cores x 8 vector engines x 8 hardware threads per
-// engine in small-GRF mode. K-split dispatch aims to fill that.
-static constexpr int BMG_HW_THREADS = 2048;
-
-// Threads per vector engine in small-GRF mode: the 64 KB register file holds
-// 128 registers per thread. -doubleGRF halves this, and a module built that
-// way wants half the target.
-static constexpr int BMG_THREADS_PER_XVE = 8;
-static constexpr int BMG_XVE_PER_CORE = 8;
-
-// Hardware thread count of the device this queue runs on.
-//
-// B60 and B70 are both Battlemage but differ in Xe core count, so a constant
-// sized for one under-splits K on the other. max_compute_units reports the Xe
-// cores, which is the figure that varies; the per-core geometry does not.
-// Cached per device: the query goes to the driver, and this sits on the decode
-// dispatch path.
-inline int bmg_hw_threads(sycl::queue& q) {
-    static thread_local sycl::device cached_dev;
-    static thread_local int cached = 0;
-    const sycl::device dev = q.get_device();
-    if (cached != 0 && dev == cached_dev) return cached;
-    int t = BMG_HW_THREADS;
-    try {
-        const uint32_t cores =
-            dev.get_info<sycl::info::device::max_compute_units>();
-        if (cores > 0) {
-            t = (int)cores * BMG_XVE_PER_CORE * BMG_THREADS_PER_XVE;
-        }
-    } catch (const sycl::exception&) {
-        // Keep the B70 figure when the driver will not report it.
-    }
-    cached_dev = dev;
-    cached = t;
-    return t;
-}
-
+#include "bmg_occupancy.h"
 
 template<int VL>
 SYCL_ESIMD_FUNCTION inline simd<float, VL> fp8_dequant_bmg(
