@@ -14,6 +14,7 @@ import pytest
 
 from srctext import code, tokens
 
+_ROOT = Path(__file__).resolve().parents[3]
 _DS = Path(__file__).resolve().parents[1] / "csrc/deepseek_v41"
 _DEQUANT = Path(__file__).resolve().parents[1] / "csrc/deepseek_v41/fp4_dequant.h"
 _LUT = _DS / "fp4_dequant.h"
@@ -1273,3 +1274,73 @@ def test_fused_runtime_refuses_a_routing_it_cannot_compute():
         "the fused runtime does not check the routing mode, so a noaux_tc "
         "config would be routed by a softmax kernel"
     )
+
+
+# --- the twin trees ---------------------------------------------------------
+
+_SGL_DS = _ROOT / "sglang/custom-esimd-kernels/csrc/deepseek_v41"
+
+
+def test_both_trees_carry_every_deepseek_kernel():
+    """A fix found in one tree is not a fix in the other.
+
+    The manifest blames divergent twins for most of its defect register, and
+    these kernels were written into the vllm tree alone. A header present in
+    one and absent in the other is not a compile error anywhere: the sglang
+    build simply has no DeepSeek support, silently.
+    """
+    vllm_headers = {p.name for p in _DS.glob("*.h")}
+    assert vllm_headers, "no deepseek headers in the vllm tree"
+    if not _SGL_DS.is_dir():
+        pytest.fail(
+            f"the sglang tree has no deepseek_v41 directory; {len(vllm_headers)} "
+            "kernels exist in only one tree")
+    sgl_headers = {p.name for p in _SGL_DS.glob("*.h")}
+    missing = vllm_headers - sgl_headers
+    extra = sgl_headers - vllm_headers
+    assert not missing, f"sglang is missing {sorted(missing)}"
+    assert not extra, f"sglang has kernels vllm does not: {sorted(extra)}"
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in _DS.glob("*.h")))
+def test_the_twin_kernels_are_byte_identical(name):
+    """Nothing in these kernels is tree-specific.
+
+    They take pointers and shapes; only the op namespace differs, and that
+    lives in the binding. A divergence here means one tree's arithmetic has
+    been changed and the other's has not, which is exactly how the K-series
+    defects happened.
+    """
+    if not _SGL_DS.is_dir():
+        pytest.skip("sglang deepseek tree not present")
+    a = (_DS / name).read_bytes()
+    b = (_SGL_DS / name).read_bytes()
+    assert a == b, (
+        f"{name} differs between the trees; a fix in one is not a fix in the "
+        "other")
+
+
+def test_the_sglang_binding_uses_its_own_namespace():
+    """The one thing that must differ. Registering the sglang ops under the
+    vllm namespace would collide at import when both are installed."""
+    sgl = _ROOT / "sglang/custom-esimd-kernels/csrc/xpu/torch_extension_deepseek.cc"
+    if not sgl.is_file():
+        pytest.fail("the sglang tree has no deepseek binding")
+    src = sgl.read_text()
+    assert "TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_sglang, m)" in src
+    assert "TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m)" not in src
+
+
+def test_both_setups_build_the_deepseek_module():
+    """A kernel that no setup.py builds is not shipped."""
+    checked = 0
+    for setup in (Path(__file__).resolve().parents[1] / "setup.py",
+                  _ROOT / "sglang/custom-esimd-kernels/setup.py"):
+        if not setup.is_file():
+            continue
+        checked += 1
+        src = setup.read_text()
+        assert "deepseek_kernels.sycl" in src, (
+            f"{setup.parent.name}/setup.py does not build the deepseek module")
+        assert "torch_extension_deepseek.cc" in src
+    assert checked == 2, f"examined {checked} setup files, expected 2"

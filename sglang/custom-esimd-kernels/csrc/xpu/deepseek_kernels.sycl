@@ -1,0 +1,348 @@
+// DeepSeek V4.1 Flash -- SYCL kernel launchers.
+
+#include <utility>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <c10/core/Device.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include "../deepseek_v41/fp4_gemm.h"
+#include "../deepseek_v41/topk_noaux_tc.h"
+#include "../deepseek_v41/lightning_indexer.h"
+#include "../deepseek_v41/sparse_attn.h"
+#include "../deepseek_v41/engram_gate.h"
+#include "../deepseek_v41/act_quant.h"
+#include "../deepseek_v41/o_groups.h"
+#include "../deepseek_v41/compressor.h"
+
+using namespace sycl::ext::intel::esimd;
+using fp16 = sycl::half;
+
+// The bias is one vector shared by every token, not a per-token row: it is a
+// learned per-expert offset of shape [NUM_EXPERTS].
+template <int NUM_EXPERTS, int TOP_K, int N_GROUP, int TOPK_GROUP>
+struct DeepSeekTopKKernel {
+    const fp16* logits;
+    const fp16* bias;
+    int* out_indices;
+    fp16* out_weights;
+    int batch_size;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int token_idx = (int)item.get_global_id(0);
+        if (token_idx >= batch_size) return;
+
+        simd<fp16, NUM_EXPERTS> local_logits =
+            block_load<fp16, NUM_EXPERTS>(logits + (size_t)token_idx * NUM_EXPERTS);
+        simd<fp16, NUM_EXPERTS> local_bias = block_load<fp16, NUM_EXPERTS>(bias);
+
+        simd<int, TOP_K> local_indices;
+        simd<fp16, TOP_K> local_weights;
+
+        compute_noaux_tc_routing<NUM_EXPERTS, TOP_K, N_GROUP, TOPK_GROUP>(
+            local_logits, local_bias, local_indices, local_weights);
+
+        // TOP_K is 4, 6 or 8; only powers of two are block-storable, so the
+        // odd width goes out as scalars rather than reading past the row.
+        if constexpr ((TOP_K & (TOP_K - 1)) == 0) {
+            block_store<int, TOP_K>(out_indices + (size_t)token_idx * TOP_K, local_indices);
+            block_store<fp16, TOP_K>(out_weights + (size_t)token_idx * TOP_K, local_weights);
+        } else {
+            #pragma unroll
+            for (int k = 0; k < TOP_K; ++k) {
+                out_indices[(size_t)token_idx * TOP_K + k] = local_indices[k];
+                out_weights[(size_t)token_idx * TOP_K + k] = local_weights[k];
+            }
+        }
+    }
+};
+
+void launch_fp4_gemm(
+    torch::Tensor& a, 
+    torch::Tensor& b_fp4, 
+    torch::Tensor& b_scales, 
+    torch::Tensor& c) 
+{
+    const int M = (int)a.size(0);
+    const int K = (int)a.size(1);
+    const int N = (int)b_fp4.size(0);
+
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(a.device().index()).queue();
+
+    // One work-item owns 16 output channels and an M_TILE of rows. M_TILE is
+    // chosen so the fp32 accumulator stays inside the small-GRF budget:
+    // M_TILE * 16 floats, plus the unpacked B tile.
+    constexpr int N_TILE = 16;
+    constexpr int GROUP = 32;
+
+    const size_t n_groups = (size_t)((N + N_TILE - 1) / N_TILE);
+
+    auto launch = [&](auto m_tile_c) {
+        constexpr int MT = decltype(m_tile_c)::value;
+        const size_t m_groups = (size_t)((M + MT - 1) / MT);
+        q.submit([&](sycl::handler& cgh) {
+            FP4_GEMM_Kernel<MT, N_TILE, GROUP> kernel{
+                reinterpret_cast<const fp16*>(a.data_ptr()),
+                reinterpret_cast<const uint8_t*>(b_fp4.data_ptr()),
+                reinterpret_cast<const uint8_t*>(b_scales.data_ptr()),
+                reinterpret_cast<fp16*>(c.data_ptr()),
+                M, N, K
+            };
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(m_groups, n_groups),
+                                  sycl::range<2>(1, 1)),
+                kernel);
+        });
+    };
+
+    // Decode is M==1; larger M amortises the weight stream over more rows.
+    if (M == 1)      launch(std::integral_constant<int, 1>{});
+    else if (M <= 4) launch(std::integral_constant<int, 4>{});
+    else             launch(std::integral_constant<int, 8>{});
+}
+
+void launch_noaux_tc_topk(
+    torch::Tensor& logits, 
+    torch::Tensor& bias, 
+    torch::Tensor& out_indices, 
+    torch::Tensor& out_weights,
+    int64_t top_k)
+{
+    int batch_size = logits.size(0);
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(logits.device().index()).queue();
+
+    // Row-parallel with no SLM and no barrier, so the group width is free; a
+    // one-item group would use one lane of a SIMD16 engine.
+    constexpr int WG = 16;
+    const size_t global = ((size_t)(batch_size + WG - 1) / WG) * WG;
+    sycl::range<1> global_range(global);
+    sycl::range<1> local_range(WG);
+
+    auto submit_kernel = [&](auto top_k_val) {
+        constexpr int TK = decltype(top_k_val)::value;
+        q.submit([&](sycl::handler& cgh) {
+            // config.json carries n_routed_experts 384, topk_method noaux_tc
+            // and no n_group/topk_group: selection is over all experts. The
+            // group-limited path stays templated for the V3-style configs that
+            // do carry them, and 1/1 admits every expert.
+            DeepSeekTopKKernel<384, TK, 1, 1> kernel{
+                reinterpret_cast<const fp16*>(logits.data_ptr()),
+                reinterpret_cast<const fp16*>(bias.data_ptr()),
+                reinterpret_cast<int*>(out_indices.data_ptr()),
+                reinterpret_cast<fp16*>(out_weights.data_ptr()),
+                batch_size
+            };
+            cgh.parallel_for(sycl::nd_range<1>(global_range, local_range), kernel);
+        });
+    };
+
+    switch (top_k) {
+        case 4: submit_kernel(std::integral_constant<int, 4>{}); break;
+        case 6: submit_kernel(std::integral_constant<int, 6>{}); break;  // V4.1 default
+        case 8: submit_kernel(std::integral_constant<int, 8>{}); break;
+        default:
+            throw std::runtime_error("Unsupported top_k for DeepSeek V4.1 ESIMD kernel");
+    }
+}
+
+
+void launch_lightning_indexer(torch::Tensor& q, torch::Tensor& index_k,
+                              torch::Tensor& weights, torch::Tensor& scores,
+                              int64_t compress_len) {
+    const int S = (int)q.size(0);
+    const int T = (int)index_k.size(0);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    dsv41_indexer::launch_lightning_indexer<32, 128>(
+        sq,
+        reinterpret_cast<const fp16*>(q.data_ptr()),
+        reinterpret_cast<const fp16*>(index_k.data_ptr()),
+        reinterpret_cast<const fp16*>(weights.data_ptr()),
+        reinterpret_cast<float*>(scores.data_ptr()),
+        S, T, nullptr, (int)compress_len);
+}
+
+void launch_candidate_blocks(torch::Tensor& scores, torch::Tensor& keep,
+                             int64_t block_size, int64_t topk_blocks,
+                             int64_t compress_len) {
+    const int S = (int)scores.size(0);
+    const int T = (int)scores.size(1);
+    sycl::queue& sq =
+        c10::xpu::getCurrentXPUStream(scores.device().index()).queue();
+    dsv41_indexer::launch_candidate_blocks(
+        sq, reinterpret_cast<const float*>(scores.data_ptr()),
+        reinterpret_cast<uint8_t*>(keep.data_ptr()), S, T, (int)block_size,
+        (int)topk_blocks, nullptr, (int)compress_len);
+}
+
+
+void launch_sparse_attn(torch::Tensor& q, torch::Tensor& kv,
+                        torch::Tensor& attn_sink, torch::Tensor& topk_idxs,
+                        torch::Tensor& out, double scale) {
+    const int S = (int)q.size(0);
+    const int H = (int)q.size(1);
+    const int D = (int)q.size(2);
+    const int N = (int)kv.size(0);
+    const int TOPK = (int)topk_idxs.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+
+    const fp16* qp = reinterpret_cast<const fp16*>(q.data_ptr());
+    const fp16* kvp = reinterpret_cast<const fp16*>(kv.data_ptr());
+    const float* sp = attn_sink.defined() && attn_sink.numel() > 0
+                          ? reinterpret_cast<const float*>(attn_sink.data_ptr())
+                          : nullptr;
+    const int32_t* ip = reinterpret_cast<const int32_t*>(topk_idxs.data_ptr());
+    fp16* op = reinterpret_cast<fp16*>(out.data_ptr());
+
+    switch (D) {
+        case 512:
+            dsv41_sparse::launch_sparse_attn<fp16, 512>(
+                sq, qp, kvp, sp, ip, op, S, H, N, TOPK, (float)scale);
+            break;
+        case 256:
+            dsv41_sparse::launch_sparse_attn<fp16, 256>(
+                sq, qp, kvp, sp, ip, op, S, H, N, TOPK, (float)scale);
+            break;
+        case 128:
+            dsv41_sparse::launch_sparse_attn<fp16, 128>(
+                sq, qp, kvp, sp, ip, op, S, H, N, TOPK, (float)scale);
+            break;
+        default:
+            TORCH_CHECK(false,
+                        "deepseek_v41_sparse_attn: head_dim must be 128, 256 "
+                        "or 512, got ", D);
+    }
+}
+
+
+void launch_engram_gate(torch::Tensor& h, torch::Tensor& key,
+                        torch::Tensor& weight, torch::Tensor& value,
+                        torch::Tensor& mask, torch::Tensor& out, double eps,
+                        double clamp_value) {
+    const int T = (int)h.size(0);
+    const int HC = (int)h.size(1);
+    const int D = (int)h.size(2);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(h.device().index()).queue();
+
+    const float* hp = reinterpret_cast<const float*>(h.data_ptr());
+    const float* kp = reinterpret_cast<const float*>(key.data_ptr());
+    const float* wp = reinterpret_cast<const float*>(weight.data_ptr());
+    const float* vp = reinterpret_cast<const float*>(value.data_ptr());
+    const uint8_t* mp = mask.defined() && mask.numel() > 0
+                            ? reinterpret_cast<const uint8_t*>(mask.data_ptr())
+                            : nullptr;
+    float* op = reinterpret_cast<float*>(out.data_ptr());
+
+    switch (D) {
+        case 5120:
+            dsv41_engram::launch_engram_gate<5120>(
+                sq, hp, kp, wp, vp, mp, op, T, HC, (float)eps, (float)clamp_value);
+            break;
+        case 2048:
+            dsv41_engram::launch_engram_gate<2048>(
+                sq, hp, kp, wp, vp, mp, op, T, HC, (float)eps, (float)clamp_value);
+            break;
+        case 1024:
+            dsv41_engram::launch_engram_gate<1024>(
+                sq, hp, kp, wp, vp, mp, op, T, HC, (float)eps, (float)clamp_value);
+            break;
+        default:
+            TORCH_CHECK(false, "deepseek_v41_engram_gate: dim must be 1024, "
+                               "2048 or 5120, got ", D);
+    }
+}
+
+
+void launch_act_quant(torch::Tensor& x, torch::Tensor& y, torch::Tensor& s,
+                      int64_t group_size, bool round_scale, double qmax,
+                      double amax_floor) {
+    const int M = (int)x.size(0);
+    const int N = (int)x.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    const float* xp = reinterpret_cast<const float*>(x.data_ptr());
+    uint8_t* yp = reinterpret_cast<uint8_t*>(y.data_ptr());
+    float* sp = reinterpret_cast<float*>(s.data_ptr());
+
+#define DSQ_LAUNCH(G)                                                          \
+    if (round_scale)                                                           \
+        dsv41_quant::launch_act_quant<G, true>(sq, xp, yp, sp, M, N,            \
+                                               (float)qmax, (float)amax_floor);\
+    else                                                                       \
+        dsv41_quant::launch_act_quant<G, false>(sq, xp, yp, sp, M, N,           \
+                                                (float)qmax, (float)amax_floor)
+    switch (group_size) {
+        case 16:  DSQ_LAUNCH(16);  break;
+        case 32:  DSQ_LAUNCH(32);  break;
+        case 64:  DSQ_LAUNCH(64);  break;
+        case 128: DSQ_LAUNCH(128); break;
+        default:
+            TORCH_CHECK(false, "deepseek_v41_act_quant: group_size must be 16, "
+                               "32, 64 or 128, got ", group_size);
+    }
+#undef DSQ_LAUNCH
+}
+
+
+void launch_o_group_proj(torch::Tensor& x, torch::Tensor& w,
+                         torch::Tensor& out) {
+    const int T = (int)x.size(0);
+    const int G = (int)x.size(1);
+    const int D = (int)x.size(2);
+    const int R = (int)w.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    const float* xp = reinterpret_cast<const float*>(x.data_ptr());
+    const float* wp = reinterpret_cast<const float*>(w.data_ptr());
+    float* op = reinterpret_cast<float*>(out.data_ptr());
+
+    switch (D) {
+        case 512:
+            dsv41_ogroups::launch_o_group_proj<512>(sq, xp, wp, op, T, G, R);
+            break;
+        case 256:
+            dsv41_ogroups::launch_o_group_proj<256>(sq, xp, wp, op, T, G, R);
+            break;
+        case 128:
+            dsv41_ogroups::launch_o_group_proj<128>(sq, xp, wp, op, T, G, R);
+            break;
+        case 64:
+            dsv41_ogroups::launch_o_group_proj<64>(sq, xp, wp, op, T, G, R);
+            break;
+        default:
+            TORCH_CHECK(false, "deepseek_v41_o_group_proj: per-group input dim "
+                               "must be 64, 128, 256 or 512, got ", D);
+    }
+}
+
+
+void launch_compress_pool(torch::Tensor& kv, torch::Tensor& score,
+                          torch::Tensor& latent, int64_t ratio) {
+    const int G = (int)latent.size(0);
+    const int D = (int)latent.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(kv.device().index()).queue();
+    const float* kp = reinterpret_cast<const float*>(kv.data_ptr());
+    const float* sp = reinterpret_cast<const float*>(score.data_ptr());
+    float* lp = reinterpret_cast<float*>(latent.data_ptr());
+
+    switch (ratio) {
+        case 1: dsv41_compress::launch_compress_pool<1>(sq, kp, sp, lp, G, D); break;
+        case 2: dsv41_compress::launch_compress_pool<2>(sq, kp, sp, lp, G, D); break;
+        case 4: dsv41_compress::launch_compress_pool<4>(sq, kp, sp, lp, G, D); break;
+        case 8: dsv41_compress::launch_compress_pool<8>(sq, kp, sp, lp, G, D); break;
+        default:
+            TORCH_CHECK(false, "deepseek_v41_compress_pool: ratio must be 1, 2, "
+                               "4 or 8, got ", ratio);
+    }
+}
+
+void launch_rotary(torch::Tensor& x, torch::Tensor& cosv, torch::Tensor& sinv,
+                   bool inverse) {
+    const int S = (int)x.size(0);
+    const int D = (int)x.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+    dsv41_compress::launch_rotary(
+        sq, reinterpret_cast<float*>(x.data_ptr()),
+        reinterpret_cast<const float*>(cosv.data_ptr()),
+        reinterpret_cast<const float*>(sinv.data_ptr()), S, D, inverse);
+}

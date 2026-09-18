@@ -444,6 +444,33 @@ ext_modules.append(
 )
 ### Decode SDPA (v2)
 
+### DeepSeek V4.1: FP4 GEMM, noaux_tc router, lightning indexer, sparse
+### attention, engram gate, activation quant, o_groups and the compressor.
+### The kernels are byte-identical to the vllm tree's; only the op namespace
+### differs, so a fix in one must be mirrored to the other.
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_sglang.deepseek_v41",
+        sources=[
+            "csrc/xpu/deepseek_kernels.sycl",
+            "csrc/xpu/torch_extension_deepseek.cc",
+        ],
+        include_dirs=[
+            root / "csrc",
+            root / "csrc/xpu",
+            root / "csrc/deepseek_v41",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES}",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+
 setup(
     name="custom-esimd-kernels-sglang",
     version="0.1.0",
