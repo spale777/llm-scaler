@@ -454,3 +454,177 @@ def test_expert_dtype_is_fp4_and_scales_are_ue8m0():
     assert "unpack_fp4_row" in c, "the expert GEMM must unpack E2M1"
     d = code(_DEQUANT.read_text())
     assert "decode_ue8m0_scales" in d, "UE8M0 scale decode missing"
+
+
+# --- lightning indexer ------------------------------------------------------
+
+_INDEXER = _DS / "lightning_indexer.h"
+NEG_INF_F = float("-inf")
+
+
+def _kernel_index_scores(q, k, w, S, T, H, D, reach):
+    """Mirror of LightningIndexerKernel: relu per head, then weighted sum."""
+    out = [[0.0] * T for _ in range(S)]
+    for s in range(S):
+        for t in range(T):
+            if t >= reach[s]:
+                out[s][t] = NEG_INF_F
+                continue
+            acc = 0.0
+            for h in range(H):
+                dot = sum(q[s][h][d] * k[t][d] for d in range(D))
+                acc += (dot if dot > 0 else 0.0) * w[s][h]
+            out[s][t] = acc
+    return out
+
+
+def test_indexer_matches_the_reference_score():
+    """einsum(bshd,btd->bsht), relu, weight per head, sum over heads.
+
+    model.py::Indexer computes `(index_score.relu_() * weights).sum(dim=2)`.
+    One shared key per position: this is MQA, so every index head reads the
+    same key row.
+    """
+    import random
+    random.seed(2)
+    S, T, H, D = 3, 40, 4, 8
+    q = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(H)]
+         for _ in range(S)]
+    k = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(T)]
+    w = [[random.uniform(0, 1) for _ in range(H)] for _ in range(S)]
+    reach = [10, 25, 40]
+
+    got = _kernel_index_scores(q, k, w, S, T, H, D, reach)
+    checked = 0
+    seen = 0
+    for s in range(S):
+        for t in range(T):
+            if t >= reach[s]:
+                seen += 1
+                assert got[s][t] == NEG_INF_F, (
+                    "an unreachable position must be -inf, not small: the "
+                    "candidate stage reads a block max and treats -inf as "
+                    "unreachable"
+                )
+                continue
+            per_head = [sum(q[s][h][d] * k[t][d] for d in range(D))
+                        for h in range(H)]
+            per_head = [x if x > 0 else 0.0 for x in per_head]
+            want = sum(per_head[h] * w[s][h] for h in range(H))
+            checked += 1
+            assert abs(got[s][t] - want) < 1e-12
+    assert checked > 0 and seen > 0, (
+        f"examined {checked} reachable and {seen} masked positions; the shapes "
+        "no longer exercise both paths"
+    )
+
+
+def test_indexer_rectifies_before_weighting():
+    """Summing first and rectifying after changes the ranking.
+
+    A head that scores a position negatively must contribute zero, not a
+    negative another head has to overcome.
+    """
+    import random
+    random.seed(2)
+    S, T, H, D = 3, 40, 4, 8
+    q = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(H)]
+         for _ in range(S)]
+    k = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(T)]
+    w = [[random.uniform(0, 1) for _ in range(H)] for _ in range(S)]
+    reach = [10, 25, 40]
+    got = _kernel_index_scores(q, k, w, S, T, H, D, reach)
+
+    differs = 0
+    total = 0
+    for s in range(S):
+        for t in range(min(reach[s], T)):
+            total += 1
+            ph = [sum(q[s][h][d] * k[t][d] for d in range(D)) for h in range(H)]
+            after = sum(ph[h] * w[s][h] for h in range(H))
+            after = after if after > 0 else 0.0
+            if abs(after - got[s][t]) > 1e-9:
+                differs += 1
+    assert differs > total // 2, (
+        "rectifying after the sum is indistinguishable here, so this test is "
+        "not exercising the ordering"
+    )
+    src = code(_INDEXER.read_text())
+    assert "dot > 0.0f ? dot : 0.0f" in src, (
+        "the per-head rectification is gone; the ranking changes"
+    )
+
+
+def test_indexer_applies_no_scale_of_its_own():
+    """weights already carry softmax_scale * n_heads^-0.5 from the host."""
+    src = code(_INDEXER.read_text())
+    i = src.find("struct LightningIndexerKernel")
+    body = src[i:src.find("launch_lightning_indexer", i)]
+    assert "softmax_scale" not in body and "rsqrt" not in body, (
+        "the kernel rescales scores the host already scaled"
+    )
+
+
+def _kernel_keep(scores, S, T, bs, topk, reach):
+    """Mirror of CandidateBlockKernel."""
+    nb = (T + bs - 1) // bs
+    keep = [[0] * nb for _ in range(S)]
+    for s in range(S):
+        last = (reach[s] - 1) // bs
+        for _ in range(min(topk, nb)):
+            best, bb = NEG_INF_F, -1
+            for b in range(nb):
+                if keep[s][b]:
+                    continue
+                sc = (float("inf") if b == last
+                      else max([scores[s][i]
+                                for i in range(b * bs, min(b * bs + bs, T))]
+                               + [NEG_INF_F]))
+                if sc > best:
+                    best, bb = sc, b
+            if bb < 0 or best == NEG_INF_F:
+                break
+            keep[s][bb] = 1
+    return keep
+
+
+@pytest.mark.parametrize("topk", [1, 2, 3, 5])
+def test_candidate_blocks_match_the_reference(topk):
+    """Block score is its best position; the newest block is pinned in.
+
+    select_candidate_blocks pads with -inf, takes an amax per block, forces the
+    block holding the query's newest position to +inf, then keeps only picks
+    that scored above -inf -- so a context with fewer reachable blocks than
+    topk_blocks does not admit positions the query cannot see.
+    """
+    import random
+    random.seed(2)
+    S, T, H, D, bs = 3, 40, 4, 8, 8
+    q = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(H)]
+         for _ in range(S)]
+    k = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(T)]
+    w = [[random.uniform(0, 1) for _ in range(H)] for _ in range(S)]
+    reach = [10, 25, 40]
+    scores = _kernel_index_scores(q, k, w, S, T, H, D, reach)
+
+    got = _kernel_keep(scores, S, T, bs, topk, reach)
+
+    nb = (T + bs - 1) // bs
+    want = []
+    for s in range(S):
+        padded = scores[s] + [NEG_INF_F] * ((-T) % bs)
+        bl = [max(padded[b * bs:(b + 1) * bs]) for b in range(nb)]
+        last = (reach[s] - 1) // bs
+        bl = [float("inf") if b == last else bl[b] for b in range(nb)]
+        order = sorted(range(nb), key=lambda b: -bl[b])[:min(topk, nb)]
+        keep = [0] * nb
+        for b in order:
+            if bl[b] > NEG_INF_F:
+                keep[b] = 1
+        want.append(keep)
+
+    assert got == want, f"candidate selection diverges at topk={topk}"
+    for s in range(S):
+        assert got[s][(reach[s] - 1) // bs] == 1, (
+            "the block holding the newest position must be kept"
+        )

@@ -43,11 +43,16 @@ inline void compute_noaux_tc_routing(
     constexpr float ROUTED_SCALING_FACTOR = 1.5f;
     constexpr float NEG_INF = -3.0e38f;
     constexpr float EPS = 1e-20f;  // matches training; NOT norm_eps
+    // The logit temperature divides before the transform. It is 1.0 for this
+    // model, so it folds away, but sqrtsoftplus is not scale-invariant and a
+    // temperature applied after the transform would change the selection.
+    constexpr float GATE_TEMP = 1.0f;
 
     float scores[NUM_EXPERTS];
     #pragma unroll
     for (int i = 0; i < NUM_EXPERTS; ++i) {
-        simd<float, 1> x_simd = static_cast<float>(logits[i].read());
+        simd<float, 1> x_simd =
+            static_cast<float>(logits[i].read()) / GATE_TEMP;
         simd<float, 1> exp_x = sycl::ext::intel::esimd::exp(x_simd);
         simd<float, 1> softplus = sycl::ext::intel::esimd::log(1.0f + exp_x);
         simd<float, 1> sqrt_softplus = sycl::ext::intel::esimd::sqrt(softplus);
@@ -126,8 +131,10 @@ inline void compute_noaux_tc_routing(
         sel[max_idx] = NEG_INF;
     }
 
-    // norm_topk_prob = true.
-    const float inv = 1.0f / (weight_sum + EPS);
+    // norm_topk_prob = true, and normalising a single selected expert would
+    // make every weight exactly 1 regardless of its score.
+    const float inv =
+        (TOP_K > 1) ? (1.0f / (weight_sum + EPS)) : 1.0f;
     #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
         out_weights[k] = (fp16)((static_cast<float>(out_weights[k].read()) * inv) * ROUTED_SCALING_FACTOR);
