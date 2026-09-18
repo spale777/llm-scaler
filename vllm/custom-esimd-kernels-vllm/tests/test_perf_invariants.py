@@ -116,7 +116,17 @@ def test_wide_router_streams_each_weight_row_once(path):
         "neither wide-router kernel was found; the anchor moved and this test stopped checking the grid")
 
 
-@pytest.mark.parametrize("path", _MOE_SYCL, ids=_ids)
+# Every file that DEFINES submit_kernel, not just the two moe.sycl ones: the
+# definition was templated there while moe_int4.sycl and eagle.sycl kept the
+# by-value std::function in both trees, so the guard passed over 105 launch
+# sites that still allocated.
+_SUBMIT_KERNEL_FILES = _MOE_SYCL + [
+    _VLLM / "moe_batch/moe_int4.sycl", _SGL / "moe_batch/moe_int4.sycl",
+    _VLLM / "eagle/eagle.sycl", _SGL / "eagle/eagle.sycl",
+]
+
+
+@pytest.mark.parametrize("path", _SUBMIT_KERNEL_FILES, ids=_ids)
 def test_submit_kernel_does_not_type_erase(path):
     """std::function heap-allocates on every launch."""
     if not path.exists():
@@ -128,6 +138,55 @@ def test_submit_kernel_does_not_type_erase(path):
         f"{path.name}: submit_kernel takes std::function by value"
     )
     assert "template <typename KernelFn>" in src
+
+
+@pytest.mark.parametrize("path", _SUBMIT_KERNEL_FILES, ids=_ids)
+def test_no_std_function_scaffolding_around_a_single_submit(path):
+    """A `std::function` assigned and submitted inside the same switch arm is
+    a second heap allocation buying nothing.
+
+    Only the arm-local form is banned. Where one handle is assigned across
+    several branches and submitted once afterwards the type erasure is doing
+    real work (carrying a branch-selected kernel out of the switch), and
+    removing it means duplicating the submit into every arm.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    src = path.read_text()
+    # Only std::function-typed handles. `auto cgf = [&](sycl::handler&){...}`
+    # binds the closure by its own type and erases nothing, so flagging it is a
+    # false positive -- and both moe.sycl files are written that way.
+    erased = set(re.findall(
+        r"std::function<void\(sycl::handler&\)>\s+(\w+)", src))
+    if not erased:
+        return
+    # A lambda body contains semicolons, so the span from the assignment to the
+    # submit cannot be matched with a character class -- brace-walk instead.
+    bad = []
+    for m in re.finditer(r"\b(\w+)\s*=\s*\[[&=]\]\s*\(\s*sycl::handler", src):
+        name = m.group(1)
+        if name not in erased:
+            continue
+        ob = src.find("{", m.end())
+        if ob < 0:
+            continue
+        depth, j = 0, ob
+        while j < len(src):
+            if src[j] == "{":
+                depth += 1
+            elif src[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        # What follows the lambda, up to the next statement of substance.
+        tail = src[j:j + 200]
+        if re.search(rf"submit_kernel\(\s*{re.escape(name)}\s*,", tail):
+            bad.append(name)
+    assert not bad, (
+        f"{path.name}: {sorted(set(bad))} is assigned and submitted within one "
+        "arm; pass the lambda straight to submit_kernel instead"
+    )
 
 
 @pytest.mark.parametrize("path", _MOE_SYCL, ids=_ids)

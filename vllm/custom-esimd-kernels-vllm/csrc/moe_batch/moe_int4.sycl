@@ -28,12 +28,13 @@ using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::esimd::xmx;
 namespace xesimd = sycl::ext::intel::experimental::esimd;
 
+template <typename KernelFn>
 static inline sycl::event submit_kernel(
-    std::function<void(sycl::handler&)> kernel,
+    KernelFn&& kernel,
     const torch::Device& device,
     const char* desc) {
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
-    return queue.submit(kernel);
+    return queue.submit(std::forward<KernelFn>(kernel));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

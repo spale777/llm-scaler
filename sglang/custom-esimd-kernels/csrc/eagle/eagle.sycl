@@ -11,12 +11,13 @@ using namespace sycl::ext::intel::esimd::xmx;
 namespace xesimd = sycl::ext::intel::experimental::esimd;
 using bf16 = sycl::ext::oneapi::bfloat16;
 
+template <typename KernelFn>
 static inline sycl::event submit_kernel(
-    std::function<void(sycl::handler&)> kernel,
+    KernelFn&& kernel,
     const torch::Device& device,
     const char* desc) {
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
-    return queue.submit(kernel);
+    return queue.submit(std::forward<KernelFn>(kernel));
 }
 
 static inline bool isPowerOf2(uint32_t in) {
@@ -72,31 +73,26 @@ void conv1d_forward_kernel(
   sycl::range<2> localConv1d(1, 1);
   sycl::nd_range<2> rangeConv1d(globalConv1d, localConv1d);
 
-  std::function<void(sycl::handler&)> kernel;
   switch (fpType) {
     case torch::kBFloat16:
-      kernel = [&](sycl::handler& cgh) {
+      submit_kernel([&](sycl::handler& cgh) {
         cgh.parallel_for<class eagleConv1dBf16Forward>(rangeConv1d, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL{
             causalConv1dUpdateBf16(
               qkvzState, zOut, convW, convB, convState, convStateIdx, acceptedTokens,
               nTokens, headQk, headV, headDim, qkvzStride, conv_stride0, idx
             );
           });
-        };
-
-      submit_kernel(kernel, device, "causal_conv1d_update forward");
+        }, device, "causal_conv1d_update forward");
     break;
     case torch::kHalf:
-      kernel = [&](sycl::handler& cgh) {
+      submit_kernel([&](sycl::handler& cgh) {
         cgh.parallel_for<class eagleConv1dFp16Forward>(rangeConv1d, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL{
             causalConv1dUpdateFp16(
               qkvzState, zOut, convW, convB, convState, convStateIdx, acceptedTokens,
               nTokens, headQk, headV, headDim, qkvzStride, conv_stride0, idx
             );
           });
-        };
-
-      submit_kernel(kernel, device, "causal_conv1d_update forward");
+        }, device, "causal_conv1d_update forward");
       break;
     default:
       break;
@@ -126,30 +122,24 @@ void gdn_eagle_forward_kernel(
   sycl::range<2> globalGdnRecur(headV * 16, batches);
   sycl::range<2> localGdnRecur(16, 1);
   sycl::nd_range<2> rangeGdnRecur(globalGdnRecur, localGdnRecur);
-  std::function<void(sycl::handler&)> kernel;
-
   switch (fpType) {
   case torch::kBFloat16:
-    kernel = [&](sycl::handler& cgh) {
+    submit_kernel([&](sycl::handler& cgh) {
       cgh.parallel_for<class eagleGdnRecurBf16Forward>(
         rangeGdnRecur, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL{
           gdnRecurBf16(qkvzState, baState, (bf16*)aLogW, (bf16*)dtBias, acceptedTokens, ssmStateIdx, lastRecurState, outState,
             nTokens, headQk, headV, headDim, qkvzStride, ssm_stride0, idx);
         });
-      };
-
-    submit_kernel(kernel, device, "gdn_eagle forward");
+      }, device, "gdn_eagle forward");
     break;
   case torch::kHalf:
-    kernel = [&](sycl::handler& cgh) {
+    submit_kernel([&](sycl::handler& cgh) {
       cgh.parallel_for<class eagleGdnRecurFp16Forward>(
         rangeGdnRecur, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL{
           gdnRecurFp16(qkvzState, baState, (fp16*)aLogW, (fp16*)dtBias, acceptedTokens, ssmStateIdx, lastRecurState, outState,
             nTokens, headQk, headV, headDim, qkvzStride, ssm_stride0, idx);
         });
-      };
-
-    submit_kernel(kernel, device, "gdn_eagle forward");
+      }, device, "gdn_eagle forward");
     break;
   default:
     break;
@@ -298,38 +288,33 @@ void page_attention_forward_kernel(
   sycl::range<3> localPaPhase3(1, 1, 1);
   sycl::nd_range<3> rangePaPhase3(globalPaPhase3, localPaPhase3);
 
-  std::function<void(sycl::handler&)> kernelPhase1;
-  std::function<void(sycl::handler&)> kernelPhase2;
-  std::function<void(sycl::handler&)> kernelPhase3;
-
-  kernelPhase1 = [&](sycl::handler& cgh) {
+  // This entry is templated on T, so every phase has one concrete kernel and
+  // none of them needs a type-erased handle.
+  submit_kernel([&](sycl::handler& cgh) {
     cgh.parallel_for<paPhase1ForwardT<T>>(
       rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
         sdpaDecodeGqa4Phase1<T>(qState, kCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
           batches, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
       });
-    };
+    }, device, "page_attn_ph1 forward");
 
-  kernelPhase2 = [&](sycl::handler& cgh) {
+  submit_kernel([&](sycl::handler& cgh) {
     cgh.parallel_for<paPhase2ForwardT<T>>(
       rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
         sdpaDecodeGqa4Phase2<T>((uint8_t*)pState, pGroupMax, vCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
           batches, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
       });
-    };
-
-  kernelPhase3 = [&](sycl::handler& cgh) {
-    cgh.parallel_for<paPhase3ForwardT<T>>(
-      rangePaPhase3, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase3<T>(pTempOut, pGlobalSoftmaxSum, out, kvSeqLens,
-          batches, headV, maxKvSeqLen, gqaRatio, idx);
-      });
-    };
-
-  submit_kernel(kernelPhase1, device, "page_attn_ph1 forward");
-  submit_kernel(kernelPhase2, device, "page_attn_ph2 forward");
+    }, device, "page_attn_ph2 forward");
+  // Phase3 operates on the float scratch phase2 produced, so it needs no type
+  // erasure to carry it out of the dtype switch.
   if (flag == 0) {
-    submit_kernel(kernelPhase3, device, "page_attn_ph3 forward");
+    submit_kernel([&](sycl::handler& cgh) {
+      cgh.parallel_for<paPhase3ForwardT<T>>(
+        rangePaPhase3, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+          sdpaDecodeGqa4Phase3<T>(pTempOut, pGlobalSoftmaxSum, out, kvSeqLens,
+            batches, headV, maxKvSeqLen, gqaRatio, idx);
+        });
+      }, device, "page_attn_ph3 forward");
   }
 }
 
@@ -682,7 +667,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
   sycl::range<2> globalRange(H_v * 16, n_seqs);
   sycl::range<2> localRange(16, 1);
   sycl::nd_range<2> range(globalRange, localRange);
-  std::function<void(sycl::handler&)> kernel;
 
   const uint32_t headQk = (uint32_t)H_k;
   const uint32_t headV  = (uint32_t)H_v;
@@ -706,47 +690,45 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_e
   switch (q.scalar_type()) {
     case torch::kHalf:
       if (stateIsHalf) {
-        kernel = [=](sycl::handler& cgh) {
+        submit_kernel([=](sycl::handler& cgh) {
           cgh.parallel_for<class chunkGdnExtendFp16Sf16>(
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendFp16<sycl::half>(
                 qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
                 headQk, headV, headDim, hChunk, qScale, ndi);
             });
-        };
+        }, q.device(), "chunk_gated_delta_rule_extend fp16");
       } else {
-        kernel = [=](sycl::handler& cgh) {
+        submit_kernel([=](sycl::handler& cgh) {
           cgh.parallel_for<class chunkGdnExtendFp16Sf32>(
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendFp16<float>(
                 qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
                 headQk, headV, headDim, hChunk, qScale, ndi);
             });
-        };
+        }, q.device(), "chunk_gated_delta_rule_extend fp16");
       }
-      submit_kernel(kernel, q.device(), "chunk_gated_delta_rule_extend fp16");
       break;
     case torch::kBFloat16:
       if (stateIsHalf) {
-        kernel = [=](sycl::handler& cgh) {
+        submit_kernel([=](sycl::handler& cgh) {
           cgh.parallel_for<class chunkGdnExtendBf16Sf16>(
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendBf16<sycl::half>(
                 qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
                 headQk, headV, headDim, hChunk, qScale, ndi);
             });
-        };
+        }, q.device(), "chunk_gated_delta_rule_extend bf16");
       } else {
-        kernel = [=](sycl::handler& cgh) {
+        submit_kernel([=](sycl::handler& cgh) {
           cgh.parallel_for<class chunkGdnExtendBf16Sf32>(
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendBf16<float>(
                 qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
                 headQk, headV, headDim, hChunk, qScale, ndi);
             });
-        };
+        }, q.device(), "chunk_gated_delta_rule_extend bf16");
       }
-      submit_kernel(kernel, q.device(), "chunk_gated_delta_rule_extend bf16");
       break;
     default:
       TORCH_CHECK(false, "unreachable dtype check");
