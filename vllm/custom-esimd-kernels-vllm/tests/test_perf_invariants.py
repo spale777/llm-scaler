@@ -350,3 +350,49 @@ def test_int4_scale_is_not_reloaded_every_k_step(path):
             f"{path.name}: kg_cur starts at {m.group(1)}, so group "
             f"{m.group(1)} would be skipped"
         )
+
+
+_POOLED_SCRATCH = [
+    (_VLLM / "moe_batch/moe_int4.sycl",
+     "moe_forward_gelu_tanh_int4_decode", "gemma_int4_decode_ws"),
+    (_SGL / "xpu/esimd_kernel.sycl",
+     "esimd_shared_expert_q8", "shared_expert_q8_ws"),
+]
+
+
+@pytest.mark.parametrize("path,fn,pool", _POOLED_SCRATCH,
+                         ids=lambda v: v if isinstance(v, str) else "")
+def test_pooled_scratch_does_not_escape(path, fn, pool):
+    """A decode op may reuse its internal buffers but must return a fresh one.
+
+    Both of these run per token per layer and allocated every intermediate on
+    entry, which is pure allocator dispatch on a host-bound path; the file each
+    lives in already carried the pooling idiom. Reuse is only sound while the
+    returned tensor is not itself pooled -- it escapes to python and has to
+    stay live past the call, and the next token would otherwise overwrite it.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    src = path.read_text()
+    i = src.find(fn + "(")
+    assert i >= 0, f"{fn} not found -- re-derive this test"
+    # Brace-match the body.
+    ob = src.index("{", i)
+    depth, j = 0, ob
+    while j < len(src):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    body = src[i:j + 1]
+    assert pool in body, f"{fn} no longer uses the {pool} pool"
+    returned = set(re.findall(r"return\s+(\w+)\s*;", body))
+    assert returned, f"{fn} returns nothing -- re-derive this test"
+    for name in returned:
+        assert not re.search(rf"auto&\s+{name}\s*=\s*ws\.", body), (
+            f"{fn}: `{name}` is returned but bound to the pool; the next "
+            "call overwrites a tensor the caller still holds"
+        )

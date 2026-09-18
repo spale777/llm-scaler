@@ -668,14 +668,38 @@ at::Tensor esimd_moe_down_q6k(
 // gu_qs [2*inter_s, hidden] int8 (rows gate then up); gu_sc [2*inter_s, hidden/32]
 // fp16; d_qs [hidden, inter_s] int8; d_sc [hidden, inter_s/32] fp16;
 // wg [hidden] fp16 (shared_expert_gate weight row 0). x/out [M, hidden] fp16.
+// Pooled decode scratch, as gguf_moe_ws below does and for the same reason:
+// both kernels go on one in-order queue, so the next call cannot start before
+// this one's last kernel retired. `out` is deliberately not pooled -- it
+// escapes to python and must stay live past the call.
+struct SharedExpertQ8Ws {
+    int64_t M = -1, hidden = -1, inter_s = -1;
+    at::ScalarType dtype = at::ScalarType::Undefined;
+    c10::DeviceIndex dev = -1;
+    at::Tensor inter, g;
+};
+
+static SharedExpertQ8Ws& shared_expert_q8_ws() {
+    static SharedExpertQ8Ws ws;
+    return ws;
+}
+
 at::Tensor esimd_shared_expert_q8(
     at::Tensor x, at::Tensor gu_qs, at::Tensor gu_sc,
     at::Tensor d_qs, at::Tensor d_sc, at::Tensor wg, int64_t inter_s) {
     int64_t M = x.size(0);
     int64_t hidden = x.size(1);
-    auto out   = at::empty({M, hidden}, x.options());
-    auto inter = at::empty({M, inter_s}, x.options());
-    auto g     = at::empty({M}, x.options());
+    auto out = at::empty({M, hidden}, x.options());
+    auto& ws = shared_expert_q8_ws();
+    if (ws.M != M || ws.hidden != hidden || ws.inter_s != inter_s ||
+        ws.dtype != x.scalar_type() || ws.dev != x.device().index()) {
+        ws.inter = at::empty({M, inter_s}, x.options());
+        ws.g     = at::empty({M}, x.options());
+        ws.M = M; ws.hidden = hidden; ws.inter_s = inter_s;
+        ws.dtype = x.scalar_type(); ws.dev = x.device().index();
+    }
+    auto& inter = ws.inter;
+    auto& g     = ws.g;
     auto p_x  = reinterpret_cast<const fp16*>(x.data_ptr());
     auto p_gq = reinterpret_cast<const int8_t*>(gu_qs.data_ptr());
     auto p_gs = reinterpret_cast<const fp16*>(gu_sc.data_ptr());
