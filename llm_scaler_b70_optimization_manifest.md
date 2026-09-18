@@ -30,7 +30,7 @@ prediction.
 | `fp8_moe_gemm_blockscale.h` (MoE decode) | ✅ | ✅ | ⚠️ | D7 unbounded write; likely GRF spill (K5) |
 | `fp8_moe_gemm_blockscale.h` (DPAS prefill) | ✅ | vLLM only | ✅ | VNNI2 pack verified bit-perfect over all 256 combinations |
 | Custom IPC all-reduce | ✅ | ❌ | ❌ | Rewritten to fail loudly; `register_buffer` refuses because the Level Zero handle exchange is unbuilt, so the op is unreachable. Never executed. See §3 |
-| DeepSeek V4.1 kernels | ✅ | ⚠️ | ❌ | Tracked and built. FP4 LUT and router order corrected. The top-k op refuses: its kernel neither loads nor stores, and the group-limited noaux_tc stage is absent. `fp4_gemm.h` is a skeleton |
+| DeepSeek V4.1 kernels | ✅ | ✅ | ✅ | FP4 GEMM unpacks E2M1 to FP16 and uses the FP16 dpas, the only shape Xe2 runs. Router scores with sqrtsoftplus, ranks 8 groups by their two best biased keys, keeps 4, then takes top-k; bias steers selection only. Checked on CPU: VNNI layout and nibble order to 1e-14, group-limited selection expert-for-expert over 300 tokens, all 16 nibbles and 256 scale bytes exact. Unmeasured on hardware |
 | MoE router rewrite (`acc[64]`) | ✅ | ✅ | ✅ | Reverted to four scalar accumulators. See K3 |
 | Q4_K 2D load width 8→16 | ✅ | ✅ | ✅ | Reverted to width 8. See K1 |
 | `lsc_prefetch` injection | ✅ | ✅ | ❌ | Three sites per tree on the decode GEMV weight streams. Unmeasured |
