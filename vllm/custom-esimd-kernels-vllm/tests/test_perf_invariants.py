@@ -396,3 +396,33 @@ def test_pooled_scratch_does_not_escape(path, fn, pool):
             f"{fn}: `{name}` is returned but bound to the pool; the next "
             "call overwrites a tensor the caller still holds"
         )
+
+
+_NMAJOR = [
+    _VLLM / "moe_batch/int4_nmajor_gemm.h",
+    _SGL / "moe_batch/int4_nmajor_gemm.h",
+]
+
+
+@pytest.mark.parametrize("path", _NMAJOR, ids=_ids)
+def test_nmajor_scale_reads_are_not_scalar_strided(path):
+    """N-major scales for one k-group are a strided run, so they load as one.
+
+    `s_base[(n_start + ni) * K_groups + kg]` walked by a scalar `ni` loop is one
+    message per element, and consecutive ni are K_groups*2 bytes apart -- a
+    separate 64-byte line each, for two useful bytes. The up kernel does this
+    16 times per group and the down kernel 32, on both scale streams.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    src = code(path.read_text())
+    scalar = re.findall(r"\w+\[ni\]\s*=\s*s_base\[\(", src)
+    assert not scalar, (
+        f"{path.name}: {len(scalar)} scalar strided scale read(s) remain; "
+        "a strided gather<fp16, N> issues the run as one message"
+    )
+    gathers = re.findall(r"gather<fp16,\s*N>\(\w+\s*\+\s*kg,\s*\w+\)", src)
+    assert len(gathers) >= 3, (
+        f"{path.name}: expected the gate, up and down scale streams to gather; "
+        f"found {len(gathers)}"
+    )

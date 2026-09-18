@@ -96,14 +96,18 @@ sycl::event moe_up_int4_nmajor_kernel(
                 simd<fp16, ACC_SZ> g_acc(fp16(0));
                 simd<fp16, ACC_SZ> u_acc(fp16(0));
 
+                // N-major scale: consecutive n rows are K_groups apart, so the
+                // N values for one kg form a strided run. One gather issues
+                // them as a single message instead of N dependent scalar loads.
+                const simd<uint32_t, N> scl_byte_off =
+                    simd<uint32_t, N>(0u, 1u) * (uint32_t)(K_groups * sizeof(IT));
+                const IT* gate_s0 = s_base + (size_t)n_start * K_groups;
+                const IT* up_s0 =
+                    s_base + (size_t)(intermediate_size + n_start) * K_groups;
+
                 for (int kg = 0; kg < K_groups; kg++) {
-                    // N-major scale: s_base[n_row * K_groups + kg]
-                    simd<fp16, N> gate_scl, up_scl;
-                    #pragma unroll
-                    for (int ni = 0; ni < N; ni++) {
-                        gate_scl[ni] = s_base[(n_start + ni) * K_groups + kg];
-                        up_scl[ni]   = s_base[(intermediate_size + n_start + ni) * K_groups + kg];
-                    }
+                    simd<fp16, N> gate_scl = gather<fp16, N>(gate_s0 + kg, scl_byte_off);
+                    simd<fp16, N> up_scl   = gather<fp16, N>(up_s0 + kg, scl_byte_off);
 
                     for (int kp_off = 0; kp_off < KP_PER_GROUP; kp_off += 2) {
                         const int kp_start = kg * KP_PER_GROUP + kp_off;
@@ -260,12 +264,15 @@ sycl::event moe_down_int4_nmajor_kernel(
 
                 simd<fp16, ACC_SZ> acc(fp16(0));
 
+                // N-major scale: consecutive n rows are I_groups apart, so the
+                // N values for one kg form a strided run. One gather issues
+                // them as a single message instead of N dependent scalar loads.
+                const simd<uint32_t, N> scl_byte_off =
+                    simd<uint32_t, N>(0u, 1u) * (uint32_t)(I_groups * sizeof(IT));
+                const IT* scl_s0 = s_base + (size_t)n_start * I_groups;
+
                 for (int kg = 0; kg < I_groups; kg++) {
-                    simd<fp16, N> scl;
-                    #pragma unroll
-                    for (int ni = 0; ni < N; ni++) {
-                        scl[ni] = s_base[(n_start + ni) * I_groups + kg];
-                    }
+                    simd<fp16, N> scl = gather<fp16, N>(scl_s0 + kg, scl_byte_off);
 
                     for (int kp_off = 0; kp_off < KP_PER_GROUP; kp_off += 2) {
                         const int kp_start = kg * KP_PER_GROUP + kp_off;
