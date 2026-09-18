@@ -14,6 +14,7 @@
 #include "../deepseek_v41/engram_gate.h"
 #include "../deepseek_v41/act_quant.h"
 #include "../deepseek_v41/o_groups.h"
+#include "../deepseek_v41/compressor.h"
 
 using namespace sycl::ext::intel::esimd;
 using fp16 = sycl::half;
@@ -312,4 +313,36 @@ void launch_o_group_proj(torch::Tensor& x, torch::Tensor& w,
             TORCH_CHECK(false, "deepseek_v41_o_group_proj: per-group input dim "
                                "must be 64, 128, 256 or 512, got ", D);
     }
+}
+
+
+void launch_compress_pool(torch::Tensor& kv, torch::Tensor& score,
+                          torch::Tensor& latent, int64_t ratio) {
+    const int G = (int)latent.size(0);
+    const int D = (int)latent.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(kv.device().index()).queue();
+    const float* kp = reinterpret_cast<const float*>(kv.data_ptr());
+    const float* sp = reinterpret_cast<const float*>(score.data_ptr());
+    float* lp = reinterpret_cast<float*>(latent.data_ptr());
+
+    switch (ratio) {
+        case 1: dsv41_compress::launch_compress_pool<1>(sq, kp, sp, lp, G, D); break;
+        case 2: dsv41_compress::launch_compress_pool<2>(sq, kp, sp, lp, G, D); break;
+        case 4: dsv41_compress::launch_compress_pool<4>(sq, kp, sp, lp, G, D); break;
+        case 8: dsv41_compress::launch_compress_pool<8>(sq, kp, sp, lp, G, D); break;
+        default:
+            TORCH_CHECK(false, "deepseek_v41_compress_pool: ratio must be 1, 2, "
+                               "4 or 8, got ", ratio);
+    }
+}
+
+void launch_rotary(torch::Tensor& x, torch::Tensor& cosv, torch::Tensor& sinv,
+                   bool inverse) {
+    const int S = (int)x.size(0);
+    const int D = (int)x.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+    dsv41_compress::launch_rotary(
+        sq, reinterpret_cast<float*>(x.data_ptr()),
+        reinterpret_cast<const float*>(cosv.data_ptr()),
+        reinterpret_cast<const float*>(sinv.data_ptr()), S, D, inverse);
 }

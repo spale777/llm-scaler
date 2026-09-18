@@ -57,6 +57,18 @@ void launch_o_group_proj(
     torch::Tensor& w,
     torch::Tensor& out);
 
+void launch_compress_pool(
+    torch::Tensor& kv,
+    torch::Tensor& score,
+    torch::Tensor& latent,
+    int64_t ratio);
+
+void launch_rotary(
+    torch::Tensor& x,
+    torch::Tensor& cosv,
+    torch::Tensor& sinv,
+    bool inverse);
+
 void launch_noaux_tc_topk(
     torch::Tensor& logits, 
     torch::Tensor& bias, 
@@ -317,6 +329,54 @@ torch::Tensor deepseek_v41_o_group_proj(
     return out;
 }
 
+torch::Tensor deepseek_v41_compress_pool(
+    torch::Tensor kv,
+    torch::Tensor score)
+{
+    CHECK_INPUT(kv);
+    CHECK_INPUT(score);
+    TORCH_CHECK(kv.scalar_type() == torch::kFloat32 &&
+                score.scalar_type() == torch::kFloat32,
+                "deepseek_v41_compress_pool: kv and score must be Float32; the "
+                "reference promotes the pooling path to fp32");
+    TORCH_CHECK(kv.dim() == 3, "expected kv [G, RATIO, D], got ", kv.dim(), "D");
+    TORCH_CHECK(score.sizes() == kv.sizes(), "score must match kv");
+
+    const int64_t ratio = kv.size(1);
+    auto latent = torch::empty({kv.size(0), kv.size(2)}, kv.options());
+    launch_compress_pool(kv, score, latent, ratio);
+    return latent;
+}
+
+torch::Tensor deepseek_v41_rotary(
+    torch::Tensor x,
+    torch::Tensor cosv,
+    torch::Tensor sinv,
+    bool inverse)
+{
+    CHECK_INPUT(x);
+    CHECK_INPUT(cosv);
+    CHECK_INPUT(sinv);
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 &&
+                cosv.scalar_type() == torch::kFloat32 &&
+                sinv.scalar_type() == torch::kFloat32,
+                "deepseek_v41_rotary: x, cos and sin must be Float32");
+    TORCH_CHECK(x.dim() == 2, "expected x [S, D], got ", x.dim(), "D");
+    // Adjacent elements form the complex pairs, so an odd width has a lane
+    // with no partner.
+    TORCH_CHECK(x.size(1) % 2 == 0, "deepseek_v41_rotary: D must be even, got ",
+                x.size(1));
+    TORCH_CHECK(cosv.dim() == 2 && cosv.size(0) == x.size(0) &&
+                cosv.size(1) == x.size(1) / 2,
+                "cos must be [S, D/2]");
+    TORCH_CHECK(sinv.sizes() == cosv.sizes(), "sin must match cos");
+
+    // Rotation is in place, matching the reference, which writes back through
+    // the same storage its caller still holds.
+    launch_rotary(x, cosv, sinv, inverse);
+    return x;
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
     m.def("deepseek_v41_fp4_gemm", &deepseek_v41_fp4_gemm);
     m.def("deepseek_v41_noaux_tc_topk", &deepseek_v41_noaux_tc_topk);
@@ -326,6 +386,8 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
     m.def("deepseek_v41_engram_gate", &deepseek_v41_engram_gate);
     m.def("deepseek_v41_act_quant", &deepseek_v41_act_quant);
     m.def("deepseek_v41_o_group_proj", &deepseek_v41_o_group_proj);
+    m.def("deepseek_v41_compress_pool", &deepseek_v41_compress_pool);
+    m.def("deepseek_v41_rotary", &deepseek_v41_rotary);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

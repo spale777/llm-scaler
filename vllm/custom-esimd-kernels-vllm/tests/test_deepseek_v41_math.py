@@ -1060,3 +1060,145 @@ def test_o_groups_count_matches_config():
     assert "w.size(0) == x.size(1)" in host, (
         "the group count must be checked against the input, not assumed"
     )
+
+
+# --- compressor and rotary --------------------------------------------------
+
+_COMPRESSOR = _DS / "compressor.h"
+
+
+def test_compress_pool_softmaxes_over_the_group_not_the_channels():
+    """(kv * score.softmax(dim=2)).sum(dim=2): the softmax is over the group.
+
+    Each channel of the latent is its own convex combination of that channel
+    across the group's positions. Reducing over channels instead makes the
+    dimensions compete, which they have no reason to do, and still returns a
+    full latent.
+    """
+    import random
+    random.seed(8)
+    G, R, D = 5, 2, 16
+    kv = [[[random.uniform(-2, 2) for _ in range(D)] for _ in range(R)]
+          for _ in range(G)]
+    sc = [[[random.uniform(-3, 3) for _ in range(D)] for _ in range(R)]
+          for _ in range(G)]
+
+    got = [[0.0] * D for _ in range(G)]
+    for g in range(G):
+        for d in range(D):
+            vals = [sc[g][i][d] for i in range(R)]
+            m = max(vals)
+            w = [math.exp(v - m) for v in vals]
+            den = sum(w)
+            got[g][d] = sum((w[i] / den) * kv[g][i][d] for i in range(R))
+            # The gate is a convex combination.
+            assert abs(sum(x / den for x in w) - 1.0) < 1e-12
+
+    over_channels = [[0.0] * D for _ in range(G)]
+    for g in range(G):
+        for i in range(R):
+            vals = sc[g][i]
+            m = max(vals)
+            e = [math.exp(v - m) for v in vals]
+            den = sum(e)
+            for d in range(D):
+                over_channels[g][d] += kv[g][i][d] * e[d] / den
+    differs = sum(1 for g in range(G) for d in range(D)
+                  if abs(got[g][d] - over_channels[g][d]) > 1e-9)
+    assert differs > 0, "the two reductions agree; test is not exercising the axis"
+
+    src = code(_COMPRESSOR.read_text())
+    assert "score[base + (size_t)i * D]" in src, (
+        "the softmax must walk the group axis at a fixed channel"
+    )
+
+
+@pytest.mark.parametrize("inverse", [False, True])
+def test_rotary_matches_complex_multiply(inverse):
+    """view_as_complex over ADJACENT pairs, times a unit complex per position."""
+    import cmath
+    import random
+    random.seed(8)
+    S, D = 4, 16
+    x = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(S)]
+    th = [[random.uniform(-3, 3) for _ in range(D // 2)] for _ in range(S)]
+
+    got = [row[:] for row in x]
+    for s in range(S):
+        for i in range(D // 2):
+            re, im = got[s][2 * i], got[s][2 * i + 1]
+            c, sn = math.cos(th[s][i]), math.sin(th[s][i])
+            if inverse:
+                sn = -sn
+            got[s][2 * i] = re * c - im * sn
+            got[s][2 * i + 1] = re * sn + im * c
+
+    for s in range(S):
+        for i in range(D // 2):
+            z = complex(x[s][2 * i], x[s][2 * i + 1])
+            f = cmath.exp(1j * th[s][i])
+            if inverse:
+                f = f.conjugate()
+            r = z * f
+            assert abs(got[s][2 * i] - r.real) < 1e-12
+            assert abs(got[s][2 * i + 1] - r.imag) < 1e-12
+
+
+def test_rotary_pairs_adjacent_elements_not_halves():
+    """Rotating x[i] against x[i + D/2] is the classic transcription error.
+
+    It produces a full, plausible output and a different model.
+    """
+    import random
+    random.seed(8)
+    S, D = 4, 16
+    x = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(S)]
+    th = [[random.uniform(-3, 3) for _ in range(D // 2)] for _ in range(S)]
+
+    adjacent = [row[:] for row in x]
+    halves = [row[:] for row in x]
+    for s in range(S):
+        for i in range(D // 2):
+            c, sn = math.cos(th[s][i]), math.sin(th[s][i])
+            re, im = adjacent[s][2 * i], adjacent[s][2 * i + 1]
+            adjacent[s][2 * i] = re * c - im * sn
+            adjacent[s][2 * i + 1] = re * sn + im * c
+            re, im = halves[s][i], halves[s][i + D // 2]
+            halves[s][i] = re * c - im * sn
+            halves[s][i + D // 2] = re * sn + im * c
+
+    differs = sum(1 for s in range(S) for d in range(D)
+                  if abs(adjacent[s][d] - halves[s][d]) > 1e-9)
+    assert differs > 0, "the two pairings agree; test is not exercising the layout"
+
+    src = code(_COMPRESSOR.read_text())
+    assert "(size_t)i * 2" in src, (
+        "the pair offset must be 2i, so the elements are adjacent"
+    )
+    assert "x[off + 1]" in src, "the imaginary part must be the next element"
+
+
+def test_rotary_inverse_undoes_the_rotation():
+    """The attention output has the query's rotation removed this way."""
+    import random
+    random.seed(8)
+    S, D = 4, 16
+    x = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(S)]
+    th = [[random.uniform(-3, 3) for _ in range(D // 2)] for _ in range(S)]
+
+    def rot(src_rows, inv):
+        y = [row[:] for row in src_rows]
+        for s in range(S):
+            for i in range(D // 2):
+                c, sn = math.cos(th[s][i]), math.sin(th[s][i])
+                if inv:
+                    sn = -sn
+                re, im = y[s][2 * i], y[s][2 * i + 1]
+                y[s][2 * i] = re * c - im * sn
+                y[s][2 * i + 1] = re * sn + im * c
+        return y
+
+    back = rot(rot(x, False), True)
+    for s in range(S):
+        for d in range(D):
+            assert abs(back[s][d] - x[s][d]) < 1e-12
