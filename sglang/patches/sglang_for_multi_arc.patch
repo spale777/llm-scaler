@@ -8962,7 +8962,7 @@ index 37552404b..8aa941fdd 100644
  _is_cuda = is_cuda()
  _is_cpu = is_cpu()
  _is_cpu_amx_available = cpu_has_amx_support()
-@@ -123,6 +158,836 @@ _is_hip = is_hip()
+@@ -123,6 +158,862 @@ _is_hip = is_hip()
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  
  
@@ -9207,22 +9207,38 @@ index 37552404b..8aa941fdd 100644
 +                      shared=shared is not None, sgate=sgate is not None)
 +        return None
 +
-+    # Fused topk uses softmax + renorm + plain (ungrouped, no-bias) selection.
++    # The fused router head implements softmax + renorm + ungrouped, no-bias
++    # selection and nothing else. A config that routes differently is not
++    # rejected outright: the expert half of the fused path is routing-agnostic
++    # and takes caller-supplied indices, so such a config runs there with the
++    # routing computed separately. `_esimd_routing_mode` records which.
 +    tc = getattr(topk, "topk_config", None)
 +    if tc is None:
 +        return None
-+    if getattr(tc, "scoring_func", "softmax") != "softmax":
-+        return None
-+    if not getattr(tc, "renormalize", True):
-+        return None
-+    if getattr(tc, "use_grouped_topk", False):
-+        return None
-+    if getattr(tc, "correction_bias", None) is not None:
-+        return None
 +    if getattr(tc, "custom_routing_function", None) is not None:
++        # Arbitrary python routing cannot be reproduced by either path.
 +        return None
 +    top_k = getattr(tc, "top_k", None)
 +    if top_k is None:
++        return None
++
++    scoring = getattr(tc, "scoring_func", "softmax")
++    grouped = bool(getattr(tc, "use_grouped_topk", False))
++    bias = getattr(tc, "correction_bias", None)
++    renorm = bool(getattr(tc, "renormalize", True))
++    if scoring == "softmax" and renorm and not grouped and bias is None:
++        routing_mode = "fused"
++    elif scoring == "sqrtsoftplus" and not grouped:
++        # noaux_tc: score every expert with sqrt(softplus(logit)), select on
++        # score + bias, weight by the unbiased score. The bias steers selection
++        # only, so it is required rather than disqualifying.
++        if bias is None:
++            _moe_full_dbg("noaux_tc_without_bias")
++            return None
++        routing_mode = "noaux_tc"
++    else:
++        _moe_full_dbg("routing_unsupported", scoring=scoring,
++                      grouped=grouped, bias=bias is not None, renorm=renorm)
 +        return None
 +
 +    # --- routed weights (e5m2) + load-time transposed caches ---
@@ -9288,6 +9304,8 @@ index 37552404b..8aa941fdd 100644
 +        "shared_down": shared_down, "ss2": ss2,
 +        "sgw16": sgw16,
 +    }
++    W["routing_mode"] = routing_mode
++    W["correction_bias"] = bias
 +    block._esimd_moe_full_W = W
 +    return W
 +
@@ -9486,7 +9504,10 @@ index 37552404b..8aa941fdd 100644
 +    if qm is None or not hasattr(qm, "gate_ql") or not hasattr(qm, "down_ql"):
 +        return False
 +
-+    # topk must be plain softmax + renorm (matches the fused kernel selection).
++    # This path fuses the router into the shared-expert kernel, whose head is
++    # softmax + renorm over ungrouped, unbiased scores. Unlike the routed
++    # entry there is no caller-supplied-indices variant here, so a config that
++    # routes differently genuinely cannot use it.
 +    tc = getattr(topk, "topk_config", None)
 +    if tc is None:
 +        return False
@@ -9763,6 +9784,11 @@ index 37552404b..8aa941fdd 100644
 +
 +    W = _gather_moe_full_weights(block, x)
 +    if W is None:
++        return None
++    # This entry point fuses the router GEMV and a softmax top-k into the same
++    # dispatch, so it can only serve a config whose routing is exactly that.
++    # noaux_tc configs reach the experts through the routed entry instead.
++    if W.get("routing_mode") != "fused":
 +        return None
 +
 +    wqsc = _esimd_router_wq_scale(W["gate"], x)

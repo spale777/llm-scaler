@@ -1221,3 +1221,55 @@ def test_esimd_kernels_avoid_scalar_sycl_math():
         "scalar sycl:: math in an ESIMD kernel fails at device codegen, which "
         "a syntax-only check does not reach:\n  " + "\n  ".join(offenders)
     )
+
+
+# --- sglang fused-MoE routing admission -------------------------------------
+
+_SGL_PATCH = (Path(__file__).resolve().parents[3]
+              / "sglang/patches/sglang_for_multi_arc.patch")
+
+
+def test_fused_moe_admits_noaux_tc_routing():
+    """A sqrtsoftplus config must not be rejected before it is classified.
+
+    The fused entry point computes the router inside its own kernel with a
+    hardcoded softmax, so it can only serve softmax configs. But the expert
+    half is routing-agnostic and takes caller-supplied indices, so a noaux_tc
+    config is not unservable -- rejecting it at the door sends V4.1 down the
+    unfused path by construction, which is what the correct FP4 GEMM was
+    supposed to avoid.
+    """
+    if not _SGL_PATCH.exists():
+        pytest.skip("sglang patch not present")
+    src = _SGL_PATCH.read_text()
+
+    assert '"sqrtsoftplus"' in src, (
+        "the fused-MoE builder never mentions sqrtsoftplus, so a V4.1 config "
+        "falls through to the generic rejection"
+    )
+    assert 'routing_mode = "noaux_tc"' in src, (
+        "noaux_tc configs are not classified, only refused"
+    )
+    # The bias steers selection; requiring it absent is the V3-era assumption.
+    i = src.find('routing_mode = "noaux_tc"')
+    window = src[max(0, i - 900):i]
+    assert "bias is None" in window, (
+        "noaux_tc without a correction bias must still be refused: the bias is "
+        "what the selection is made on"
+    )
+
+
+def test_fused_runtime_refuses_a_routing_it_cannot_compute():
+    """The fused op folds the router in, so it must check the mode it got.
+
+    Admitting noaux_tc at build time without gating the runtime would hand a
+    sqrtsoftplus config to a kernel that computes softmax and return plausible
+    wrong experts.
+    """
+    if not _SGL_PATCH.exists():
+        pytest.skip("sglang patch not present")
+    src = _SGL_PATCH.read_text()
+    assert 'W.get("routing_mode") != "fused"' in src, (
+        "the fused runtime does not check the routing mode, so a noaux_tc "
+        "config would be routed by a softmax kernel"
+    )
