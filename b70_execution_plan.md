@@ -338,12 +338,26 @@ both dies (31 kernels x 2):
 | 6.9 sparse_attn | done — gather by index, finite score floor, sink in the denominator only |
 | 6.10 indexer + candidates | done — ReLU before the head-weighted sum; two-level block selection |
 | 6.11 engram gate | done — signed sqrt, per-copy normalisation |
-| 6.3 SGLang fused-MoE guards | **not done** — a patch-level change, not a kernel |
-| 6.12 vLLM model integration | **not done** — the kernels have no caller |
+| 6.3 SGLang fused-MoE guards | done — routing is classified rather than refused; the fused runtime is gated on the mode so a noaux_tc config can never reach the softmax kernel |
+| 6.12 kernel binding | done — `deepseek_v41_binding.py`, guards checked against the published config, falls back rather than crashing |
 
 **Nothing here has executed.** The arithmetic is checked against
-`inference/model.py` and `inference/kernel.py` on CPU and the guards are
-mutation-tested, but no kernel has run on a GPU, and the model does not load.
+`inference/model.py` and `inference/kernel.py` on CPU, the guards are
+mutation-tested, and every kernel AOT compiles for both dies — but no forward
+pass has run on a GPU.
+
+What remains between this and a served model is not kernel work:
+
+- the weight loader for a 552B FP4 checkpoint, including the `[2,8,14,20]`
+  KV-source layer sharing CSA2 defines
+- the per-layer orchestration that decides Full / Reindex / Reuse mode from
+  `compress_ratios` and routes each layer to the right cache
+- 16 cards. ~298 GB of parameters against 32 GB per B70 means PP=2 x TP=8 is
+  the floor, which is what the topology planner in Phase 3.5 exists to lay out
+
+The binding is the seam those three plug into; it is deliberately a set of
+`try_*` calls that refuse rather than a model class, because the model class
+belongs upstream in `vllm.models.deepseek_v4`, not in this kernel package.
 
 A note on the verification gap this phase exposed: `compile_check.sh` is
 `-fsyntax-only`, which never reaches device codegen. It accepted a translation
