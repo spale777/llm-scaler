@@ -236,3 +236,41 @@ def test_wide_router_accumulates_in_float(path):
         f"disagrees with the narrow kernel across the dispatch boundary: "
         f"{unconverted[:2]}"
     )
+
+
+_INT4_MOE = [_VLLM / "moe_batch/moe_int4.sycl", _SGL / "moe_batch/moe_int4.sycl"]
+
+
+@pytest.mark.parametrize("path", _INT4_MOE, ids=_ids)
+def test_int4_scale_is_not_reloaded_every_k_step(path):
+    """A scale group spans 16 kp, so loading it per kp re-reads it 16 times.
+
+    The weight load in these loops is the useful traffic; on the 64-wide up
+    kernel four scale vectors of 64 bytes each sat beside it, so a third of
+    that kernel's bytes were the same scale lines fetched again. The value is
+    a pure function of kp / 16, so reloading only when that changes is
+    bit-identical -- simulated over every shape and stride with no divergence.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    src = code(path.read_text())
+    # Every `kg = kp / 16` must be followed by a change guard rather than by a
+    # bare load.
+    sites = [m.end() for m in re.finditer(r"(?:const )?int kg = kp / 16;", src)]
+    assert sites, "the scale-group index is gone -- re-derive this test"
+    ungated = []
+    for at in sites:
+        window = src[at:at + 120]
+        if not re.search(r"if \(kg != kg_cur\)", window):
+            ungated.append(window[:70])
+    assert not ungated, (
+        f"{path.name}: {len(ungated)} scale-group site(s) load unconditionally "
+        f"inside the k loop: {ungated}"
+    )
+    # ...and the cursor must start outside the valid range, or the first group
+    # is never loaded at all.
+    for m in re.finditer(r"int kg_cur = (-?\d+);", src):
+        assert int(m.group(1)) < 0, (
+            f"{path.name}: kg_cur starts at {m.group(1)}, so group "
+            f"{m.group(1)} would be skipped"
+        )

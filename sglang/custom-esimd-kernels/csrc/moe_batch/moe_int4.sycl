@@ -437,6 +437,11 @@ void moe_up_routed_int4_kernel(
 
                     constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
 
+                    // One scale group spans 16 kp, so the four scale vectors are
+                    // reloaded only when the group changes rather than per kp.
+                    simd<fp16, 32> gs0, gs1, us0, us1;
+                    int kg_cur = -1;
+
                     for (int kp = 0; kp < K_packed; kp++) {
                         simd<fp16, 8> x_chunk = block_load<fp16, 8>(x_row + kp * 8);
 
@@ -445,11 +450,14 @@ void moe_up_routed_int4_kernel(
                         simd<uint32_t, 32> up0 = block_load<uint32_t, 32>(w_base + (size_t)kp * two_dff + u0);
                         simd<uint32_t, 32> up1 = block_load<uint32_t, 32>(w_base + (size_t)kp * two_dff + u1);
 
-                        int kg = kp / 16;
-                        simd<fp16, 32> gs0 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + g0);
-                        simd<fp16, 32> gs1 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + g1);
-                        simd<fp16, 32> us0 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + u0);
-                        simd<fp16, 32> us1 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + u1);
+                        const int kg = kp / 16;
+                        if (kg != kg_cur) {
+                            kg_cur = kg;
+                            gs0 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + g0);
+                            gs1 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + g1);
+                            us0 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + u0);
+                            us1 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + u1);
+                        }
 
                         #pragma unroll
                         for (int b = 0; b < 8; b++) {
@@ -532,6 +540,10 @@ void moe_up_routed_int4_slm_kernel(
                 constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
 
                 simd<float, 16> gate_acc(0.f), up_acc(0.f);
+                // The stride is GS, so a group spans several iterations only
+                // when GS < 16; the guard reloads exactly on a change either way.
+                simd<fp16, 16> g_scale, u_scale;
+                int kg_cur = -1;
                 for (int kp = tid; kp < K_packed; kp += GS) {
                     simd<fp16, 8> x_chunk = block_load<fp16, 8>(x_row + kp * 8);
                     simd<uint32_t, 16> g_packed = block_load<uint32_t, 16>(
@@ -539,11 +551,14 @@ void moe_up_routed_int4_slm_kernel(
                     simd<uint32_t, 16> u_packed = block_load<uint32_t, 16>(
                         w_base + (size_t)kp * two_dff + u_offset);
 
-                    int kg = kp / 16;
-                    simd<fp16, 16> g_scale = block_load<fp16, 16>(
-                        s_base + (size_t)kg * two_dff + g_offset);
-                    simd<fp16, 16> u_scale = block_load<fp16, 16>(
-                        s_base + (size_t)kg * two_dff + u_offset);
+                    const int kg = kp / 16;
+                    if (kg != kg_cur) {
+                        kg_cur = kg;
+                        g_scale = block_load<fp16, 16>(
+                            s_base + (size_t)kg * two_dff + g_offset);
+                        u_scale = block_load<fp16, 16>(
+                            s_base + (size_t)kg * two_dff + u_offset);
+                    }
 
                     #pragma unroll
                     for (int b = 0; b < 8; b++) {
@@ -806,15 +821,22 @@ void moe_down_routed_int4_kernel(
                     constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
                     simd<float, 32> acc0(0.f), acc1(0.f);
 
+                    // One scale group spans 16 kp: reload only on a group change.
+                    simd<fp16, 32> sc0, sc1;
+                    int kg_cur = -1;
+
                     for (int kp = 0; kp < K_packed; kp++) {
                         simd<fp16, 8> hi_chunk = block_load<fp16, 8>(hi + kp * 8);
 
                         simd<uint32_t, 32> pk0 = block_load<uint32_t, 32>(w_base + (size_t)kp * hidden_size + n_start);
                         simd<uint32_t, 32> pk1 = block_load<uint32_t, 32>(w_base + (size_t)kp * hidden_size + n_start + 32);
 
-                        int kg = kp / 16;
-                        simd<fp16, 32> sc0 = block_load<fp16, 32>(s_base + (size_t)kg * hidden_size + n_start);
-                        simd<fp16, 32> sc1 = block_load<fp16, 32>(s_base + (size_t)kg * hidden_size + n_start + 32);
+                        const int kg = kp / 16;
+                        if (kg != kg_cur) {
+                            kg_cur = kg;
+                            sc0 = block_load<fp16, 32>(s_base + (size_t)kg * hidden_size + n_start);
+                            sc1 = block_load<fp16, 32>(s_base + (size_t)kg * hidden_size + n_start + 32);
+                        }
 
                         #pragma unroll
                         for (int b = 0; b < 8; b++) {
@@ -888,15 +910,22 @@ void moe_down_routed_int4_slm_kernel(
 
                 constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
                 simd<float, 16> acc(0.f);
+                // The stride is GS, so a group spans several iterations only
+                // when GS < 16; the guard reloads exactly on a change either way.
+                simd<fp16, 16> scale;
+                int kg_cur = -1;
 
                 for (int kp = tid; kp < K_packed; kp += GS) {
                     simd<fp16, 8> hi_chunk = block_load<fp16, 8>(hi + kp * 8);
                     simd<uint32_t, 16> packed = block_load<uint32_t, 16>(
                         w_base + (size_t)kp * hidden_size + n_start);
 
-                    int kg = kp / 16;
-                    simd<fp16, 16> scale = block_load<fp16, 16>(
-                        s_base + (size_t)kg * hidden_size + n_start);
+                    const int kg = kp / 16;
+                    if (kg != kg_cur) {
+                        kg_cur = kg;
+                        scale = block_load<fp16, 16>(
+                            s_base + (size_t)kg * hidden_size + n_start);
+                    }
 
                     #pragma unroll
                     for (int b = 0; b < 8; b++) {
