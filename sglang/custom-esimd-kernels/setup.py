@@ -33,7 +33,7 @@ ext_modules = [
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-Xs", "-device bmg", "-funroll-loops", "-Xs", "-options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", "-device bmg -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
@@ -79,7 +79,7 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-Xs", "-device bmg -options -doubleGRF", "-funroll-loops", "-Xs", "-options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", "-device bmg -options -doubleGRF -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
@@ -146,7 +146,7 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-Xs", "-device bmg", "-funroll-loops", "-Xs", "-options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", "-device bmg -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
@@ -196,9 +196,12 @@ ext_modules.append(
 ### Grouped GGUF MoE GGEMV (Q4_K up + Q5_K/Q6_K down, doubleGRF DPAS).
 # Used by sglang gguf.py for GGUF MoE prefill + MTP-verify (small-M N=16 occupancy
 # tile). DPAS REQUIRES AOT for the actual GPU — JIT'ing DPAS on PTL is unreliable —
-# so this ext is AOT to OMNI_XPU_DEVICE (default ptl-u Xe3) with -doubleGRF, unlike
-# the JIT eagle_ops above. Ported from cc_workspace POC moe_q4k_prefill_poc.
-_MOE_GROUPED_DEV = os.environ.get("OMNI_XPU_DEVICE", "ptl-u")
+# so this ext is AOT to OMNI_XPU_DEVICE with -doubleGRF. Ported from cc_workspace
+# POC moe_q4k_prefill_poc.
+# The default is bmg, matching _PREFILL_DPAS_DEV below: both read this one
+# variable, so a different default here builds one of them for an architecture
+# the other is not targeting, and this repo ships B60/B70.
+_MOE_GROUPED_DEV = os.environ.get("OMNI_XPU_DEVICE", "bmg")
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_sglang.moe_grouped_gguf_xpu",

@@ -38,6 +38,7 @@ SyclExtension(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -95,7 +96,8 @@ ext_modules.append(
 )
 ### MoE auxiliary kernels
 
-### FP8 GEMM (M>1) — uses DPAS, compile with JIT only (no AOT to avoid device mismatch)
+### FP8 GEMM (M>1) — uses DPAS. `-device bmg` is the family target, so one
+### binary covers G21 and G31; only a per-die target risks a mismatch.
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_vllm.custom_esimd_kernels_gemm",
@@ -110,6 +112,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -155,6 +158,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -176,6 +180,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -199,6 +204,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
