@@ -145,10 +145,18 @@ void moe_router_forward_e4m3_kernel(
 
                 simd<float, 64> acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
 
+                const uint8_t* wrow = weight + (size_t)row * hidden_size;
                 for (int k = 0; k < hidden_size; k += 64) {
+                    // The router weight row is streamed once per token block;
+                    // the up/down kernels below prefetch the same way.
+                    if (k + 64 < hidden_size) {
+                        xesimd::lsc_prefetch<uint8_t, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(wrow + k + 64);
+                    }
                     simd<fp16, 64> wv = fp8e4m3_to_half<64>(
-                        block_load<uint8_t, 64>(
-                            weight + (size_t)row * hidden_size + k)) * s;
+                        block_load<uint8_t, 64>(wrow + k)) * s;
 
                     simd<fp16, 64> xv0 = block_load<fp16, 64>(x + k);
                     acc0 += convert<float>(xv0 * wv);
@@ -197,10 +205,18 @@ void moe_router_forward_e5m2_kernel(
 
                 simd<float, 64> acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
 
+                const uint8_t* wrow = weight + (size_t)row * hidden_size;
                 for (int k = 0; k < hidden_size; k += 64) {
+                    // The router weight row is streamed once per token block;
+                    // the up/down kernels below prefetch the same way.
+                    if (k + 64 < hidden_size) {
+                        xesimd::lsc_prefetch<uint8_t, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(wrow + k + 64);
+                    }
                     simd<fp16, 64> wv = fp8e5m2_to_half<64>(
-                        block_load<uint8_t, 64>(
-                            weight + (size_t)row * hidden_size + k)) * (fp16)s;
+                        block_load<uint8_t, 64>(wrow + k)) * (fp16)s;
 
                     simd<fp16, 64> xv0 = block_load<fp16, 64>(x + k);
                     acc0 += convert<float>(xv0 * wv);
@@ -763,6 +779,20 @@ void moe_up_shared_e4m3_kernel(
 
                 simd<float, 64> ag(0.f), au(0.f);
                 for (int k = 0; k < hidden_size; k += 64) {
+                    // Shared-expert weights are the largest non-routed
+                    // decode stream; the routed kernels prefetch likewise.
+                    if (k + 64 < hidden_size) {
+                        xesimd::lsc_prefetch<uint8_t, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(gw + k + 64);
+                    }
+                    if (k + 64 < hidden_size) {
+                        xesimd::lsc_prefetch<uint8_t, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(uw + k + 64);
+                    }
                     auto xv = block_load<fp16, 64>(x_row + k);
                     auto g_dq = fp8e4m3_to_half<64>(block_load<uint8_t, 64>(gw + k)) * s;
                     auto u_dq = fp8e4m3_to_half<64>(block_load<uint8_t, 64>(uw + k)) * s;
@@ -810,6 +840,20 @@ void moe_up_shared_e5m2_kernel(
 
                 simd<float, 64> ag(0.f), au(0.f);
                 for (int k = 0; k < hidden_size; k += 64) {
+                    // Shared-expert weights are the largest non-routed
+                    // decode stream; the routed kernels prefetch likewise.
+                    if (k + 64 < hidden_size) {
+                        xesimd::lsc_prefetch<uint8_t, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(gw + k + 64);
+                    }
+                    if (k + 64 < hidden_size) {
+                        xesimd::lsc_prefetch<uint8_t, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(uw + k + 64);
+                    }
                     auto xv = block_load<fp16, 64>(x_row + k);
                     auto g_dq = fp8e5m2_to_half<64>(block_load<uint8_t, 64>(gw + k)) * s;
                     auto u_dq = fp8e5m2_to_half<64>(block_load<uint8_t, 64>(uw + k)) * s;
@@ -1138,6 +1182,12 @@ void moe_down_shared_e4m3_kernel(
 
                 simd<float, 64> acc(0.f);
                 for (int k = 0; k < intermediate_size; k += 64) {
+                    if (k + 64 < intermediate_size) {
+                        xesimd::lsc_prefetch<uint8_t, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(dw + k + 64);
+                    }
                     auto d_dq = fp8e4m3_to_half<64>(block_load<uint8_t, 64>(dw + k)) * ds;
                     acc += convert<float>(d_dq * block_load<fp16, 64>(hi + k));
                 }
@@ -1177,6 +1227,12 @@ void moe_down_shared_e5m2_kernel(
 
                 simd<float, 64> acc(0.f);
                 for (int k = 0; k < intermediate_size; k += 64) {
+                    if (k + 64 < intermediate_size) {
+                        xesimd::lsc_prefetch<uint8_t, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(dw + k + 64);
+                    }
                     auto d_dq = fp8e5m2_to_half<64>(block_load<uint8_t, 64>(dw + k)) * ds;
                     acc += convert<float>(d_dq * block_load<fp16, 64>(hi + k));
                 }

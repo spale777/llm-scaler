@@ -222,6 +222,13 @@ struct MoeDownAccumulateDecode {
                 intermediates + static_cast<size_t>(route) * intermediate;
             simd<float, VL> accumulator = 0.0f;
             for (int k = 0; k < full_end; k += VL) {
+                // One full expert matrix is streamed per route, so the weight
+                // is the dominant traffic here as in MoeDownDecode above.
+                if (k + VL < full_end) {
+                    xesimd::lsc_prefetch<uint8_t, VL, xesimd::lsc_data_size::default_size,
+                                         xesimd::cache_hint::cached,
+                                         xesimd::cache_hint::cached>(weight + k + VL);
+                }
                 simd<float, VL> values =
                     block_load<fp16, VL>(input + k);
                 accumulator += values * moe_decode_fp8_to_float<VL>(

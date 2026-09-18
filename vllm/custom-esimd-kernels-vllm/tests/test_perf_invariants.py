@@ -94,6 +94,38 @@ def test_weight_streams_are_prefetched(path):
 
 
 @pytest.mark.parametrize("path", _MOE_SYCL, ids=_ids)
+def test_router_and_shared_weight_streams_are_prefetched(path):
+    """Every fp8 weight stream in moe.sycl, not just the routed up/down pair.
+
+    The router reads one [E, hidden] row per token block and the shared-expert
+    kernels read the largest non-routed matrices at decode; both streamed with
+    no prefetch while the routed kernels beside them had it.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    c = code(path.read_text())
+    # Each fp8 weight pointer that is loaded in a k loop must be prefetched.
+    checked = 0
+    for ptr in ("wrow", "gw", "uw", "dw"):
+        loads = len(re.findall(
+            rf"block_load<uint8_t, 64>\({ptr} \+ k\)", c))
+        if not loads:
+            continue
+        checked += 1
+        pf = len(re.findall(rf"lsc_prefetch<[^>]*>\({ptr} \+ k \+ 64\)", c))
+        assert pf >= loads, (
+            f"{path.name}: {loads} load(s) of `{ptr}` in a k loop but only "
+            f"{pf} prefetch(es); this stream is read once and never reused"
+        )
+    # Renaming every pointer in both trees would otherwise empty the loop and
+    # pass having examined nothing.
+    assert checked >= 4, (
+        f"{path.name}: examined {checked} of the 4 weight streams; the "
+        "anchors moved and this test stopped checking them"
+    )
+
+
+@pytest.mark.parametrize("path", _MOE_SYCL, ids=_ids)
 def test_wide_router_streams_each_weight_row_once(path):
     """A (token, expert) grid re-reads each expert row n_tokens times."""
     if not path.exists():
