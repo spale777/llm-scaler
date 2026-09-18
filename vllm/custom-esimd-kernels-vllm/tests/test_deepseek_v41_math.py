@@ -5,6 +5,7 @@ reference in deepseek-ai/DeepSeek-V4.1-Flash
 inference/{model.py,kernel.py,convert.py}.
 """
 
+import math
 import re
 import struct
 from pathlib import Path
@@ -164,3 +165,207 @@ def test_expert_count_matches_the_config():
         "n_routed_experts is 384 in config.json; 256 matches no layer"
     )
     assert "case 6:" in src, "num_experts_per_tok is 6"
+
+
+# --- the implemented kernels' arithmetic, mirrored and checked exactly ---
+
+_GEMM = _DS / "fp4_gemm.h"
+NEG_INF = -3.0e38
+EPS = 1e-20
+ROUTED_SCALING = 1.5
+
+
+def _nib_val(n):
+    return E2M1[n & 7] * (-1.0 if n & 8 else 1.0)
+
+
+def _scale_val(raw):
+    """UE8M0 -> float, mirroring decode_ue8m0_scales."""
+    return 0.0 if raw <= 112 else 2.0 ** (min(raw, 142) - 112 - 15)
+
+
+def test_ue8m0_decode_is_exact_over_every_byte():
+    """raw=127 must be 1.0, and the Inf encoding must be unreachable.
+
+    Exponent field 31 is fp16 Inf/NaN; an Inf scale against an E2M1 zero gives
+    NaN and poisons the whole output tile, so the raw value saturates at 142.
+    """
+    src = code(_DEQUANT.read_text())
+    m = re.search(r"min\(shifted,\s*\(uint16_t\)(\d+)\)", src)
+    assert m, "the UE8M0 saturation bound is no longer recognisable"
+    assert int(m.group(1)) == 142, (
+        f"scale saturates at {m.group(1)}; 143 or above encodes fp16 Inf"
+    )
+    m = re.search(r"shifted\s*=\s*shifted\s*-\s*(\d+)", src)
+    assert m and int(m.group(1)) == 112, "the 127->15 exponent rebias is wrong"
+    assert _scale_val(127) == 1.0
+    assert _scale_val(112) == 0.0
+    assert _scale_val(142) == 32768.0
+
+
+def _kernel_gemm(A, B, S, M, N, K, n_tile=16, group=32):
+    """Mirror of FP4_GEMM_Kernel including its VNNI index arithmetic."""
+    k_packed, k_groups = K // 2, K // group
+    C = [[0.0] * N for _ in range(M)]
+    for n0 in range(0, N, n_tile):
+        for m0 in range(M):
+            acc = [0.0] * n_tile
+            for k in range(0, K, 32):
+                kg = k // group
+                scl = [_scale_val(S[(n0 + n) * k_groups + kg])
+                       if n0 + n < N else 0.0 for n in range(n_tile)]
+                b_rows = [0.0] * (n_tile * 32)
+                for n in range(n_tile):
+                    if n0 + n >= N:
+                        continue
+                    base = (n0 + n) * k_packed + k // 2
+                    for byte in range(16):
+                        p = B[base + byte]
+                        b_rows[n * 32 + byte * 2] = _nib_val(p & 0xF) * scl[n]
+                        b_rows[n * 32 + byte * 2 + 1] = _nib_val((p >> 4) & 0xF) * scl[n]
+                for ks in range(0, 32, 16):
+                    b_vnni = [0.0] * (n_tile * 16)
+                    for n in range(n_tile):
+                        for kk in range(16):
+                            b_vnni[(kk // 2) * (n_tile * 2) + n * 2 + (kk & 1)] = \
+                                b_rows[n * 32 + ks + kk]
+                    a_tile = [A[m0 * K + k + ks + t] for t in range(16)]
+                    for n in range(n_tile):
+                        acc[n] += sum(
+                            a_tile[kk] * b_vnni[(kk // 2) * (n_tile * 2) + n * 2 + (kk & 1)]
+                            for kk in range(16))
+            for n in range(n_tile):
+                if n0 + n < N:
+                    C[m0][n0 + n] = acc[n]
+    return C
+
+
+def _reference_gemm(A, B, S, M, N, K, group=32):
+    k_packed, k_groups = K // 2, K // group
+    C = [[0.0] * N for _ in range(M)]
+    for m in range(M):
+        for n in range(N):
+            s = 0.0
+            for k in range(K):
+                byte = B[n * k_packed + k // 2]
+                nib = (byte & 0xF) if k % 2 == 0 else ((byte >> 4) & 0xF)
+                s += A[m * K + k] * _nib_val(nib) * _scale_val(S[n * k_groups + k // group])
+            C[m][n] = s
+    return C
+
+
+@pytest.mark.parametrize("M,N,K", [(1, 16, 32), (1, 16, 64), (2, 32, 64),
+                                   (3, 16, 128), (1, 64, 256)])
+def test_fp4_gemm_vnni_layout_matches_a_plain_dot_product(M, N, K):
+    """The VNNI interleave is where a hand-derived DPAS layout usually breaks.
+
+    b_vnni[(kk/2)*(N*2) + n*2 + (kk&1)] places k pairs for channel n; getting
+    the stride or the parity wrong still produces a full output tile, just the
+    wrong one, so this compares against a direct sum over k.
+    """
+    import random
+    random.seed(1234 + M * 1000 + N * 10 + K)
+    A = [random.uniform(-2, 2) for _ in range(M * K)]
+    B = [random.randrange(256) for _ in range(N * (K // 2))]
+    S = [random.randrange(113, 143) for _ in range(N * (K // 32))]
+
+    got = _kernel_gemm(A, B, S, M, N, K)
+    want = _reference_gemm(A, B, S, M, N, K)
+    worst = max(abs(got[m][n] - want[m][n]) / max(1e-9, abs(want[m][n]))
+                for m in range(M) for n in range(N))
+    assert worst < 1e-9, f"VNNI layout diverges: worst relative error {worst:.3e}"
+
+
+def _kernel_router(logits, bias, E, TK, NG, TKG):
+    """Mirror of compute_noaux_tc_routing, including the group-limited stage."""
+    scores = [math.sqrt(math.log(1.0 + math.exp(x))) for x in logits]
+    sel = [scores[i] + bias[i] for i in range(E)]
+    if NG > 1 and TKG < NG:
+        GS = E // NG
+        key = []
+        for g in range(NG):
+            b0 = b1 = NEG_INF
+            for i in range(GS):
+                v = sel[g * GS + i]
+                if v > b0:
+                    b1, b0 = b0, v
+                elif v > b1:
+                    b1 = v
+            key.append(b0 + b1)
+        live = [False] * NG
+        for _ in range(TKG):
+            best, bg = NEG_INF, 0
+            for g in range(NG):
+                if not live[g] and key[g] > best:
+                    best, bg = key[g], g
+            live[bg] = True
+            key[bg] = NEG_INF
+        for g in range(NG):
+            if not live[g]:
+                for i in range(GS):
+                    sel[g * GS + i] = NEG_INF
+    idx, w, tot = [], [], 0.0
+    for _ in range(TK):
+        mv, mi = NEG_INF, 0
+        for i in range(E):
+            if sel[i] > mv:
+                mv, mi = sel[i], i
+        idx.append(mi)
+        w.append(scores[mi])
+        tot += scores[mi]
+        sel[mi] = NEG_INF
+    inv = 1.0 / (tot + EPS)
+    return idx, [x * inv * ROUTED_SCALING for x in w]
+
+
+def test_group_limited_routing_matches_the_reference():
+    """Only the best TOPK_GROUP groups may serve a token.
+
+    A group ranks by the sum of its two best keys, so one strong expert cannot
+    carry a group alone. Skipping this stage still returns TOP_K experts, just
+    from anywhere, which no shape check would catch.
+    """
+    import random
+    random.seed(11)
+    E, TK, NG, TKG = 384, 6, 8, 4
+    for _ in range(50):
+        lg = [random.uniform(-6, 6) for _ in range(E)]
+        bs = [random.uniform(-1, 1) for _ in range(E)]
+        got_i, got_w = _kernel_router(lg, bs, E, TK, NG, TKG)
+
+        scores = [math.sqrt(math.log1p(math.exp(x))) for x in lg]
+        keys = [scores[i] + bs[i] for i in range(E)]
+        GS = E // NG
+        gscore = [sum(sorted(keys[g * GS:(g + 1) * GS], reverse=True)[:2])
+                  for g in range(NG)]
+        keep = set(sorted(range(NG), key=lambda g: -gscore[g])[:TKG])
+        masked = [keys[i] if (i // GS) in keep else NEG_INF for i in range(E)]
+        want_i = sorted(range(E), key=lambda i: (-masked[i], i))[:TK]
+
+        assert got_i == want_i, "group-limited selection diverges"
+        assert all((i // GS) in keep for i in got_i), (
+            "an expert outside the surviving groups was selected"
+        )
+        tot = sum(scores[i] for i in want_i)
+        want_w = [scores[i] / (tot + EPS) * ROUTED_SCALING for i in want_i]
+        assert max(abs(a - b) for a, b in zip(got_w, want_w)) < 1e-12
+
+
+def test_routing_weight_is_the_unbiased_score():
+    """The bias steers selection only; it must not reach the returned weight.
+
+    Folding the bias into the weight is the natural mistake and changes every
+    expert's contribution while still selecting the right experts.
+    """
+    import random
+    random.seed(5)
+    E, TK = 384, 6
+    lg = [random.uniform(-4, 4) for _ in range(E)]
+    bs = [random.uniform(0.5, 2.0) for _ in range(E)]
+    idx, w = _kernel_router(lg, bs, E, TK, 8, 4)
+    scores = [math.sqrt(math.log1p(math.exp(x))) for x in lg]
+    tot = sum(scores[i] for i in idx)
+    for k, i in enumerate(idx):
+        assert abs(w[k] - scores[i] / (tot + EPS) * ROUTED_SCALING) < 1e-12, (
+            "the returned weight carries the selection bias"
+        )

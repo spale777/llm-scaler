@@ -2072,30 +2072,87 @@ def test_onednn_get_stream_bounds_its_device_index():
         )
 
 
-def test_deepseek_v41_ops_still_refuse():
-    """Nothing pinned either refusal, and deleting one is the natural first move.
+def test_deepseek_v41_ops_load_and_store():
+    """Both kernels must touch memory; a refusal is no longer the contract.
 
-    Both kernels read uninitialised registers and store nothing (topk), or build
-    an invalid nd_range at M<16 (fp4 gemm). Xe2 XMX has no FP4 or FP8 matrix
-    arithmetic, so neither can work as written.
+    The earlier shape of these ops declared their operands, never loaded them,
+    and stored nothing, so the bindings refused rather than return an
+    uninitialised tensor. They now run, which makes the load and the store the
+    thing worth pinning: dropping either brings back a kernel that computes on
+    register garbage and looks like it worked.
     """
+    kern = _VLLM / "xpu/deepseek_kernels.sycl"
+    if not kern.exists():
+        pytest.skip(f"{kern} not present")
+    c = code(kern.read_text())
+
+    i = c.find("struct DeepSeekTopKKernel")
+    assert i >= 0, "the topk kernel was renamed; re-derive this test"
+    body = c[i:c.find("void launch_fp4_gemm", i)]
+    assert "block_load<fp16,NUM_EXPERTS>(logits" in tokens(body), (
+        "the router does not load its logits"
+    )
+    assert "block_load<fp16,NUM_EXPERTS>(bias)" in tokens(body), (
+        "the router does not load its bias"
+    )
+    assert "out_indices" in body and "out_weights" in body, (
+        "the router does not store its selection"
+    )
+    assert re.search(r"compute_noaux_tc_routing<\s*NUM_EXPERTS,\s*TOP_K,"
+                     r"\s*N_GROUP,\s*TOPK_GROUP\s*>", body), (
+        "the router must pass its group configuration; without it the "
+        "group-limited stage is skipped and a different expert set is chosen"
+    )
+
     path = _VLLM / "xpu/torch_extension_deepseek.cc"
-    if not path.exists():
-        pytest.skip(f"{path} not present")
-    c = code(path.read_text())
+    b = code(path.read_text())
     for op in ("deepseek_v41_fp4_gemm", "deepseek_v41_noaux_tc_topk"):
-        i = c.find("void " + op + "(")
-        if i < 0:
-            i = c.find(op + "(")
-        assert i >= 0, f"{op} not found"
-        body = c[i:i + 1200]
-        # Match  exactly: a regex on TORCH_CHECK(...) alone accepts
-        # TORCH_CHECK(true, ...), which is the shape a careless re-enable takes.
-        assert re.search(r"TORCH_CHECK\(\s*false\s*,", body) \
-            and not re.search(r"TORCH_CHECK\(\s*true\s*,", body), (
-            f"{op} no longer refuses at entry; the kernel neither loads its "
-            "operands nor stores a result, and Xe2 XMX has no FP4/FP8 matrix path"
+        j = b.find(op + "(")
+        assert j >= 0, f"{op} not found"
+        seg = b[j:j + 2000]
+        assert not re.search(r"TORCH_CHECK\(\s*false\s*,", seg), (
+            f"{op} still refuses although the kernel is implemented"
         )
+
+
+def test_deepseek_v41_router_groups_match_the_config():
+    """384 experts in 8 groups, 4 of which may serve one token.
+
+    These three numbers decide which experts are reachable at all. A wrong
+    group count silently partitions the experts differently and the router
+    returns a plausible but wrong set, which no shape check would catch.
+    """
+    kern = _VLLM / "xpu/deepseek_kernels.sycl"
+    if not kern.exists():
+        pytest.skip(f"{kern} not present")
+    t = tokens(kern.read_text())
+    assert "DeepSeekTopKKernel<384,TK,8,4>" in t, (
+        "the router must be instantiated for 384 experts in 8 groups keeping 4"
+    )
+
+
+def test_deepseek_v41_fp4_gemm_dequantises_before_the_dpas():
+    """Xe2 XMX has no FP4 and no FP8 matrix arithmetic.
+
+    The e2m1/bf8/hf8 dpas enumerators exist in the ESIMD headers but target
+    PVC-class silicon: they compile for Battlemage and fail at runtime. The
+    only shape that runs here unpacks to FP16 first, so the DPAS must name
+    fp16 operands.
+    """
+    hdr = _VLLM / "deepseek_v41/fp4_gemm.h"
+    if not hdr.exists():
+        pytest.skip(f"{hdr} not present")
+    c = code(hdr.read_text())
+    assert "unpack_fp4_row" in c, "the FP4 weights are never unpacked"
+    dpas = re.findall(r"dpas<[^>]*>", c)
+    assert dpas, "no DPAS call in the FP4 GEMM"
+    for d in dpas:
+        assert "fp16" in d, f"{d} does not use fp16 operands"
+        for bad in ("e2m1", "bf8", "hf8"):
+            assert bad not in d, (
+                f"{d} names {bad}, which is not implemented by Xe2 XMX and "
+                "fails at runtime rather than at compile time"
+            )
 
 
 def test_int4_resadd_keeps_its_small_k_arm():

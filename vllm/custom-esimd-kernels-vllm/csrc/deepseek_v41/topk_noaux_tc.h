@@ -10,13 +10,25 @@ using fp16 = sycl::half;
 
 // noaux_tc scores experts independently, so there is no softmax and no global
 // reduction across experts.
-template <int NUM_EXPERTS, int TOP_K>
+//
+// Group-limited routing: the experts are partitioned into N_GROUP contiguous
+// groups and only TOPK_GROUP of them may contribute. A group's rank is the sum
+// of its two best selection keys, matching the reference; experts outside the
+// surviving groups are masked out before the per-expert top-k. With
+// TOPK_GROUP == N_GROUP the mask admits everything and this reduces to plain
+// top-k, which is what the non-grouped callers want.
+template <int NUM_EXPERTS, int TOP_K, int N_GROUP = 1, int TOPK_GROUP = 1>
 inline void compute_noaux_tc_routing(
     simd<fp16, NUM_EXPERTS>& logits,
     simd<fp16, NUM_EXPERTS>& bias,
     simd<int, TOP_K>& out_indices,
     simd<fp16, TOP_K>& out_weights) SYCL_ESIMD_FUNCTION
 {
+    static_assert(NUM_EXPERTS % N_GROUP == 0,
+                  "expert groups must partition the experts evenly");
+    static_assert(TOPK_GROUP >= 1 && TOPK_GROUP <= N_GROUP,
+                  "TOPK_GROUP must select between one and all groups");
+    static_assert(TOP_K <= NUM_EXPERTS, "cannot select more experts than exist");
     // Required order:
     //   scores  = softplus(logits).sqrt()   -- all experts, before selection
     //   indices = topk(scores + bias)       -- bias steers selection only
@@ -46,6 +58,52 @@ inline void compute_noaux_tc_routing(
     #pragma unroll
     for (int i = 0; i < NUM_EXPERTS; ++i) {
         sel[i] = scores[i] + static_cast<float>(bias[i].read());
+    }
+
+    // Group-limited stage. A group scores as the sum of its two best keys, so
+    // one very strong expert does not carry a group on its own. Only the best
+    // TOPK_GROUP groups stay eligible; the rest are masked to -inf and can no
+    // longer win a top-k round.
+    if constexpr (N_GROUP > 1 && TOPK_GROUP < N_GROUP) {
+        constexpr int GROUP_SIZE = NUM_EXPERTS / N_GROUP;
+        float group_key[N_GROUP];
+        #pragma unroll
+        for (int g = 0; g < N_GROUP; ++g) {
+            float b0 = NEG_INF, b1 = NEG_INF;
+            #pragma unroll
+            for (int i = 0; i < GROUP_SIZE; ++i) {
+                const float v = sel[g * GROUP_SIZE + i];
+                if (v > b0) { b1 = b0; b0 = v; }
+                else if (v > b1) { b1 = v; }
+            }
+            group_key[g] = b0 + b1;
+        }
+
+        bool group_live[N_GROUP];
+        #pragma unroll
+        for (int g = 0; g < N_GROUP; ++g) group_live[g] = false;
+        #pragma unroll
+        for (int r = 0; r < TOPK_GROUP; ++r) {
+            float best = NEG_INF;
+            int best_g = 0;
+            #pragma unroll
+            for (int g = 0; g < N_GROUP; ++g) {
+                if (!group_live[g] && group_key[g] > best) {
+                    best = group_key[g];
+                    best_g = g;
+                }
+            }
+            group_live[best_g] = true;
+            group_key[best_g] = NEG_INF;
+        }
+
+        #pragma unroll
+        for (int g = 0; g < N_GROUP; ++g) {
+            if (!group_live[g]) {
+                #pragma unroll
+                for (int i = 0; i < GROUP_SIZE; ++i) sel[g * GROUP_SIZE + i] = NEG_INF;
+            }
+        }
     }
 
     float weight_sum = 0.0f;

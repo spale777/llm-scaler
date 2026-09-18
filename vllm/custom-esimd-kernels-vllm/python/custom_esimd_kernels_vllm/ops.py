@@ -2007,11 +2007,15 @@ def deepseek_v41_fp4_gemm(
     b_fp4: torch.Tensor,
     b_scales: torch.Tensor,
 ) -> torch.Tensor:
-    """NOT IMPLEMENTED -- the binding raises.
+    """C[M, N] = a[M, K] @ dequant(b_fp4[N, K/2]).T with UE8M0 group scales.
 
-    Xe2 XMX carries no FP8 or FP4 matrix arithmetic (FP16/BF16/INT8/INT4/INT2
-    only), so any working kernel must dequantize to a supported type before the
-    dpas; fp4_gemm.h is still a skeleton.
+    Xe2 XMX carries no FP4 or FP8 matrix arithmetic (FP16/BF16/INT8/INT4/INT2
+    only), so the weights are unpacked to FP16 in registers and fed to the FP16
+    dpas. `a` is FP16 for the same reason: quantizing it would only add a
+    dequant on the hot path.
+
+    b_fp4 packs two E2M1 nibbles per byte, low nibble first; b_scales is
+    [N, K/32] UE8M0 bytes, one per 32 contiguous k.
     """
     return torch.ops.custom_esimd_kernels_vllm.deepseek_v41_fp4_gemm(a, b_fp4, b_scales)
 
@@ -2021,6 +2025,14 @@ def deepseek_v41_noaux_tc_topk(
     bias: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Computes Top-K gating using the DeepSeek V4.1 noaux_tc algorithm (sqrtsoftplus).
-    Returns (weights, indices)."""
+    """DeepSeek V4.1 noaux_tc group-limited top-k gating. Returns (weights, indices).
+
+    Scores every expert with sqrt(softplus(logit)) before selection, ranks the
+    8 expert groups by the sum of their two best biased keys, keeps the best 4,
+    and takes the top-k within them. The bias steers selection only: the
+    returned weight is the unbiased score, normalized and scaled by 1.5.
+
+    logits is [T, 384] fp16; bias is [384] fp16, shared across tokens.
+    top_k must be 4, 6 (the V4.1 default) or 8.
+    """
     return torch.ops.custom_esimd_kernels_vllm.deepseek_v41_noaux_tc_topk(logits, bias, top_k)

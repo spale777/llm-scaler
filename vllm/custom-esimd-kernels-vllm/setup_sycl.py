@@ -189,6 +189,31 @@ ext_modules.append(
 )
 ### MoE Batch kernels
 
+### DeepSeek V4.1: FP4 GEMM and the group-limited noaux_tc router. Built here
+### as well as in setup.py so both build paths produce the same set of modules;
+### the package import of deepseek_v41 is otherwise absent from sycl builds.
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.deepseek_v41",
+        sources=[
+            "csrc/xpu/deepseek_kernels.sycl",
+            "csrc/xpu/torch_extension_deepseek.cc",
+        ],
+        include_dirs=[
+            root.joinpath("csrc"),
+            root.joinpath("csrc/xpu"),
+            root.joinpath("csrc/deepseek_v41"),
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", f"-device {BMG_DEVICES} -options -cl-intel-enable-auto-fma", "-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+
 setup(
     name="custom-esimd-kernels-vllm",
     version="0.1.0",
