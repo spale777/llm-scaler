@@ -2036,3 +2036,139 @@ def deepseek_v41_noaux_tc_topk(
     top_k must be 4, 6 (the V4.1 default) or 8.
     """
     return torch.ops.custom_esimd_kernels_vllm.deepseek_v41_noaux_tc_topk(logits, bias, top_k)
+
+@torch.compiler.disable
+def deepseek_v41_lightning_indexer(
+    q: torch.Tensor,
+    index_k: torch.Tensor,
+    weights: torch.Tensor,
+    compress_len: int,
+) -> torch.Tensor:
+    """Per-query scores over compressed KV positions. Returns [S, T] float32.
+
+    One shared key per position (MQA). Each index head's dot product is
+    rectified before the head-weighted sum, so a head that dislikes a position
+    contributes nothing rather than cancelling one that likes it.
+
+    `weights` must already carry softmax_scale * n_heads**-0.5; the kernel
+    applies no scale. Positions at or past `compress_len` score -inf, which is
+    what the candidate stage reads as unreachable.
+
+    q is [S, 32, 128] fp16, index_k is [T, 128] fp16, weights is [S, 32] fp16.
+    """
+    return _ops.deepseek_v41_lightning_indexer(q, index_k, weights, compress_len)
+
+
+@torch.compiler.disable
+def deepseek_v41_candidate_blocks(
+    scores: torch.Tensor,
+    block_size: int,
+    topk_blocks: int,
+    compress_len: int,
+) -> torch.Tensor:
+    """Level one of the two-level selection. Returns a [S, num_blocks] uint8 mask.
+
+    A block scores as its best position. The block holding the query's newest
+    position is kept regardless of score, since it is only partly filled and a
+    full older block would outscore it. Blocks that never scored are dropped,
+    so a short context does not admit positions the query cannot see.
+    """
+    return _ops.deepseek_v41_candidate_blocks(
+        scores, block_size, topk_blocks, compress_len)
+
+
+@torch.compiler.disable
+def deepseek_v41_sparse_attn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Gather-by-index attention with an online softmax and a per-head sink.
+
+    kv is [N, D], one row per position shared by every head. A -1 in topk_idxs
+    marks an unused slot and contributes nothing; a row that is entirely -1
+    returns zeros rather than NaN. The sink is a logit with no value vector: it
+    joins the denominator once, after the loop.
+    """
+    return _ops.deepseek_v41_sparse_attn(q, kv, attn_sink, topk_idxs, scale)
+
+
+@torch.compiler.disable
+def deepseek_v41_engram_gate(
+    h: torch.Tensor,
+    key: torch.Tensor,
+    weight: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float,
+    clamp_value: float,
+) -> torch.Tensor:
+    """Write an n-gram lookup into the residual stream, gated by the match.
+
+    `weight` is q_weight * k_weight, which is the only form the reference uses.
+    Normalisation is per (token, hc copy) over dim. The gate takes the signed
+    square root of the clamped dot before the sigmoid. `value` is shared across
+    the copies; a masked token passes through untouched.
+    """
+    return _ops.deepseek_v41_engram_gate(
+        h, key, weight, value, mask, eps, clamp_value)
+
+
+@torch.compiler.disable
+def deepseek_v41_act_quant(
+    x: torch.Tensor,
+    group_size: int,
+    fp4: bool,
+    round_scale: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise activation quantization. Returns (codes uint8, scales float32).
+
+    With round_scale the scale is forced to a power of two, rounded UP: rounding
+    to nearest lets a group's largest element exceed the format max and clamp.
+    The amax floor keeps the scale normal for an all-zero group.
+    """
+    return _ops.deepseek_v41_act_quant(x, group_size, fp4, round_scale)
+
+
+@torch.compiler.disable
+def deepseek_v41_o_group_proj(
+    x: torch.Tensor,
+    w: torch.Tensor,
+) -> torch.Tensor:
+    """Block-diagonal output projection: einsum("bsgd,grd->bsgr").
+
+    wo_a is one [D, R] block per output group, not a dense [G*D, G*R]. Running
+    it dense mixes the groups.
+    """
+    return _ops.deepseek_v41_o_group_proj(x, w)
+
+
+@torch.compiler.disable
+def deepseek_v41_compress_pool(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+) -> torch.Tensor:
+    """Pool a group of tokens into one KV latent with a learned softmax gate.
+
+    The softmax is over the group's positions at a fixed channel. The latent is
+    produced before RoPE, because the indexer needs the unrotated form.
+    """
+    return _ops.deepseek_v41_compress_pool(kv, score)
+
+
+@torch.compiler.disable
+def deepseek_v41_rotary(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    inverse: bool,
+) -> torch.Tensor:
+    """Rotate adjacent element pairs as complex numbers, in place.
+
+    Pairs are (x[2i], x[2i+1]), not split halves. `inverse` conjugates the
+    rotation, which is how the attention output has the query's rotation
+    removed. V4.1 uses two bases, so the table is an input.
+    """
+    return _ops.deepseek_v41_rotary(x, cos, sin, inverse)

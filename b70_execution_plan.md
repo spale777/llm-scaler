@@ -321,8 +321,35 @@ kernels:
 - The main KV cache is **FP4 E2M1 with one E4M3 scale per 16 channels**; the
   indexer's own cache uses groups of 32 with E8M0.
 
-Implemented and checked against the reference on CPU: FP4 GEMM, noaux_tc
-router, lightning indexer, candidate-block selection, sparse attention.
+### Phase 6 kernel status
+
+Implemented and checked against the reference on CPU, then AOT compiled for
+both dies (31 kernels x 2):
+
+| Item | State |
+|---|---|
+| 6.1 fp4_dequant | done — LUT and UE8M0 decode exact over all 16 nibbles / 256 bytes |
+| 6.2 topk_noaux_tc | done — ungrouped, matching `Gate.forward`; gate_temp threaded |
+| 6.4 FP4 expert GEMM | done — E2M1 unpacked to FP16 for the FP16 dpas; VNNI layout to 1e-14 |
+| 6.5 delete fp4_gemm skeleton | done — replaced by the working kernel |
+| 6.6 activation quant | done — power-of-two scales round UP; per-format amax floor |
+| 6.7 o_groups | done — block-diagonal einsum, not a dense Linear |
+| 6.8 compressor + RoPE | done — softmax pool over the group axis; adjacent-pair rotation, dual base |
+| 6.9 sparse_attn | done — gather by index, finite score floor, sink in the denominator only |
+| 6.10 indexer + candidates | done — ReLU before the head-weighted sum; two-level block selection |
+| 6.11 engram gate | done — signed sqrt, per-copy normalisation |
+| 6.3 SGLang fused-MoE guards | **not done** — a patch-level change, not a kernel |
+| 6.12 vLLM model integration | **not done** — the kernels have no caller |
+
+**Nothing here has executed.** The arithmetic is checked against
+`inference/model.py` and `inference/kernel.py` on CPU and the guards are
+mutation-tested, but no kernel has run on a GPU, and the model does not load.
+
+A note on the verification gap this phase exposed: `compile_check.sh` is
+`-fsyntax-only`, which never reaches device codegen. It accepted a translation
+unit using `sycl::rsqrt` inside an ESIMD kernel, which fails with nine errors
+the moment a real device target is given. AOT compiling at least one
+representative TU is the only check that catches that class.
 
 
 **~551B params / ~298 GB.** B70 carries 32 GB, so 8 cards give 256 GB aggregate and need
