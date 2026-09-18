@@ -2115,19 +2115,22 @@ def test_deepseek_v41_ops_load_and_store():
         )
 
 
-def test_deepseek_v41_router_groups_match_the_config():
-    """384 experts in 8 groups, 4 of which may serve one token.
+def test_deepseek_v41_router_selects_over_every_expert():
+    """V4.1 config.json has no n_group and no topk_group.
 
-    These three numbers decide which experts are reachable at all. A wrong
-    group count silently partitions the experts differently and the router
-    returns a plausible but wrong set, which no shape check would catch.
+    n_routed_experts is 384 with topk_method noaux_tc and no grouping fields,
+    so selection ranges over all experts. Instantiating a group-limited variant
+    masks experts that should stay eligible and returns a different set, which
+    is plausible output no shape check would catch. The grouped path stays
+    available for the V3-style configs that do carry those fields.
     """
     kern = _VLLM / "xpu/deepseek_kernels.sycl"
     if not kern.exists():
         pytest.skip(f"{kern} not present")
     t = tokens(kern.read_text())
-    assert "DeepSeekTopKKernel<384,TK,8,4>" in t, (
-        "the router must be instantiated for 384 experts in 8 groups keeping 4"
+    assert "DeepSeekTopKKernel<384,TK,1,1>" in t, (
+        "the V4.1 router must admit every expert; a group count sourced from "
+        "V3 masks experts this config never groups"
     )
 
 

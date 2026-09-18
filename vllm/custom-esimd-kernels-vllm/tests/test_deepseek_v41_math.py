@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from srctext import code
+from srctext import code, tokens
 
 _DS = Path(__file__).resolve().parents[1] / "csrc/deepseek_v41"
 _DEQUANT = Path(__file__).resolve().parents[1] / "csrc/deepseek_v41/fp4_dequant.h"
@@ -369,3 +369,88 @@ def test_routing_weight_is_the_unbiased_score():
         assert abs(w[k] - scores[i] / (tot + EPS) * ROUTED_SCALING) < 1e-12, (
             "the returned weight carries the selection bias"
         )
+
+
+# --- the shipped kernels against the published config ----------------------
+
+import dsv41_config as cfg  # noqa: E402
+
+_KERNELS_SYCL = Path(__file__).resolve().parents[1] / "csrc/xpu/deepseek_kernels.sycl"
+
+
+def test_router_expert_count_matches_config():
+    t = tokens(_KERNELS_SYCL.read_text())
+    assert f"DeepSeekTopKKernel<{cfg.N_ROUTED_EXPERTS}," in t, (
+        f"the router must be instantiated for n_routed_experts="
+        f"{cfg.N_ROUTED_EXPERTS}"
+    )
+
+
+def test_router_is_not_group_limited():
+    """config.json carries no n_group and no topk_group.
+
+    Their absence is load-bearing: noaux_tc here selects over every expert.
+    A group count carried over from the V3-style configs masks experts this
+    model never masks, and the router still returns num_experts_per_tok of
+    them, so the output is plausible and wrong.
+    """
+    assert cfg.N_GROUP is None and cfg.TOPK_GROUP is None
+    t = tokens(_KERNELS_SYCL.read_text())
+    m = re.search(r"DeepSeekTopKKernel<(\d+),TK,(\d+),(\d+)>", t)
+    assert m, "the router instantiation is no longer recognisable"
+    n_group, topk_group = int(m.group(2)), int(m.group(3))
+    assert n_group == topk_group, (
+        f"the router keeps {topk_group} of {n_group} expert groups, but this "
+        "config has no grouping; every expert must stay eligible"
+    )
+
+
+def test_topk_arms_cover_the_configured_experts_per_tok():
+    """num_experts_per_tok is 6; an uninstantiated arm throws from the host."""
+    src = _KERNELS_SYCL.read_text()
+    arms = {int(x) for x in re.findall(r"case (\d+): submit_kernel", src)}
+    assert cfg.NUM_EXPERTS_PER_TOK in arms, (
+        f"top_k={cfg.NUM_EXPERTS_PER_TOK} has no instantiated arm; the model's "
+        f"own setting would be refused. Arms present: {sorted(arms)}"
+    )
+
+
+def test_routing_constants_match_config():
+    src = code(_TOPK.read_text())
+    m = re.search(r"ROUTED_SCALING_FACTOR\s*=\s*([0-9.]+)f", src)
+    assert m, "the routed scaling factor is no longer a named constant"
+    assert float(m.group(1)) == cfg.ROUTED_SCALING_FACTOR, (
+        f"routed_scaling_factor is {m.group(1)}, config says "
+        f"{cfg.ROUTED_SCALING_FACTOR}"
+    )
+    assert cfg.NORM_TOPK_PROB, "config sets norm_topk_prob"
+    assert "weight_sum" in src, (
+        "norm_topk_prob is true, so the weights must be normalised by their sum"
+    )
+
+
+def test_expert_weight_block_size_is_32():
+    """quantization_config.weight_block_size is [32, 32], not [128, 128].
+
+    The MoE block-scale kernels were written for 128x128. A 32-wide block
+    scaled as though it were 128 pairs every weight past the first block with
+    the wrong scale.
+    """
+    assert cfg.WEIGHT_BLOCK_SIZE == [32, 32]
+    host = code((Path(__file__).resolve().parents[1]
+                 / "csrc/xpu/esimd_kernel_moe.sycl").read_text())
+    assert "block_k == 32" in host, (
+        "the MoE host refuses a 32-wide K block, which is what this model uses"
+    )
+    assert "block_n == 32" in host, (
+        "the MoE host refuses a 32-wide N block, which is what this model uses"
+    )
+
+
+def test_expert_dtype_is_fp4_and_scales_are_ue8m0():
+    assert cfg.EXPERT_DTYPE == "fp4"
+    assert cfg.SCALE_FMT == "ue8m0"
+    c = code(_GEMM.read_text())
+    assert "unpack_fp4_row" in c, "the expert GEMM must unpack E2M1"
+    d = code(_DEQUANT.read_text())
+    assert "decode_ue8m0_scales" in d, "UE8M0 scale decode missing"

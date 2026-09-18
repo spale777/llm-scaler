@@ -116,9 +116,11 @@ void launch_noaux_tc_topk(
     auto submit_kernel = [&](auto top_k_val) {
         constexpr int TK = decltype(top_k_val)::value;
         q.submit([&](sycl::handler& cgh) {
-            // DeepSeek V4.1: n_routed_experts 384 in 8 groups, 4 of which may
-            // contribute to any one token.
-            DeepSeekTopKKernel<384, TK, 8, 4> kernel{
+            // config.json carries n_routed_experts 384, topk_method noaux_tc
+            // and no n_group/topk_group: selection is over all experts. The
+            // group-limited path stays templated for the V3-style configs that
+            // do carry them, and 1/1 admits every expert.
+            DeepSeekTopKKernel<384, TK, 1, 1> kernel{
                 reinterpret_cast<const fp16*>(logits.data_ptr()),
                 reinterpret_cast<const fp16*>(bias.data_ptr()),
                 reinterpret_cast<int*>(out_indices.data_ptr()),
