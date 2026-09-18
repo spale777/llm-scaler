@@ -887,3 +887,108 @@ def test_engram_masked_token_passes_through():
             assert abs(got[1][c][i] - h[1][c][i]) < 1e-15, (
                 "a masked token must pass through untouched"
             )
+
+
+# --- activation quantization ------------------------------------------------
+
+_ACT_QUANT = _DS / "act_quant.h"
+
+
+def _bits(f):
+    return struct.unpack("I", struct.pack("f", f))[0]
+
+
+def _frombits(b):
+    return struct.unpack("f", struct.pack("I", b & 0xFFFFFFFF))[0]
+
+
+def _fast_log2_ceil(x):
+    b = _bits(x)
+    exp = (b >> 23) & 0xFF
+    man = b & ((1 << 23) - 1)
+    return exp - 127 + (1 if man != 0 else 0)
+
+
+def _fast_pow2(e):
+    return _frombits((e + 127) << 23)
+
+
+def _fast_round_scale(amax, max_inv):
+    return _fast_pow2(_fast_log2_ceil(amax * max_inv))
+
+
+def test_fast_log2_ceil_is_exact():
+    """The bit trick must equal ceil(log2(x)); the mantissa test is the ceiling."""
+    import random
+    random.seed(5)
+    vals = ([2.0 ** e for e in range(-40, 40)]
+            + [random.uniform(1e-8, 1e8) for _ in range(2000)])
+    for x in vals:
+        assert _fast_log2_ceil(x) == math.ceil(math.log2(x)), x
+
+
+def test_fast_pow2_is_exact():
+    for e in range(-126, 128):
+        assert _fast_pow2(e) == 2.0 ** e
+
+
+@pytest.mark.parametrize("qmax", [448.0, 6.0])
+def test_rounded_scale_never_lets_a_group_overflow(qmax):
+    """Rounding UP is what keeps amax/scale inside the format.
+
+    Rounding to nearest would let a group's largest element exceed the
+    format max and clamp, losing the very value the scale was picked to
+    preserve.
+    """
+    import random
+    random.seed(7)
+    max_inv = 1.0 / qmax
+    over_ceil = 0
+    over_nearest = 0
+    n = 5000
+    for _ in range(n):
+        amax = random.uniform(1e-4, 1e4)
+        s = _fast_round_scale(amax, max_inv)
+        if amax / s > qmax * (1 + 1e-6):
+            over_ceil += 1
+        s_near = 2.0 ** round(math.log2(amax * max_inv))
+        if amax / s_near > qmax * (1 + 1e-6):
+            over_nearest += 1
+    assert over_ceil == 0, (
+        f"{over_ceil}/{n} groups overflow with the ceiling; the scale must "
+        "round up"
+    )
+    assert over_nearest > 0, (
+        "round-to-nearest does not overflow on this fixture, so the test is "
+        "not exercising the distinction"
+    )
+
+
+def test_act_quant_keeps_the_amax_floor_per_format():
+    """An all-zero group must not divide by zero or a subnormal.
+
+    FP8 floors at 1e-4; FP4 floors at 6*2^-126, the smallest amax whose
+    rounded scale is still a normal float.
+    """
+    src = code(_ACT_QUANT.read_text())
+    assert "FP8_AMAX_FLOOR" in src, "the FP8 amax floor is gone"
+    m = re.search(r"FP8_AMAX_FLOOR\s*=\s*([0-9.e-]+)f", src)
+    assert m and float(m.group(1)) == 1e-4, (
+        f"FP8 amax floor is {m.group(1) if m else 'missing'}, reference uses 1e-4"
+    )
+    host = code((Path(__file__).resolve().parents[1]
+                 / "csrc/xpu/torch_extension_deepseek.cc").read_text())
+    assert "1.1754943508222875e-38" in host, (
+        "the FP4 amax floor must be 6 * the smallest normal float"
+    )
+
+
+def test_act_quant_rounding_is_the_bit_trick_not_log2():
+    src = code(_ACT_QUANT.read_text())
+    assert "fast_log2_ceil" in src and "fast_pow2" in src, (
+        "the scale rounding must use the reference's bit manipulation"
+    )
+    assert "man != 0u ? 1 : 0" in src, (
+        "the mantissa test is the ceiling; without it the scale rounds down "
+        "and the group overflows"
+    )

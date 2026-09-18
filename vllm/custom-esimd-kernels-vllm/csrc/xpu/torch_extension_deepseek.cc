@@ -43,6 +43,15 @@ void launch_engram_gate(
     double eps,
     double clamp_value);
 
+void launch_act_quant(
+    torch::Tensor& x,
+    torch::Tensor& y,
+    torch::Tensor& s,
+    int64_t group_size,
+    bool round_scale,
+    double qmax,
+    double amax_floor);
+
 void launch_noaux_tc_topk(
     torch::Tensor& logits, 
     torch::Tensor& bias, 
@@ -253,6 +262,33 @@ torch::Tensor deepseek_v41_engram_gate(
     return out;
 }
 
+std::tuple<torch::Tensor, torch::Tensor> deepseek_v41_act_quant(
+    torch::Tensor x,
+    int64_t group_size,
+    bool fp4,
+    bool round_scale)
+{
+    CHECK_INPUT(x);
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32,
+                "deepseek_v41_act_quant: x must be Float32");
+    TORCH_CHECK(x.dim() == 2, "expected x [M, N], got ", x.dim(), "D");
+    TORCH_CHECK(group_size == 16 || group_size == 32 || group_size == 64 ||
+                group_size == 128,
+                "deepseek_v41_act_quant: group_size must be 16, 32, 64 or 128, "
+                "got ", group_size);
+
+    // E2M1 tops out at 6, E4M3 at 448. The amax floor keeps the rounded scale
+    // normal: without it an all-zero group divides by zero or a subnormal.
+    const double qmax = fp4 ? 6.0 : 448.0;
+    const double amax_floor = fp4 ? (6.0 * 1.1754943508222875e-38) : 1e-4;
+
+    const int64_t groups = (x.size(1) + group_size - 1) / group_size;
+    auto y = torch::empty({x.size(0), x.size(1)}, x.options().dtype(torch::kUInt8));
+    auto s = torch::empty({x.size(0), groups}, x.options());
+    launch_act_quant(x, y, s, group_size, round_scale, qmax, amax_floor);
+    return std::make_tuple(y, s);
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
     m.def("deepseek_v41_fp4_gemm", &deepseek_v41_fp4_gemm);
     m.def("deepseek_v41_noaux_tc_topk", &deepseek_v41_noaux_tc_topk);
@@ -260,6 +296,7 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
     m.def("deepseek_v41_candidate_blocks", &deepseek_v41_candidate_blocks);
     m.def("deepseek_v41_sparse_attn", &deepseek_v41_sparse_attn);
     m.def("deepseek_v41_engram_gate", &deepseek_v41_engram_gate);
+    m.def("deepseek_v41_act_quant", &deepseek_v41_act_quant);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

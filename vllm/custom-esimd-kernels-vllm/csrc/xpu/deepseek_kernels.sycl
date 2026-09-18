@@ -12,6 +12,7 @@
 #include "../deepseek_v41/lightning_indexer.h"
 #include "../deepseek_v41/sparse_attn.h"
 #include "../deepseek_v41/engram_gate.h"
+#include "../deepseek_v41/act_quant.h"
 
 using namespace sycl::ext::intel::esimd;
 using fp16 = sycl::half;
@@ -247,4 +248,35 @@ void launch_engram_gate(torch::Tensor& h, torch::Tensor& key,
             TORCH_CHECK(false, "deepseek_v41_engram_gate: dim must be 1024, "
                                "2048 or 5120, got ", D);
     }
+}
+
+
+void launch_act_quant(torch::Tensor& x, torch::Tensor& y, torch::Tensor& s,
+                      int64_t group_size, bool round_scale, double qmax,
+                      double amax_floor) {
+    const int M = (int)x.size(0);
+    const int N = (int)x.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    const float* xp = reinterpret_cast<const float*>(x.data_ptr());
+    uint8_t* yp = reinterpret_cast<uint8_t*>(y.data_ptr());
+    float* sp = reinterpret_cast<float*>(s.data_ptr());
+
+#define DSQ_LAUNCH(G)                                                          \
+    if (round_scale)                                                           \
+        dsv41_quant::launch_act_quant<G, true>(sq, xp, yp, sp, M, N,            \
+                                               (float)qmax, (float)amax_floor);\
+    else                                                                       \
+        dsv41_quant::launch_act_quant<G, false>(sq, xp, yp, sp, M, N,           \
+                                                (float)qmax, (float)amax_floor)
+    switch (group_size) {
+        case 16:  DSQ_LAUNCH(16);  break;
+        case 32:  DSQ_LAUNCH(32);  break;
+        case 64:  DSQ_LAUNCH(64);  break;
+        case 128: DSQ_LAUNCH(128); break;
+        default:
+            TORCH_CHECK(false, "deepseek_v41_act_quant: group_size must be 16, "
+                               "32, 64 or 128, got ", group_size);
+    }
+#undef DSQ_LAUNCH
 }
