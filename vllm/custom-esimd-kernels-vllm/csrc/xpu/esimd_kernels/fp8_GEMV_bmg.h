@@ -22,6 +22,39 @@
 // engine in small-GRF mode. K-split dispatch aims to fill that.
 static constexpr int BMG_HW_THREADS = 2048;
 
+// Threads per vector engine in small-GRF mode: the 64 KB register file holds
+// 128 registers per thread. -doubleGRF halves this, and a module built that
+// way wants half the target.
+static constexpr int BMG_THREADS_PER_XVE = 8;
+static constexpr int BMG_XVE_PER_CORE = 8;
+
+// Hardware thread count of the device this queue runs on.
+//
+// B60 and B70 are both Battlemage but differ in Xe core count, so a constant
+// sized for one under-splits K on the other. max_compute_units reports the Xe
+// cores, which is the figure that varies; the per-core geometry does not.
+// Cached per device: the query goes to the driver, and this sits on the decode
+// dispatch path.
+inline int bmg_hw_threads(sycl::queue& q) {
+    static thread_local sycl::device cached_dev;
+    static thread_local int cached = 0;
+    const sycl::device dev = q.get_device();
+    if (cached != 0 && dev == cached_dev) return cached;
+    int t = BMG_HW_THREADS;
+    try {
+        const uint32_t cores =
+            dev.get_info<sycl::info::device::max_compute_units>();
+        if (cores > 0) {
+            t = (int)cores * BMG_XVE_PER_CORE * BMG_THREADS_PER_XVE;
+        }
+    } catch (const sycl::exception&) {
+        // Keep the B70 figure when the driver will not report it.
+    }
+    cached_dev = dev;
+    cached = t;
+    return t;
+}
+
 template<int VL>
 SYCL_ESIMD_FUNCTION inline simd<float, VL> fp8_dequant_bmg(
     simd<uint8_t, VL> raw, int fp8_mode) {
@@ -272,15 +305,16 @@ struct GEMV_fp8_pert_bmg_masked_tail_kernel {
  *   - VL_BIG: prefer 256 / 128, or whatever makes (kp / VL_BIG) ≥ 2 with a
  *     small tail.
  */
-inline void select_bmg(uint32_t N, uint32_t K, int& vl_big, int& vl_tail, int& ks) {
+inline void select_bmg(uint32_t N, uint32_t K, int& vl_big, int& vl_tail, int& ks,
+                       int hw_threads = BMG_HW_THREADS) {
     // Default: vl=256, ks=1 (matches v2 for nice K values).
     vl_big = 256; vl_tail = 0; ks = 1;
 
-    // Target threads = N × ks; aim for >= BMG_HW_THREADS.
+    // Target threads = N × ks; aim for >= hw_threads.
     int target_ks = 1;
-    if (N * 8 <= BMG_HW_THREADS) target_ks = 8;
-    else if (N * 4 <= BMG_HW_THREADS) target_ks = 4;
-    else if (N * 2 <= BMG_HW_THREADS) target_ks = 2;
+    if (N * 8 <= (uint32_t)hw_threads) target_ks = 8;
+    else if (N * 4 <= (uint32_t)hw_threads) target_ks = 4;
+    else if (N * 2 <= (uint32_t)hw_threads) target_ks = 2;
     else target_ks = 1;
 
     // K_SPLIT must divide K. Find largest divisor of K that's <= target_ks.
@@ -328,7 +362,7 @@ inline void GEMV_fp8_pert_bmg_host(
     uint32_t N, uint32_t K, int fp8_mode, sycl::queue& q)
 {
     int vl_big, vl_tail, ks;
-    select_bmg(N, K, vl_big, vl_tail, ks);
+    select_bmg(N, K, vl_big, vl_tail, ks, bmg_hw_threads(q));
 
     uint32_t global = N * ks;
     uint32_t local  = ks;

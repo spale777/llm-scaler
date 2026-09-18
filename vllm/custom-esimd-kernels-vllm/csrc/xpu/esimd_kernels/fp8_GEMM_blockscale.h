@@ -33,6 +33,32 @@
 // engine in small-GRF mode. K-split dispatch aims to fill that.
 static constexpr int BMG_HW_THREADS = 2048;
 
+// Threads per vector engine in small-GRF mode, and vector engines per Xe core.
+static constexpr int BMG_THREADS_PER_XVE = 8;
+static constexpr int BMG_XVE_PER_CORE = 8;
+
+// Hardware thread count of the device this queue runs on.
+//
+// B60 and B70 are both Battlemage but differ in Xe core count, so a constant
+// sized for one under-splits K on the other. max_compute_units reports the Xe
+// cores, which is the figure that varies; the per-core geometry does not.
+inline int bmg_hw_threads(sycl::queue& q) {
+  static thread_local sycl::device cached_dev;
+  static thread_local int cached = 0;
+  const sycl::device dev = q.get_device();
+  if (cached != 0 && dev == cached_dev) return cached;
+  int t = BMG_HW_THREADS;
+  try {
+    const uint32_t cores = dev.get_info<sycl::info::device::max_compute_units>();
+    if (cores > 0) t = (int)cores * BMG_XVE_PER_CORE * BMG_THREADS_PER_XVE;
+  } catch (const sycl::exception&) {
+    // Keep the B70 figure when the driver will not report it.
+  }
+  cached_dev = dev;
+  cached = t;
+  return t;
+}
+
 namespace fp8_blockscale {
 
 // fp8_e4m3 field widths.
@@ -172,10 +198,11 @@ inline void dispatch_gemv_block_bmg(const fp16* input, const uint8_t* weight,
 
   // Target K_SPLIT so that N*K_SPLIT >= BMG_HW_THREADS (BMG occupancy), K%ks==0 and
   // (K/ks)%VL==0.
+  const int hw_threads = bmg_hw_threads(q);
   int target = 1;
-  if (N * 8 <= BMG_HW_THREADS) target = 8;
-  else if (N * 4 <= BMG_HW_THREADS) target = 4;
-  else if (N * 2 <= BMG_HW_THREADS) target = 2;
+  if (N * 8 <= hw_threads) target = 8;
+  else if (N * 4 <= hw_threads) target = 4;
+  else if (N * 2 <= hw_threads) target = 2;
   int ks = 1;
   for (int s = target; s >= 1; s >>= 1) {
     if (K % s == 0 && (K / s) % VL == 0) { ks = s; break; }
@@ -326,10 +353,11 @@ inline void gemv_fp8_blockscale_fused2_host(
     fp16* output1, uint32_t N1, uint32_t K, sycl::queue& q) {
   const int VL = (K % 256 == 0) ? 256 : 128;
   const int total_n = (int)(N0 + N1);
+  const int hw_threads = bmg_hw_threads(q);
   int target = 1;
-  if (total_n * 8 <= BMG_HW_THREADS) target = 8;
-  else if (total_n * 4 <= BMG_HW_THREADS) target = 4;
-  else if (total_n * 2 <= BMG_HW_THREADS) target = 2;
+  if (total_n * 8 <= hw_threads) target = 8;
+  else if (total_n * 4 <= hw_threads) target = 4;
+  else if (total_n * 2 <= hw_threads) target = 2;
   int ks = 1;
   for (int s = target; s >= 1; s >>= 1) {
     if (K % s == 0 && (K / s) % VL == 0) { ks = s; break; }
@@ -442,8 +470,9 @@ inline void gemv_fp8_blockscale_fp16_fused2_host(
     uint32_t N1, uint32_t K, sycl::queue& q) {
   const int VL = (K % 256 == 0) ? 256 : 128;
   const int total_n = (int)(N0 + N1);
-  int target = total_n * 8 <= BMG_HW_THREADS ? 8 : total_n * 4 <= BMG_HW_THREADS ? 4
-                                  : total_n * 2 <= BMG_HW_THREADS ? 2 : 1;
+  const int hw_threads = bmg_hw_threads(q);
+  int target = total_n * 8 <= hw_threads ? 8 : total_n * 4 <= hw_threads ? 4
+                                  : total_n * 2 <= hw_threads ? 2 : 1;
   int ks = 1;
   for (int s = target; s >= 1; s >>= 1) {
     if (K % s == 0 && (K / s) % VL == 0) { ks = s; break; }

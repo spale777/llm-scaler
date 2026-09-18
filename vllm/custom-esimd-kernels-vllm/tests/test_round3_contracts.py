@@ -1927,11 +1927,19 @@ def test_bmg_ladder_covers_every_arm_its_selector_emits(path):
     assert "for (int t : {8, 16, 32, 64, 128})" in c, (
         "select_bmg's tail power-of-2 set changed; re-derive _select_bmg"
     )
-    assert "if (N * 8 <= BMG_HW_THREADS) target_ks = 8;" in c, (
+    assert "if (N * 8 <= (uint32_t)hw_threads) target_ks = 8;" in c, (
         "select_bmg's ks ladder changed; re-derive _select_bmg"
     )
+    # The target is a parameter now, because B60 and B70 have different Xe core
+    # counts. _select_bmg models the default, so that default must stay 2048
+    # (B70) and the parameter must actually default to it -- otherwise the
+    # sweep below describes a selector no device gets.
     assert re.search(r"BMG_HW_THREADS = 2048", c), (
         "BMG_HW_THREADS changed; _select_bmg hardcodes 2048"
+    )
+    assert "int hw_threads = BMG_HW_THREADS)" in c, (
+        "select_bmg's thread target no longer defaults to BMG_HW_THREADS; the "
+        "sweep below models that default"
     )
 
     notail = {(int(v), int(k))

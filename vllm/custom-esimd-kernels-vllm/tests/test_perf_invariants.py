@@ -83,6 +83,35 @@ def test_occupancy_target_is_named_and_correct(path):
         assert int(m.group(1)) == 2048, f"expected 2048, got {m.group(1)}"
 
 
+@pytest.mark.parametrize("path", _OCCUPANCY, ids=_ids)
+def test_thread_target_is_read_from_the_device(path):
+    """B60 and B70 differ in Xe core count, so the target cannot be a constant.
+
+    2048 is 32 Xe cores x 8 engines x 8 threads, which is B70. Applied to a B60
+    the dispatcher believes it has more parallelism than it does and stops
+    splitting K too early; the two disagree on the split for 672 of the first
+    4096 N. max_compute_units reports the core count, so the device answers
+    rather than a table, and the constant stays only as the fallback when the
+    driver will not say.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    c = code(path.read_text())
+    assert "max_compute_units" in c, (
+        f"{path.name}: the thread target is not derived from the device, so a "
+        "B60 is dispatched as though it were a B70"
+    )
+    assert "bmg_hw_threads(q)" in c, (
+        f"{path.name}: the queried target is never passed to a dispatcher"
+    )
+    # No live comparison may still use the constant: that is the B70 assumption.
+    live = re.findall(r"<=\s*BMG_HW_THREADS", c)
+    assert not live, (
+        f"{path.name}: {len(live)} dispatch comparison(s) still use the "
+        "constant instead of the device's own thread count"
+    )
+
+
 @pytest.mark.parametrize("path", _DECODE, ids=_ids)
 def test_weight_streams_are_prefetched(path):
     if not path.exists():
