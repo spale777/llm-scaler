@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* norm_gemv_norm_fp16.h — Fused (RMS share) Norm + FP16 GEMV + Second Norm.
  *
  * Designed for Gemma4 MoE branch:
@@ -59,13 +60,13 @@ struct NormGemvNorm_fp16_kernel {
         if (n >= N) return;
 
         int n_chunks = K / VL;
-        simd<float, VL> res_chunks[MAX_CHUNKS];
 
+        // No register cache: a simd<float, VL>[MAX_CHUNKS] array reaches 16 KB
+        // against an ~8 KB per-thread budget. Pass 2 re-loads residual from L3.
         float sum_sq = 0.0f;
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
             simd<float, VL> r = block_load<fp16, VL>(residual + offset);
-            res_chunks[c] = r;
             simd<float, VL> sq = r * r;
             sum_sq += reduce<float>(sq, std::plus<>());
         }
@@ -77,7 +78,8 @@ struct NormGemvNorm_fp16_kernel {
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
 
-            simd<float, VL> normed = res_chunks[c] * inv_rms;
+            simd<float, VL> normed =
+                simd<float, VL>(block_load<fp16, VL>(residual + offset)) * inv_rms;
 
             // Only WG 0 writes moe_input (= normed * pre_ff_w)
             if (n == 0) {
@@ -110,6 +112,14 @@ inline void norm_gemv_norm_fp16_host(
     sycl::queue& q) {
 
     #define LAUNCH_NGN(V, MC)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(N, 1),                 NormGemvNorm_fp16_kernel<V, MC>{                     residual, scale_with_root, proj_w, pre_ff_w,                     router_logits, moe_input,                     N, K, eps});         });
+
+    // The kernel streams rather than caching chunks, so MAX_CHUNKS only picks
+    // the instantiation. The ladder covers every multiple of 64 exactly.
+
+    // The narrowest arm is VL=64 and the kernel walks K in whole chunks.
+    TORCH_CHECK(K % 64 == 0,
+                "norm_gemv_norm: K must be a multiple of 64, got ", K);
+
 
     if (K % 512 == 0) {
         int mc = K / 512;

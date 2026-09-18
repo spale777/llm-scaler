@@ -22,6 +22,7 @@
  * Included into esimd_kernel.sycl (utils.h: fp16 + esimd namespace + detail).
  */
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 
 namespace esimd_detail = sycl::ext::intel::esimd::detail;
 
@@ -29,10 +30,9 @@ static constexpr int Q5_K_VL   = 512;   // K-tile (matches host pre-shuffle chun
 static constexpr int Q5_K_ROWS = 4;     // rows per work-group
 static constexpr int Q5_K_GS   = 32;    // scale/min group
 
-// VLP is the K-tile length. 512 is the fast default; 256 covers shards whose K
-// is not a multiple of 512 (gemma-4 hidden_size 5376). Every K-quant tensor has
-// K % 256 == 0 because that is the GGUF super-block size, so the two
-// instantiations together span every possible shard.
+// VLP is the K-tile length and must stay at 512: the host pre-shuffles qh
+// against that tile width, so a narrower instantiation reads the high bits
+// of the wrong elements. K that is not a multiple of 512 is refused.
 template <int VLP>
 struct Q5_K_gemv_kernel {
     const fp16*    input;   // [1, K]
@@ -114,16 +114,16 @@ inline void q5_k_gemv_host(
     const fp16* scale, const fp16* minv, fp16* output,
     uint32_t N, uint32_t K, sycl::queue& q) {
     const int NWG = ((int)N + Q5_K_ROWS - 1) / Q5_K_ROWS;
-    const bool wide = (K % Q5_K_VL) == 0;
+    // qh is pre-shuffled on the host against a fixed Q5_K_VL-element tile, so a
+    // narrower tile de-shuffles to the wrong elements rather than merely
+    // dropping a residue. There is no correct narrow instantiation.
+    TORCH_CHECK(K % Q5_K_VL == 0,
+                "q5_k GEMV: K must be a multiple of ", (int)Q5_K_VL,
+                " (host qh shuffle tile), got K=", K);
     q.submit([&](sycl::handler& h) {
         sycl::nd_range<1> r((size_t)NWG * Q5_K_ROWS, Q5_K_ROWS);
-        if (wide) {
-            h.parallel_for(
+        h.parallel_for(
                 r, Q5_K_gemv_kernel<Q5_K_VL>{input, ql, qh, scale, minv, output, (int)N, (int)K});
-        } else {
-            h.parallel_for(
-                r, Q5_K_gemv_kernel<Q5_K_VL / 2>{input, ql, qh, scale, minv, output, (int)N, (int)K});
-        }
     });
 }
 
@@ -227,18 +227,17 @@ inline void q5_k_gemv_M_launch(
     const fp16* scale, const fp16* minv, fp16* output,
     uint32_t N, uint32_t K, uint32_t ldo, sycl::queue& q) {
     const int NWG = ((int)N + Q5_K_ROWS - 1) / Q5_K_ROWS;
-    const bool wide = (K % Q5_K_VL) == 0;
+    // qh is pre-shuffled on the host against a fixed Q5_K_VL-element tile, so a
+    // narrower tile de-shuffles to the wrong elements rather than merely
+    // dropping a residue. There is no correct narrow instantiation.
+    TORCH_CHECK(K % Q5_K_VL == 0,
+                "q5_k GEMV: K must be a multiple of ", (int)Q5_K_VL,
+                " (host qh shuffle tile), got K=", K);
     q.submit([&](sycl::handler& h) {
         sycl::nd_range<1> r((size_t)NWG * Q5_K_ROWS, Q5_K_ROWS);
-        if (wide) {
-            h.parallel_for(
+        h.parallel_for(
                 r, Q5_K_gemv_M_kernel<M, Q5_K_VL>{input, ql, qh, scale, minv, output,
                                                   (int)N, (int)K, (int)ldo});
-        } else {
-            h.parallel_for(
-                r, Q5_K_gemv_M_kernel<M, Q5_K_VL / 2>{input, ql, qh, scale, minv, output,
-                                                      (int)N, (int)K, (int)ldo});
-        }
     });
 }
 

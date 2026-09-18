@@ -18,6 +18,7 @@
  * Math copied from NormGEMV_fp8_pert_kernel so both paths stay bit-comparable.
  */
 #pragma once
+#include "utils.h"
 
 template <int V>
 struct Gdn_norm_gated_kernel {

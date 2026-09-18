@@ -382,12 +382,19 @@ inline void q8_0_gemv_dpas_host(
 // the repeats, and fitting 8 rows in registers needs VL=128, which costs more
 // than the traffic it saves.
 //
-// Requires K % Q8_0_M_VL (256) == 0 (dense proj K=2048/4096); caller falls back
-// to oneDNN otherwise.
+// The M-tiled kernel walks K in whole Q8_0_M_VL chunks with no tail, so a K
+// that does not divide is served per-row by the M=1 host.
 inline void q8_0_gemv_M_host(
     const fp16* input, const int8_t* weight, const fp16* scale, fp16* output,
     uint32_t M, uint32_t N, uint32_t K, sycl::queue& q) {
     if (M == 1) { q8_0_gemv_host(input, weight, scale, output, N, K, q); return; }
+    if (K % Q8_0_M_VL != 0) {
+        for (uint32_t m = 0; m < M; m++) {
+            q8_0_gemv_host(input + (size_t)m * K, weight, scale,
+                           output + (size_t)m * N, N, K, q);
+        }
+        return;
+    }
     if (q8_0_gemv_dpas_ok(M, N, K)) {
         q8_0_gemv_dpas_host(input, weight, scale, output, M, N, K, q);
         return;

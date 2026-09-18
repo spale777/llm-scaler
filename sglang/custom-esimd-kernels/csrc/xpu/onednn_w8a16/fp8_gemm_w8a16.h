@@ -91,7 +91,10 @@ static inline void dnnl_matmul_w8a16_fp8(
 
   // ************************************************************
   // get device, engine, stream
-  const int dev_id = c10::xpu::getCurrentXPUStream().device_index();
+  // Derive the device from the operands, not from whatever stream happens to be
+  // current: on a multi-card run those differ and the oneDNN engine would be
+  // built for the wrong device.
+  const int dev_id = mat1.device().index();
   at::Device curDevice = at::Device(at::kXPU, dev_id);
   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
 

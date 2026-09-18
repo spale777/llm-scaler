@@ -30,6 +30,14 @@ ESIMD_INLINE void causalConv1dUpdateBf16(
   uint32_t batchIdx = ndi.get_group(1);
   uint32_t convStateOffset = convStateIdx[batchIdx * nTokens];
   uint32_t updateTokens = acceptedTokens[batchIdx];
+  // Both tensors are int32 carrying a -1 skip sentinel but are read through a
+  // uint32_t* here, so the sign test must be explicit -- unskipped, the wrap
+  // makes the store through offsetCs land in another live allocation. Not a
+  // bare return: this kernel also writes qkvzState and zOut for its row, and
+  // returning would leave a padding row holding the previous step's values.
+  const bool haveConvSlot = (int32_t)convStateOffset >= 0
+                         && (int32_t)updateTokens >= 1
+                         && (int32_t)updateTokens <= 4;
   uint32_t offsetB;
   uint32_t offsetW;
   uint32_t blockAddress = headIdx >> 2;
@@ -72,7 +80,7 @@ ESIMD_INLINE void causalConv1dUpdateBf16(
   fp16Weight = block_load<bf16, 512>((bf16*)convW + offsetW);
 #pragma unroll
   for (int32_t kk = 0; kk < 6; kk++) {
-    if (kk < cachedConvStates) {
+    if (kk < cachedConvStates && haveConvSlot) {
       fp16InputHistoric.select<128, 1>(128 * kk) = block_load<bf16, 128>((bf16*)convState + offsetCs + convDim * kk);
     }
     else {
@@ -100,6 +108,11 @@ ESIMD_INLINE void causalConv1dUpdateBf16(
   }
   else if (updateTokens == 4) {
     fp16InputCurrent.select<128 * 3, 1>(0) = fp16InputHistoric.select<128 * 3, 1>(3 * 128);
+  }
+  else {
+    // No arm matched: updateTokens is outside the served range, and
+    // fp16InputCurrent's history lanes are otherwise uninitialised.
+    fp16InputCurrent.select<128 * 3, 1>(0) = 0;
   }
 
 #pragma unroll
@@ -155,7 +168,7 @@ ESIMD_INLINE void causalConv1dUpdateBf16(
   fp16InputHistoric.select<128 * 4, 1>(128 * 2) = fp16InputCurrent.select<128 * 4, 1>(128 * 3);
 #pragma unroll
   for (int32_t kk = 0; kk < 6; kk++) {
-    if (kk < cachedConvStates) {
+    if (kk < cachedConvStates && haveConvSlot) {
       block_store<bf16, 128>((bf16*)convState + offsetCs + convDim * kk, fp16InputHistoric.select<128, 1>(128 * kk));
     }
   }
@@ -248,10 +261,19 @@ ESIMD_INLINE void gdnRecurBf16(
   simd<uint32_t, 16> simdOffsetsV;
   simd<uint32_t, 16> simdOffsetsBa;
   simd<uint32_t, 16> simdOffsetsOut;
-  if (acceptedId < 1) {
+  // Signed: acceptedId is a uint32_t copy of an int32 carrying a -1 sentinel,
+  // and `acceptedId < 1` on uint32 rejects 0 alone.
+  if ((int32_t)acceptedId < 1) {
     return;
   }
   acceptedId = acceptedId - 1;
+  // The read side of the same sentinel, bounding the value that is scaled into
+  // a load offset at offsetRecurStateBase. The subscript itself stays
+  // unbounded: that needs nTokens against the accepted count, which nothing
+  // passes here, and the host cannot check values without a device sync.
+  if ((int32_t)ssmIdxPtr[acceptedId] < 0) {
+    return;
+  }
   uint32_t initRecurState = ssmIdxPtr[acceptedId];
   uint32_t offsetRecurStateBase;
 
@@ -263,7 +285,6 @@ ESIMD_INLINE void gdnRecurBf16(
 
   simd<bf16, 128 * 4> fp16V;
   simd<bf16, 128 * 8> fp16InS;
-  simd_mask<16> mask;
   simd<bf16, 16> fp16A;
   simd<bf16, 16>  fp16B;
   simd<float, 16> fp32A;
@@ -274,7 +295,9 @@ ESIMD_INLINE void gdnRecurBf16(
   float fp32Alog;
   float fp32DtBias;
 
-  mask = simdOffsetsQk < nTokens;
+  // Out-of-range lanes are made safe by clamping the offsets on the next line,
+  // not by masking: every gather below uses the unmasked overload, and ESIMD
+  // leaves unselected lanes undefined without a passthru.
   simdOffsetsRecur.select<16, 1>(0) = simdOffsetsQk;
   simdOffsetsRecur.select<16, 1>(16) = simdOffsetsQk + 16;
   simdOffsetsQk.merge(0, simdOffsetsQk >= nTokens);
@@ -371,6 +394,11 @@ ESIMD_INLINE void gdnRecurBf16(
 #pragma unroll
   for (int32_t nn = 0; nn < 4; nn++) {
     if (nn < nTokens) {
+      // Same sentinel, write side: unskipped, the uint32 wrap puts the
+      // lsc_scatter below at a plausible offset in another sequence's state.
+      if ((int32_t)ssmIdxPtr[nn] < 0) {
+        continue;
+      }
       uint32_t storeRecurStateOffset = ssmIdxPtr[nn];
       simd<float, 128> kvMemTemp = 0.0f;
 #pragma unroll

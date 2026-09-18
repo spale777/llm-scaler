@@ -13,12 +13,13 @@ using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::esimd::xmx;
 namespace xesimd = sycl::ext::intel::experimental::esimd;
 
+template <typename KernelFn>
 static inline sycl::event submit_kernel(
-    std::function<void(sycl::handler&)> kernel,
+    KernelFn&& kernel,
     const torch::Device& device,
     const char* desc) {
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
-    return queue.submit(kernel);
+    return queue.submit(std::forward<KernelFn>(kernel));
 }
 
 // ── FP8 E4M3 → half conversion ───────────────────────────────────────────────
@@ -213,19 +214,19 @@ void moe_router_forward_e5m2_kernel(
                             weight + (size_t)row * hidden_size + k)) * (fp16)s;
 
                     simd<fp16, 64> xv0 = block_load<fp16, 64>(x + k);
-                    acc0 = acc0 + xv0 * wv;
+                    acc0 += convert<float>(xv0 * wv);
 
                     if (n_tokens > 1) {
                         simd<fp16, 64> xv1 = block_load<fp16, 64>(x + (size_t)1 * hidden_size + k);
-                        acc1 = acc1 + xv1 * wv;
+                        acc1 += convert<float>(xv1 * wv);
                     }
                     if (n_tokens > 2) {
                         simd<fp16, 64> xv2 = block_load<fp16, 64>(x + (size_t)2 * hidden_size + k);
-                        acc2 = acc2 + xv2 * wv;
+                        acc2 += convert<float>(xv2 * wv);
                     }
                     if (n_tokens > 3) {
                         simd<fp16, 64> xv3 = block_load<fp16, 64>(x + (size_t)3 * hidden_size + k);
-                        acc3 = acc3 + xv3 * wv;
+                        acc3 += convert<float>(xv3 * wv);
                     }
                 }
 
@@ -357,6 +358,7 @@ void moe_router_topk_fused_e4m3_kernel(
 }
 
 // Host dispatcher: pick the (NE, TOPK) specialization for the fused router+topk.
+
 static inline bool dispatch_moe_router_topk_fused_e4m3(
     const fp16* x, const uint8_t* rweight, const float* rscale,
     fp16* top_values, int32_t* top_indices,
@@ -559,7 +561,52 @@ static inline bool dispatch_moe_router_topk_norm_fused_e4m3(
     return false;
 }
 
+// The shared-expert kernels here use one intermediate_size for both the shared
+// weight stride and the buffer row stride, so they require S == I. Each tensor
+// is checked independently: an entry feeding only one arm must not be admitted
+// on the strength of the other.
+static void moe_check_shared_inter_matches(
+    int64_t num_shared_experts, int64_t hidden_size, int64_t intermediate_size,
+    const torch::Tensor* shared_gate_up_weight,
+    const torch::Tensor* shared_down_weight) {
+    if (num_shared_experts <= 0) return;
+    const int64_t denom = num_shared_experts * hidden_size;
+    TORCH_CHECK(denom > 0, "moe shared expert: empty shared weight geometry");
+    // Only a null pointer means "this entry does not feed this arm". An empty
+    // tensor with num_shared_experts > 0 must still be refused: data_ptr() is
+    // called unguarded downstream.
+    if (shared_gate_up_weight) {
+        TORCH_CHECK(shared_gate_up_weight->numel() > 0,
+                    "moe shared expert: num_shared_experts=",
+                    num_shared_experts, " but shared_gate_up_weight is empty");
+        const int64_t two_s = shared_gate_up_weight->numel() / denom;
+        TORCH_CHECK(two_s == 2 * intermediate_size,
+                    "moe shared expert: this path assumes the shared "
+                    "intermediate size equals the routed one (",
+                    intermediate_size, "); got ", two_s / 2,
+                    ". S != I is not yet supported here -- see "
+                    "moe_int4.sycl for the treatment this file still needs.");
+    }
+    if (shared_down_weight) {
+        TORCH_CHECK(shared_down_weight->numel() > 0,
+                    "moe shared expert: num_shared_experts=",
+                    num_shared_experts, " but shared_down_weight is empty");
+        const int64_t s = shared_down_weight->numel() / denom;
+        TORCH_CHECK(s == intermediate_size,
+                    "moe shared expert (down): this path assumes the shared "
+                    "intermediate size equals the routed one (",
+                    intermediate_size, "); got ", s,
+                    ". S != I is not yet supported here.");
+    }
+}
+
+
 // -- Option C: 1 WI per (token, expert), n_tokens > 4 --
+// One work-item per expert: the weight row is streamed once and accumulated
+// against WIDE_TOK tokens, since weight traffic dominates a (token, expert)
+// grid that re-reads the row per token.
+static constexpr int WIDE_TOK = 8;
+
 void moe_router_forward_e4m3_wide_kernel(
     const fp16* x,
     const uint8_t* weight,
@@ -570,24 +617,47 @@ void moe_router_forward_e4m3_wide_kernel(
 
     auto cgf = [&](sycl::handler& cgh) {
         cgh.parallel_for<class MoeRouterForwardE4M3Wide>(
-            sycl::range<2>(n_tokens, num_experts),
-            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
-                const int token = (int)idx[0];
-                const int row   = (int)idx[1];
+            sycl::range<1>(num_experts),
+            [=](sycl::id<1> idx) SYCL_ESIMD_KERNEL {
+                const int row = (int)idx[0];
                 fp16 s = fp16(scale[0]);
+                const uint8_t* wrow = weight + (size_t)row * hidden_size;
 
-                simd<float, 64> acc(0.f);
-                for (int k = 0; k < hidden_size; k += 64) {
-                    simd<fp16, 64> wv = fp8e4m3_to_half<64>(
-                        block_load<uint8_t, 64>(
-                            weight + (size_t)row * hidden_size + k)) * s;
-                    simd<fp16, 64> xv = block_load<fp16, 64>(
-                        x + (size_t)token * hidden_size + k);
-                    acc += convert<float>(xv * wv);
+                for (int t0 = 0; t0 < n_tokens; t0 += WIDE_TOK) {
+                    const int nt = (n_tokens - t0) < WIDE_TOK
+                                       ? (n_tokens - t0) : WIDE_TOK;
+                    simd<float, 64> acc[WIDE_TOK];
+#pragma unroll
+                    for (int j = 0; j < WIDE_TOK; ++j) acc[j] = 0.f;
+
+                    for (int k = 0; k < hidden_size; k += 64) {
+                        if (k + 64 < hidden_size) {
+                            xesimd::lsc_prefetch<uint8_t, 64,
+                                xesimd::lsc_data_size::default_size,
+                                xesimd::cache_hint::cached,
+                                xesimd::cache_hint::cached>(wrow + k + 64);
+                        }
+                        simd<fp16, 64> wv =
+                            fp8e4m3_to_half<64>(block_load<uint8_t, 64>(wrow + k)) * s;
+#pragma unroll
+                        for (int j = 0; j < WIDE_TOK; ++j) {
+                            if (j < nt) {
+                                simd<fp16, 64> xv = block_load<fp16, 64>(
+                                    x + (size_t)(t0 + j) * hidden_size + k);
+                                acc[j] += convert<float>(xv * wv);
+                            }
+                        }
+                    }
+
+#pragma unroll
+                    for (int j = 0; j < WIDE_TOK; ++j) {
+                        if (j < nt) {
+                            output[(t0 + j) * num_experts + row] = fp16(
+                                sycl::ext::intel::esimd::detail::sum<float, float, 64>(
+                                    acc[j]));
+                        }
+                    }
                 }
-
-                output[token * num_experts + row] = fp16(
-                    sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc));
             });
     };
 
@@ -604,24 +674,47 @@ void moe_router_forward_e5m2_wide_kernel(
 
     auto cgf = [&](sycl::handler& cgh) {
         cgh.parallel_for<class MoeRouterForwardE5M2Wide>(
-            sycl::range<2>(n_tokens, num_experts),
-            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
-                const int token = (int)idx[0];
-                const int row   = (int)idx[1];
-                float s = scale[0];
+            sycl::range<1>(num_experts),
+            [=](sycl::id<1> idx) SYCL_ESIMD_KERNEL {
+                const int row = (int)idx[0];
+                fp16 s = fp16(scale[0]);
+                const uint8_t* wrow = weight + (size_t)row * hidden_size;
 
-                simd<float, 64> acc(0.f);
-                for (int k = 0; k < hidden_size; k += 64) {
-                    simd<fp16, 64> wv = fp8e5m2_to_half<64>(
-                        block_load<uint8_t, 64>(
-                            weight + (size_t)row * hidden_size + k)) * (fp16)s;
-                    simd<fp16, 64> xv = block_load<fp16, 64>(
-                        x + (size_t)token * hidden_size + k);
-                    acc = acc + xv * wv;
+                for (int t0 = 0; t0 < n_tokens; t0 += WIDE_TOK) {
+                    const int nt = (n_tokens - t0) < WIDE_TOK
+                                       ? (n_tokens - t0) : WIDE_TOK;
+                    simd<float, 64> acc[WIDE_TOK];
+#pragma unroll
+                    for (int j = 0; j < WIDE_TOK; ++j) acc[j] = 0.f;
+
+                    for (int k = 0; k < hidden_size; k += 64) {
+                        if (k + 64 < hidden_size) {
+                            xesimd::lsc_prefetch<uint8_t, 64,
+                                xesimd::lsc_data_size::default_size,
+                                xesimd::cache_hint::cached,
+                                xesimd::cache_hint::cached>(wrow + k + 64);
+                        }
+                        simd<fp16, 64> wv =
+                            fp8e5m2_to_half<64>(block_load<uint8_t, 64>(wrow + k)) * s;
+#pragma unroll
+                        for (int j = 0; j < WIDE_TOK; ++j) {
+                            if (j < nt) {
+                                simd<fp16, 64> xv = block_load<fp16, 64>(
+                                    x + (size_t)(t0 + j) * hidden_size + k);
+                                acc[j] += convert<float>(xv * wv);
+                            }
+                        }
+                    }
+
+#pragma unroll
+                    for (int j = 0; j < WIDE_TOK; ++j) {
+                        if (j < nt) {
+                            output[(t0 + j) * num_experts + row] = fp16(
+                                sycl::ext::intel::esimd::detail::sum<float, float, 64>(
+                                    acc[j]));
+                        }
+                    }
                 }
-
-                output[token * num_experts + row] = fp16(
-                    sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc));
             });
     };
 
@@ -1602,10 +1695,20 @@ torch::Tensor moe_up_forward(
     int hidden_size = x.size(1);
     int intermediate_size = gate_up_weight.size(2) / 2;
     int rows_per_token = top_k + num_shared_experts;
+    // The shared kernels stride both the shared weight and the intermediates
+    // buffer by intermediate_size, so S != I is refused rather than supported.
+    moe_check_shared_inter_matches(
+        num_shared_experts, hidden_size, intermediate_size,
+        &shared_gate_up_weight, nullptr);
 
     TORCH_CHECK(hidden_size % 64 == 0);
     TORCH_CHECK(gate_up_weight.size(1) == hidden_size);
     TORCH_CHECK(gate_up_weight.size(2) % 2 == 0);
+    // The up kernels tile N by 16 and store a whole tile; a remainder leaves
+    // tail columns of the intermediates buffer unwritten.
+    TORCH_CHECK(intermediate_size % 16 == 0,
+                "moe_up_forward: intermediate_size must be a multiple of 16, "
+                "got ", intermediate_size);
     TORCH_CHECK(selected_experts.numel() == n_tokens * top_k);
 
     torch::Tensor intermediates = torch::empty(
@@ -2013,6 +2116,11 @@ torch::Tensor moe_down_forward(
     int hidden_size = x.size(1);
     int intermediate_size = intermediates.size(1);
     int rows_per_token = top_k + num_shared_experts;
+    // shared_down_weight is [ns, hidden, S] and the kernel strides it by the
+    // routed intermediate_size, so S must equal I.
+    moe_check_shared_inter_matches(
+        num_shared_experts, hidden_size, intermediate_size,
+        nullptr, &shared_down_weight);
 
     TORCH_CHECK(hidden_size % 64 == 0);
     TORCH_CHECK(intermediate_size % 64 == 0);
@@ -2086,7 +2194,12 @@ void moe_accumulate_kernel(
     const int rows_per_token,
     const torch::Device& device) {
 
+    // The 64-wide store has no tail, so a 32-wide tail arm covers the
+    // remainder. The dispatch gate admits hidden % 32, which makes 32 the only
+    // possible remainder.
     const int num_chunks = hidden_size / 64;
+    const int tail_base  = num_chunks * 64;
+    const int tail_lanes = hidden_size - tail_base;   // 0 or 32
 
     auto cgf = [&](sycl::handler& cgh) {
         cgh.parallel_for<class MoeAccumulate>(
@@ -2103,8 +2216,25 @@ void moe_accumulate_kernel(
                 block_store<fp16, 64>(final_output + (size_t)token * hidden_size + base, convert<fp16>(sum));
             });
     };
+    auto cgf_tail = [&](sycl::handler& cgh) {
+        const int tb = tail_base;
+        cgh.parallel_for<class MoeAccumulateTail>(
+            sycl::range<1>(n_tokens),
+            [=](sycl::id<1> idx) SYCL_ESIMD_KERNEL {
+                const int token = (int)idx[0];
+                simd<float, 32> sum(0.f);
+                for (int b = 0; b < rows_per_token; b++) {
+                    sum += convert<float>(
+                        block_load<fp16, 32>(partials + (size_t)(token * rows_per_token + b) * hidden_size + tb));
+                }
+                block_store<fp16, 32>(final_output + (size_t)token * hidden_size + tb, convert<fp16>(sum));
+            });
+    };
 
     submit_kernel(cgf, device, "moe accumulate");
+    if (tail_lanes > 0) {
+        submit_kernel(cgf_tail, device, "moe accumulate tail");
+    }
 }
 
 torch::Tensor moe_accumulate(
@@ -2358,7 +2488,18 @@ torch::Tensor moe_forward_fused(
     TORCH_CHECK(gate_up_weight.scalar_type() == at::kFloat8_e5m2);
     int n_tokens = x.size(0), hidden_size = x.size(1);
     int intermediate_size = gate_up_weight.size(2) / 2;
+    moe_check_shared_inter_matches(
+        num_shared_experts, hidden_size, intermediate_size,
+        &shared_gate_up_weight, &shared_down_weight);
     int rows_per_token = top_k + num_shared_experts;
+    TORCH_CHECK(intermediate_size % 64 == 0,
+                "moe_forward_fused: intermediate_size must be a multiple of 64, got ",
+                intermediate_size);
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 64 == 0,
+                "moe_forward_fused: hidden_size must be a multiple of 64, got ",
+                hidden_size);
     auto intermediates = moe_up_forward(x, gate_up_weight, gate_up_scale,
         shared_gate_up_weight, shared_gate_up_scale, selected_experts, top_k, num_shared_experts);
     auto routed_output = torch::empty({n_tokens*rows_per_token, hidden_size},
@@ -2424,6 +2565,19 @@ torch::Tensor moe_forward_full(
     int n_tokens = x.size(0), hidden_size = x.size(1);
     int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k + num_shared_experts;
+    // The shared kernels stride both the shared weight and the intermediates
+    // buffer by intermediate_size, so S != I is refused rather than supported.
+    moe_check_shared_inter_matches(
+        num_shared_experts, hidden_size, intermediate_size,
+        &shared_gate_up_weight, &shared_down_weight);
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 64 == 0,
+                "moe_forward_full: hidden_size must be a multiple of 64, got ",
+                hidden_size);
+    TORCH_CHECK(intermediate_size % 64 == 0,
+                "moe_forward_full: intermediate_size must be a multiple of 64, got ",
+                intermediate_size);
 
     // Ensure pre-allocated buffers exist
     ensure_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
@@ -2496,6 +2650,19 @@ torch::Tensor moe_forward_full_rtfused(
     int n_tokens = x.size(0), hidden_size = x.size(1);
     int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k + num_shared_experts;
+    // The shared kernels stride both the shared weight and the intermediates
+    // buffer by intermediate_size, so S != I is refused rather than supported.
+    moe_check_shared_inter_matches(
+        num_shared_experts, hidden_size, intermediate_size,
+        &shared_gate_up_weight, &shared_down_weight);
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 64 == 0,
+                "moe_forward_full_rtfused: hidden_size must be a multiple of 64, got ",
+                hidden_size);
+    TORCH_CHECK(intermediate_size % 64 == 0,
+                "moe_forward_full_rtfused: intermediate_size must be a multiple of 64, got ",
+                intermediate_size);
 
     ensure_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
                        intermediate_size, x.device());
@@ -2512,11 +2679,20 @@ torch::Tensor moe_forward_full_rtfused(
         // Fallback: dense router GEMV into a temp logits buffer, then topk.
         torch::Tensor logits = torch::empty({n_tokens, (int)n_routed_experts},
             torch::device(x.device()).dtype(torch::kHalf));
-        moe_router_forward_e4m3_kernel(
-            (const fp16*)x.data_ptr(),
-            (const uint8_t*)router_weight.data_ptr(), router_scale.data_ptr<float>(),
-            (fp16*)logits.data_ptr(),
-            n_tokens, hidden_size, (int)n_routed_experts, x.device());
+        // moe_router_forward_e4m3_kernel writes only four tokens.
+        if (n_tokens <= 4) {
+            moe_router_forward_e4m3_kernel(
+                (const fp16*)x.data_ptr(),
+                (const uint8_t*)router_weight.data_ptr(), router_scale.data_ptr<float>(),
+                (fp16*)logits.data_ptr(),
+                n_tokens, hidden_size, (int)n_routed_experts, x.device());
+        } else {
+            moe_router_forward_e4m3_wide_kernel(
+                (const fp16*)x.data_ptr(),
+                (const uint8_t*)router_weight.data_ptr(), router_scale.data_ptr<float>(),
+                (fp16*)logits.data_ptr(),
+                n_tokens, hidden_size, (int)n_routed_experts, x.device());
+        }
         dispatch_moe_topk_forward<class MoeTopKFP8RTFallback>(
             (const fp16*)logits.data_ptr(),
             s_topk_idx.data_ptr<int>(), (fp16*)s_topk_weight.data_ptr(),
@@ -2575,7 +2751,18 @@ std::vector<torch::Tensor> moe_forward_full_rtfused_norm(
     TORCH_CHECK(residual.scalar_type() == torch::kHalf);
     int n_tokens = hidden.size(0), hidden_size = hidden.size(1);
     int intermediate_size = gate_up_weight.size(1) / 2;
+    moe_check_shared_inter_matches(
+        num_shared_experts, hidden_size, intermediate_size,
+        &shared_gate_up_weight, &shared_down_weight);
     int rows_per_token = top_k + num_shared_experts;
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 64 == 0,
+                "moe_forward_full_rtfused_norm: hidden_size must be a multiple of 64, got ",
+                hidden_size);
+    TORCH_CHECK(intermediate_size % 64 == 0,
+                "moe_forward_full_rtfused_norm: intermediate_size must be a multiple of 64, got ",
+                intermediate_size);
 
     ensure_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
                        intermediate_size, hidden.device());
@@ -2686,6 +2873,11 @@ static void ensure_moe_buffers_v2(int n_tokens, int top_k, int num_shared_expert
 static thread_local torch::Tensor sg_topk_idx, sg_topk_weight;
 static thread_local torch::Tensor sg_intermediates, sg_routed_output;
 static thread_local int sg_cached_ntokens = -1;
+// Every dimension the buffers are sized by must key the cache, or a later call
+// with fewer tokens but a larger hidden size reuses an undersized buffer.
+static thread_local int sg_cached_topk = -1;
+static thread_local int sg_cached_hidden = -1;
+static thread_local int sg_cached_inter = -1;
 
 static constexpr int SG_FINAL_RING = 4;
 static thread_local torch::Tensor sg_final_outputs[SG_FINAL_RING];
@@ -2694,7 +2886,10 @@ static thread_local int sg_final_ring_idx = 0;
 static void ensure_gemma4_moe_buffers(int n_tokens, int top_k,
     int hidden_size, int intermediate_size, const torch::Device& dev) {
     int rows_per_token = top_k;
-    if (sg_cached_ntokens >= n_tokens) return;
+    if (sg_cached_ntokens >= n_tokens && sg_cached_topk == top_k &&
+        sg_cached_hidden == hidden_size && sg_cached_inter == intermediate_size) {
+        return;
+    }
     sg_topk_idx = torch::empty({n_tokens, top_k}, torch::device(dev).dtype(torch::kInt32));
     sg_topk_weight = torch::empty({n_tokens, top_k}, torch::device(dev).dtype(torch::kHalf));
     sg_intermediates = torch::empty({n_tokens * rows_per_token, intermediate_size},
@@ -2706,6 +2901,9 @@ static void ensure_gemma4_moe_buffers(int n_tokens, int top_k,
             torch::device(dev).dtype(torch::kHalf));
     }
     sg_cached_ntokens = n_tokens;
+    sg_cached_topk = top_k;
+    sg_cached_hidden = hidden_size;
+    sg_cached_inter = intermediate_size;
 }
 
 static torch::Tensor& sg_take_final_output() {
@@ -2835,6 +3033,11 @@ torch::Tensor moe_forward_full_gelu_tanh(
     int n_tokens = x.size(0), hidden_size = x.size(1);
     // vllm layout: gate_up [E, 2*inter, hidden], down [E, hidden, inter]
     int intermediate_size = gate_up_weight.size(1) / 2;
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 32 == 0,
+                "moe_forward_full_gelu_tanh: hidden_size must be a multiple of 32, got ",
+                hidden_size);
     int rows_per_token = top_k;
 
     ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
@@ -2895,6 +3098,11 @@ torch::Tensor moe_forward_full_gelu_tanh_routed(
         down_weight, down_scale, top_k, n_routed_experts);
     int n_tokens = x.size(0), hidden_size = x.size(1);
     int intermediate_size = gate_up_weight.size(1) / 2;
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 32 == 0,
+                "moe_forward_full_gelu_tanh_routed: hidden_size must be a multiple of 32, got ",
+                hidden_size);
     int rows_per_token = top_k;
 
     ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
@@ -3103,6 +3311,14 @@ torch::Tensor moe_forward_full_silu_routed_e5m2(
     TORCH_CHECK(gate_up_weight.size(2) == hidden_size,
                 "gate_up_weight must be [E, 2*intermediate, hidden]");
     int intermediate_size = gate_up_weight.size(1) / 2;
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 32 == 0,
+                "moe_forward_full_silu_routed_e5m2: hidden_size must be a multiple of 32, got ",
+                hidden_size);
+    TORCH_CHECK(intermediate_size % 16 == 0,
+                "moe_forward_full_silu_routed_e5m2: intermediate_size must be a multiple of 16, got ",
+                intermediate_size);
     int rows_per_token = top_k;
 
     ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
@@ -3162,6 +3378,14 @@ torch::Tensor moe_forward_full_silu_routed_sglang(
     TORCH_CHECK(gate_up_weight.size(1) % 2 == 0,
                 "gate_up_weight.size(1) must be 2*intermediate");
     int intermediate_size = gate_up_weight.size(1) / 2;
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 32 == 0,
+                "moe_forward_full_silu_routed_sglang: hidden_size must be a multiple of 32, got ",
+                hidden_size);
+    TORCH_CHECK(intermediate_size % 16 == 0,
+                "moe_forward_full_silu_routed_sglang: intermediate_size must be a multiple of 16, got ",
+                intermediate_size);
     int rows_per_token = top_k;
 
     ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
@@ -3236,6 +3460,14 @@ torch::Tensor moe_forward_full_silu_routed(
                 "gate_up_weight must be [E, hidden, 2*intermediate] — "
                 "transpose w13 before calling");
     int intermediate_size = gate_up_weight.size(2) / 2;
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 32 == 0,
+                "moe_forward_full_silu_routed: hidden_size must be a multiple of 32, got ",
+                hidden_size);
+    TORCH_CHECK(intermediate_size % 16 == 0,
+                "moe_forward_full_silu_routed: intermediate_size must be a multiple of 16, got ",
+                intermediate_size);
     int rows_per_token = top_k;
 
     ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
@@ -3282,6 +3514,19 @@ torch::Tensor moe_forward_full_v2(
     int n_tokens = x.size(0), hidden_size = x.size(1);
     int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k + num_shared_experts;
+    // The shared kernels stride both the shared weight and the intermediates
+    // buffer by intermediate_size, so S != I is refused rather than supported.
+    moe_check_shared_inter_matches(
+        num_shared_experts, hidden_size, intermediate_size,
+        &shared_gate_up_weight, &shared_down_weight);
+    // The kernels this entry launches store whole tiles of the named extent;
+    // a remainder leaves tail columns unwritten in a reused buffer.
+    TORCH_CHECK(hidden_size % 64 == 0,
+                "moe_forward_full_v2: hidden_size must be a multiple of 64, got ",
+                hidden_size);
+    TORCH_CHECK(intermediate_size % 64 == 0,
+                "moe_forward_full_v2: intermediate_size must be a multiple of 64, got ",
+                intermediate_size);
 
     ensure_moe_buffers_v2(n_tokens, top_k, num_shared_experts, hidden_size,
                           intermediate_size, x.device());

@@ -1,0 +1,113 @@
+// DeepSeek V4.1 Flash -- SYCL kernel launchers.
+
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <c10/core/Device.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include "../deepseek_v41/fp4_gemm.h"
+#include "../deepseek_v41/topk_noaux_tc.h"
+
+using namespace sycl::ext::intel::esimd;
+using fp16 = sycl::half;
+
+template <int NUM_EXPERTS, int TOP_K>
+struct DeepSeekTopKKernel {
+    const fp16* logits;
+    const fp16* bias;
+    int* out_indices;
+    fp16* out_weights;
+    int batch_size;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int token_idx = item.get_global_id(0);
+        if (token_idx >= batch_size) return;
+
+        simd<fp16, NUM_EXPERTS> local_logits;
+        simd<fp16, NUM_EXPERTS> local_bias;
+        
+        // Not yet wired to memory; the loads belong here:
+        // local_logits.copy_from(logits + token_idx * NUM_EXPERTS);
+        // local_bias.copy_from(bias + token_idx * NUM_EXPERTS);
+        
+        simd<int, TOP_K> local_indices;
+        simd<fp16, TOP_K> local_weights;
+
+        compute_noaux_tc_routing<NUM_EXPERTS, TOP_K>(local_logits, local_bias, local_indices, local_weights);
+
+        // ...and the stores here:
+        // local_indices.copy_to(out_indices + token_idx * TOP_K);
+        // local_weights.copy_to(out_weights + token_idx * TOP_K);
+    }
+};
+
+void launch_fp4_gemm(
+    torch::Tensor& a, 
+    torch::Tensor& b_fp4, 
+    torch::Tensor& b_scales, 
+    torch::Tensor& c) 
+{
+    int M = a.size(0);
+    int K = a.size(1);
+    int N = b_fp4.size(0);
+
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(a.device().index()).queue();
+    
+    // DPAS block shape, sized for the Battlemage GRF budget.
+    int BLOCK_M = 16;
+    int BLOCK_N = 32;
+    
+    // 32 sub-groups per work-group, so threads can stage A and B through SLM
+    // cooperatively rather than each saturating global memory.
+    sycl::range<2> local_range(4, 8);
+    sycl::range<2> global_range((M / BLOCK_M) * 4, (N / BLOCK_N) * 8);
+    
+    q.submit([&](sycl::handler& cgh) {
+        DPAS_FP4_GEMM_Kernel<16, 32, 16> kernel{
+            reinterpret_cast<const uint8_t*>(a.data_ptr()),
+            reinterpret_cast<const uint8_t*>(b_fp4.data_ptr()),
+            reinterpret_cast<const uint8_t*>(b_scales.data_ptr()),
+            reinterpret_cast<sycl::ext::oneapi::bfloat16*>(c.data_ptr()),
+            M, N, K
+        };
+        cgh.parallel_for(sycl::nd_range<2>(global_range, local_range), kernel);
+    });
+}
+
+void launch_noaux_tc_topk(
+    torch::Tensor& logits, 
+    torch::Tensor& bias, 
+    torch::Tensor& out_indices, 
+    torch::Tensor& out_weights,
+    int64_t top_k)
+{
+    int batch_size = logits.size(0);
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(logits.device().index()).queue();
+
+    sycl::range<1> global_range(batch_size);
+    sycl::range<1> local_range(1);
+
+    auto submit_kernel = [&](auto top_k_val) {
+        constexpr int TK = decltype(top_k_val)::value;
+        q.submit([&](sycl::handler& cgh) {
+            // DeepSeek V4.1 has n_routed_experts = 384; DSpark layers use 128.
+            DeepSeekTopKKernel<384, TK> kernel{
+                reinterpret_cast<const fp16*>(logits.data_ptr()),
+                reinterpret_cast<const fp16*>(bias.data_ptr()),
+                reinterpret_cast<int*>(out_indices.data_ptr()),
+                reinterpret_cast<fp16*>(out_weights.data_ptr()),
+                batch_size
+            };
+            cgh.parallel_for(sycl::nd_range<1>(global_range, local_range), kernel);
+        });
+    };
+
+    switch (top_k) {
+        case 4: submit_kernel(std::integral_constant<int, 4>{}); break;
+        case 6: submit_kernel(std::integral_constant<int, 6>{}); break;  // V4.1 default
+        case 8: submit_kernel(std::integral_constant<int, 8>{}); break;
+        default:
+            throw std::runtime_error("Unsupported top_k for DeepSeek V4.1 ESIMD kernel");
+    }
+}

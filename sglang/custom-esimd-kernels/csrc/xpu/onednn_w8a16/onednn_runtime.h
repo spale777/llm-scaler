@@ -61,6 +61,8 @@ struct GpuStreamManager {
 
   dnnl::stream&
   get_stream(at::DeviceIndex device_index = c10::xpu::current_device()) {
+    // device_id indexes stream_pool with an unchecked operator[] write below.
+    c10::xpu::check_device_index(device_index);
     auto stream = c10::xpu::getCurrentXPUStream(device_index);
     auto priority = stream.priority();
     if (stream_pool[device_index][priority].find(stream) ==

@@ -27,13 +27,13 @@ torch::Tensor create_output(
     result_shape = {input.size(0), input.size(1), weight.size(1)};
   }
 
-  auto result_stride = input.strides().vec();
-  const auto k = input.size(-1);
-  const auto n = result_shape.back();
-  for (size_t i = 0; i + 1 < result_stride.size(); ++i) {
-    result_stride[i] = result_stride[i] / k * n;
-  }
-  return at::empty_strided(result_shape, result_stride, input.options());
+  // Contiguous output strides, not strides derived from the input's. This is a
+  // public torch.ops entry with no contiguity check at any layer, and a derived
+  // stride(0) < k floors to 0 -- which under-allocates and sets ldc = 0, so
+  // every row is written onto row 0.
+  TORCH_CHECK(input.is_contiguous(),
+              "onednn_fp8_gemm_w8a16: input must be contiguous");
+  return at::empty(result_shape, input.options());
 }
 
 torch::Tensor onednn_fp8_gemm_w8a16(

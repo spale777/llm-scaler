@@ -29,6 +29,7 @@ struct KVScatter_kernel {
     const int64_t* idx_ptr;    // [T]
     int T;
     int row_dim;
+    int64_t cache_rows;
     int64_t k_stride;
     int64_t v_stride;
 
@@ -37,6 +38,9 @@ struct KVScatter_kernel {
         if (t >= T) return;
 
         int64_t dst = idx_ptr[t];
+        // dst comes from device memory: a stale slot id would scatter past
+        // the cache into unrelated allocations.
+        if (dst < 0 || dst >= cache_rows) return;
         const fp16* ks = k_ptr + (int64_t)t * k_stride;
         const fp16* vs = v_ptr + (int64_t)t * v_stride;
         fp16*       kd = k_cache + dst * (int64_t)row_dim;
@@ -59,6 +63,7 @@ inline void kv_scatter_host(
     const int64_t* idx_ptr,
     int T,
     int row_dim,
+    int64_t cache_rows,
     int64_t k_stride,
     int64_t v_stride,
     sycl::queue& q)
@@ -71,7 +76,7 @@ inline void kv_scatter_host(
                 sycl::nd_range<1>({(size_t)T}, {1}),                        \
                 KVScatter_kernel<V>{                                        \
                     k_ptr, v_ptr, k_cache, v_cache, idx_ptr, T, row_dim,     \
-                    k_stride, v_stride});                                   \
+                    cache_rows, k_stride, v_stride});                                   \
         });
 
     if      (row_dim % 512 == 0) { LAUNCH_KVS(512) }

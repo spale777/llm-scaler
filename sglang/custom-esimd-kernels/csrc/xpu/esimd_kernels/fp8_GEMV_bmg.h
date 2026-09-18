@@ -18,6 +18,10 @@
 #pragma once
 #include "utils.h"
 
+// B70 (BMG-G31) has 32 Xe cores x 8 vector engines x 8 hardware threads per
+// engine in small-GRF mode. K-split dispatch aims to fill that.
+static constexpr int BMG_HW_THREADS = 2048;
+
 template<int VL>
 SYCL_ESIMD_FUNCTION inline simd<float, VL> fp8_dequant_bmg(
     simd<uint8_t, VL> raw, int fp8_mode) {
@@ -184,10 +188,91 @@ struct GEMV_fp8_pert_bmg_tail_kernel {
     }
 };
 
+/* Masked-tail variant: handles any remainder, not just exact powers of two.
+ *
+ * The VL_TAIL kernel above requires kp % VL_BIG to land exactly on one of
+ * {8,16,32,64,128}, which holds for only a minority of K values. Here the residue
+ * is loaded under a lane predicate, so out-of-range lanes contribute a hard zero
+ * and nothing past the row is dereferenced.
+ */
+template<int VL_BIG, int K_SPLIT>
+struct GEMV_fp8_pert_bmg_masked_tail_kernel {
+    const fp16*    input;
+    const uint8_t* weight;
+    const float*   scale_ptr;
+    fp16*          output;
+    int N, K;
+    int fp8_mode;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        if constexpr (K_SPLIT > 1) {
+            slm_init<K_SPLIT * sizeof(float)>();
+        }
+
+        int n   = item.get_group(0);
+        int lid = item.get_local_id(0);
+        if (n >= N) return;
+
+        const int kp      = K / K_SPLIT;
+        const int ks      = lid * kp;
+        const int kp_full = (kp / VL_BIG) * VL_BIG;
+        const int tail    = kp - kp_full;
+
+        simd<float, VL_BIG> acc = 0.0f;
+
+        for (int k = ks; k < ks + kp_full; k += VL_BIG) {
+            simd<fp16, VL_BIG> iv = block_load<fp16, VL_BIG>(input + k);
+            simd<float, VL_BIG> input_f = iv;
+
+            simd<uint8_t, VL_BIG> raw = block_load<uint8_t, VL_BIG>(weight + (size_t)n * K + k);
+            simd<float, VL_BIG> wf = fp8_dequant_bmg<VL_BIG>(raw, fp8_mode);
+
+            acc += input_f * wf;
+        }
+
+        // Residue: gather VL_BIG lanes but enable only the first `tail` of them.
+        // Disabled lanes yield 0, so they add nothing to the dot product and no
+        // address past ks+kp is ever dereferenced.
+        if (tail > 0) {
+            const int kt = ks + kp_full;
+
+            simd<uint32_t, VL_BIG> lane(0, 1);
+            simd_mask<VL_BIG> m = lane < (uint32_t)tail;
+            simd<uint32_t, VL_BIG> off = lane;
+
+            simd<fp16, VL_BIG> iv_t =
+                gather<fp16, VL_BIG>(input + kt, off * (uint32_t)sizeof(fp16), m);
+            simd<float, VL_BIG> input_t = iv_t;
+            input_t.merge(0.0f, !m);
+
+            simd<uint8_t, VL_BIG> raw_t =
+                gather<uint8_t, VL_BIG>(weight + (size_t)n * K + kt, off, m);
+            simd<float, VL_BIG> wf_t = fp8_dequant_bmg<VL_BIG>(raw_t, fp8_mode);
+
+            simd<float, VL_BIG> prod = input_t * wf_t;
+            prod.merge(0.0f, !m);
+            acc += prod;
+        }
+
+        float my_sum = reduce<float>(acc, std::plus<>()) * *scale_ptr;
+
+        if constexpr (K_SPLIT == 1) {
+            output[n] = fp16(my_sum);
+        } else {
+            slm_block_store<float, 1>(lid * sizeof(float), simd<float, 1>(my_sum));
+            barrier();
+            if (lid == 0) {
+                simd<float, K_SPLIT> parts = slm_block_load<float, K_SPLIT>(0);
+                output[n] = fp16(reduce<float>(parts, std::plus<>()));
+            }
+        }
+    }
+};
+
 /* Pick (VL_BIG, VL_TAIL, K_SPLIT) for given (N, K).
- * Goal: maximize parallelism. BMG has ~640 hardware threads.
+ * Goal: maximize parallelism, up to BMG_HW_THREADS.
  * Strategy:
- *   - Pick K_SPLIT so that N × K_SPLIT >= 1280 (target full saturation).
+ *   - Pick K_SPLIT so that N x K_SPLIT >= BMG_HW_THREADS (target full saturation).
  *   - K_SPLIT must divide K (kp = K/K_SPLIT).
  *   - VL_BIG: prefer 256 / 128, or whatever makes (kp / VL_BIG) ≥ 2 with a
  *     small tail.
@@ -196,11 +281,11 @@ inline void select_bmg(uint32_t N, uint32_t K, int& vl_big, int& vl_tail, int& k
     // Default: vl=256, ks=1 (matches v2 for nice K values).
     vl_big = 256; vl_tail = 0; ks = 1;
 
-    // Target threads = N × ks; aim for >= 640 (BMG full occupancy).
+    // Target threads = N × ks; aim for >= BMG_HW_THREADS.
     int target_ks = 1;
-    if (N * 8 <= 640) target_ks = 8;
-    else if (N * 4 <= 640) target_ks = 4;
-    else if (N * 2 <= 640) target_ks = 2;
+    if (N * 8 <= BMG_HW_THREADS) target_ks = 8;
+    else if (N * 4 <= BMG_HW_THREADS) target_ks = 4;
+    else if (N * 2 <= BMG_HW_THREADS) target_ks = 2;
     else target_ks = 1;
 
     // K_SPLIT must divide K. Find largest divisor of K that's <= target_ks.
@@ -239,8 +324,8 @@ inline void select_bmg(uint32_t N, uint32_t K, int& vl_big, int& vl_tail, int& k
             // tail is not a clean power-of-2; try smaller VL_BIG.
         }
     }
-    // Fallback: vl_big = 32, no tail.
-    vl_big = 32; vl_tail = 0;
+    // vl_tail = -1 selects the masked-tail kernel for an arbitrary remainder.
+    vl_big = 32; vl_tail = -1;
 }
 
 inline void GEMV_fp8_pert_bmg_host(
@@ -256,45 +341,99 @@ inline void GEMV_fp8_pert_bmg_host(
     #define LAUNCH_NOTAIL(V, KS)         q.submit([&](sycl::handler& h) {             h.parallel_for(sycl::nd_range<1>(global, local),                 GEMV_fp8_pert_bmg_kernel<V, KS>{p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode});         });
     #define LAUNCH_TAIL(V, T, KS)         q.submit([&](sycl::handler& h) {             h.parallel_for(sycl::nd_range<1>(global, local),                 GEMV_fp8_pert_bmg_tail_kernel<V, T, KS>{p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode});         });
 
-    if (vl_tail == 0) {
+    #define LAUNCH_MASKED(V, KS)         q.submit([&](sycl::handler& h) {             h.parallel_for(sycl::nd_range<1>(global, local),                 GEMV_fp8_pert_bmg_masked_tail_kernel<V, KS>{p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode});         });
+
+    // Triples not instantiated below must reach the masked-tail kernel: a
+    // no-tail launch with kp % VL_BIG != 0 would not accumulate the remainder.
+    #define LAUNCH_MASKED_ANY_KS(KS)         if      (KS == 1) { LAUNCH_MASKED(32, 1) }         else if (KS == 2) { LAUNCH_MASKED(32, 2) }         else if (KS == 4) { LAUNCH_MASKED(32, 4) }         else              { LAUNCH_MASKED(32, 8) }
+
+    if (vl_tail < 0) {
+            LAUNCH_MASKED_ANY_KS(ks)
+    } else if (vl_tail == 0) {
         // No tail — use simple kernel.
-        if      (vl_big == 256 && ks == 1) { LAUNCH_NOTAIL(256, 1) }
+        if (vl_big == 256 && ks == 1) { LAUNCH_NOTAIL(256, 1) }
         else if (vl_big == 256 && ks == 2) { LAUNCH_NOTAIL(256, 2) }
         else if (vl_big == 256 && ks == 4) { LAUNCH_NOTAIL(256, 4) }
+        else if (vl_big == 256 && ks == 8) { LAUNCH_NOTAIL(256, 8) }
         else if (vl_big == 128 && ks == 1) { LAUNCH_NOTAIL(128, 1) }
         else if (vl_big == 128 && ks == 2) { LAUNCH_NOTAIL(128, 2) }
         else if (vl_big == 128 && ks == 4) { LAUNCH_NOTAIL(128, 4) }
         else if (vl_big == 128 && ks == 8) { LAUNCH_NOTAIL(128, 8) }
-        else if (vl_big == 64  && ks == 1) { LAUNCH_NOTAIL(64,  1) }
-        else if (vl_big == 64  && ks == 2) { LAUNCH_NOTAIL(64,  2) }
-        else if (vl_big == 64  && ks == 4) { LAUNCH_NOTAIL(64,  4) }
-        else if (vl_big == 32  && ks == 1) { LAUNCH_NOTAIL(32,  1) }
-        else                               { LAUNCH_NOTAIL(32,  1) }
+        else if (vl_big ==  64 && ks == 1) { LAUNCH_NOTAIL(64, 1) }
+        else if (vl_big ==  64 && ks == 2) { LAUNCH_NOTAIL(64, 2) }
+        else if (vl_big ==  64 && ks == 4) { LAUNCH_NOTAIL(64, 4) }
+        else if (vl_big ==  64 && ks == 8) { LAUNCH_NOTAIL(64, 8) }
+        else if (vl_big ==  32 && ks == 1) { LAUNCH_NOTAIL(32, 1) }
+        else if (vl_big ==  32 && ks == 2) { LAUNCH_NOTAIL(32, 2) }
+        else if (vl_big ==  32 && ks == 4) { LAUNCH_NOTAIL(32, 4) }
+        else if (vl_big ==  32 && ks == 8) { LAUNCH_NOTAIL(32, 8) }
+        else                               { LAUNCH_MASKED_ANY_KS(ks) }
     } else {
         // With tail — instantiate (VL_BIG, VL_TAIL, KS) combos.
-        if      (vl_big == 256 && vl_tail == 8  && ks == 1) { LAUNCH_TAIL(256, 8,  1) }
-        else if (vl_big == 256 && vl_tail == 16 && ks == 1) { LAUNCH_TAIL(256, 16, 1) }
-        else if (vl_big == 256 && vl_tail == 32 && ks == 1) { LAUNCH_TAIL(256, 32, 1) }
-        else if (vl_big == 256 && vl_tail == 8  && ks == 2) { LAUNCH_TAIL(256, 8,  2) }
-        else if (vl_big == 256 && vl_tail == 16 && ks == 2) { LAUNCH_TAIL(256, 16, 2) }
-        else if (vl_big == 128 && vl_tail == 8  && ks == 1) { LAUNCH_TAIL(128, 8,  1) }
-        else if (vl_big == 128 && vl_tail == 16 && ks == 1) { LAUNCH_TAIL(128, 16, 1) }
-        else if (vl_big == 128 && vl_tail == 32 && ks == 1) { LAUNCH_TAIL(128, 32, 1) }
-        else if (vl_big == 128 && vl_tail == 64 && ks == 1) { LAUNCH_TAIL(128, 64, 1) }
-        else if (vl_big == 128 && vl_tail == 8  && ks == 2) { LAUNCH_TAIL(128, 8,  2) }
-        else if (vl_big == 128 && vl_tail == 16 && ks == 2) { LAUNCH_TAIL(128, 16, 2) }
-        else if (vl_big == 128 && vl_tail == 32 && ks == 2) { LAUNCH_TAIL(128, 32, 2) }
-        else if (vl_big == 128 && vl_tail == 8  && ks == 4) { LAUNCH_TAIL(128, 8,  4) }
-        else if (vl_big == 128 && vl_tail == 16 && ks == 4) { LAUNCH_TAIL(128, 16, 4) }
-        else if (vl_big == 64  && vl_tail == 8  && ks == 1) { LAUNCH_TAIL(64,  8,  1) }
-        else if (vl_big == 64  && vl_tail == 16 && ks == 1) { LAUNCH_TAIL(64,  16, 1) }
-        else if (vl_big == 64  && vl_tail == 32 && ks == 1) { LAUNCH_TAIL(64,  32, 1) }
-        else if (vl_big == 64  && vl_tail == 8  && ks == 2) { LAUNCH_TAIL(64,  8,  2) }
-        else if (vl_big == 64  && vl_tail == 16 && ks == 2) { LAUNCH_TAIL(64,  16, 2) }
-        else if (vl_big == 64  && vl_tail == 8  && ks == 4) { LAUNCH_TAIL(64,  8,  4) }
-        else                                                  { LAUNCH_NOTAIL(32, 1) }
+        // Every (vl_big, vl_tail, ks) the selector can emit needs an arm here.
+        // A missing one still computes the right answer through the masked
+        // catch-all, but that runs at width 32 whatever width was selected.
+        if (vl_big == 256 && vl_tail == 128 && ks == 1) { LAUNCH_TAIL(256, 128, 1) }
+        else if (vl_big == 256 && vl_tail == 128 && ks == 2) { LAUNCH_TAIL(256, 128, 2) }
+        else if (vl_big == 256 && vl_tail == 128 && ks == 4) { LAUNCH_TAIL(256, 128, 4) }
+        else if (vl_big == 256 && vl_tail == 128 && ks == 8) { LAUNCH_TAIL(256, 128, 8) }
+        else if (vl_big == 256 && vl_tail ==  64 && ks == 1) { LAUNCH_TAIL(256, 64, 1) }
+        else if (vl_big == 256 && vl_tail ==  64 && ks == 2) { LAUNCH_TAIL(256, 64, 2) }
+        else if (vl_big == 256 && vl_tail ==  64 && ks == 4) { LAUNCH_TAIL(256, 64, 4) }
+        else if (vl_big == 256 && vl_tail ==  64 && ks == 8) { LAUNCH_TAIL(256, 64, 8) }
+        else if (vl_big == 256 && vl_tail ==  32 && ks == 1) { LAUNCH_TAIL(256, 32, 1) }
+        else if (vl_big == 256 && vl_tail ==  32 && ks == 2) { LAUNCH_TAIL(256, 32, 2) }
+        else if (vl_big == 256 && vl_tail ==  32 && ks == 4) { LAUNCH_TAIL(256, 32, 4) }
+        else if (vl_big == 256 && vl_tail ==  32 && ks == 8) { LAUNCH_TAIL(256, 32, 8) }
+        else if (vl_big == 256 && vl_tail ==  16 && ks == 1) { LAUNCH_TAIL(256, 16, 1) }
+        else if (vl_big == 256 && vl_tail ==  16 && ks == 2) { LAUNCH_TAIL(256, 16, 2) }
+        else if (vl_big == 256 && vl_tail ==  16 && ks == 4) { LAUNCH_TAIL(256, 16, 4) }
+        else if (vl_big == 256 && vl_tail ==  16 && ks == 8) { LAUNCH_TAIL(256, 16, 8) }
+        else if (vl_big == 256 && vl_tail ==   8 && ks == 1) { LAUNCH_TAIL(256, 8, 1) }
+        else if (vl_big == 256 && vl_tail ==   8 && ks == 2) { LAUNCH_TAIL(256, 8, 2) }
+        else if (vl_big == 256 && vl_tail ==   8 && ks == 4) { LAUNCH_TAIL(256, 8, 4) }
+        else if (vl_big == 256 && vl_tail ==   8 && ks == 8) { LAUNCH_TAIL(256, 8, 8) }
+        else if (vl_big == 128 && vl_tail ==  64 && ks == 1) { LAUNCH_TAIL(128, 64, 1) }
+        else if (vl_big == 128 && vl_tail ==  64 && ks == 2) { LAUNCH_TAIL(128, 64, 2) }
+        else if (vl_big == 128 && vl_tail ==  64 && ks == 4) { LAUNCH_TAIL(128, 64, 4) }
+        else if (vl_big == 128 && vl_tail ==  64 && ks == 8) { LAUNCH_TAIL(128, 64, 8) }
+        else if (vl_big == 128 && vl_tail ==  32 && ks == 1) { LAUNCH_TAIL(128, 32, 1) }
+        else if (vl_big == 128 && vl_tail ==  32 && ks == 2) { LAUNCH_TAIL(128, 32, 2) }
+        else if (vl_big == 128 && vl_tail ==  32 && ks == 4) { LAUNCH_TAIL(128, 32, 4) }
+        else if (vl_big == 128 && vl_tail ==  32 && ks == 8) { LAUNCH_TAIL(128, 32, 8) }
+        else if (vl_big == 128 && vl_tail ==  16 && ks == 1) { LAUNCH_TAIL(128, 16, 1) }
+        else if (vl_big == 128 && vl_tail ==  16 && ks == 2) { LAUNCH_TAIL(128, 16, 2) }
+        else if (vl_big == 128 && vl_tail ==  16 && ks == 4) { LAUNCH_TAIL(128, 16, 4) }
+        else if (vl_big == 128 && vl_tail ==  16 && ks == 8) { LAUNCH_TAIL(128, 16, 8) }
+        else if (vl_big == 128 && vl_tail ==   8 && ks == 1) { LAUNCH_TAIL(128, 8, 1) }
+        else if (vl_big == 128 && vl_tail ==   8 && ks == 2) { LAUNCH_TAIL(128, 8, 2) }
+        else if (vl_big == 128 && vl_tail ==   8 && ks == 4) { LAUNCH_TAIL(128, 8, 4) }
+        else if (vl_big == 128 && vl_tail ==   8 && ks == 8) { LAUNCH_TAIL(128, 8, 8) }
+        else if (vl_big ==  64 && vl_tail ==  32 && ks == 1) { LAUNCH_TAIL(64, 32, 1) }
+        else if (vl_big ==  64 && vl_tail ==  32 && ks == 2) { LAUNCH_TAIL(64, 32, 2) }
+        else if (vl_big ==  64 && vl_tail ==  32 && ks == 4) { LAUNCH_TAIL(64, 32, 4) }
+        else if (vl_big ==  64 && vl_tail ==  32 && ks == 8) { LAUNCH_TAIL(64, 32, 8) }
+        else if (vl_big ==  64 && vl_tail ==  16 && ks == 1) { LAUNCH_TAIL(64, 16, 1) }
+        else if (vl_big ==  64 && vl_tail ==  16 && ks == 2) { LAUNCH_TAIL(64, 16, 2) }
+        else if (vl_big ==  64 && vl_tail ==  16 && ks == 4) { LAUNCH_TAIL(64, 16, 4) }
+        else if (vl_big ==  64 && vl_tail ==  16 && ks == 8) { LAUNCH_TAIL(64, 16, 8) }
+        else if (vl_big ==  64 && vl_tail ==   8 && ks == 1) { LAUNCH_TAIL(64, 8, 1) }
+        else if (vl_big ==  64 && vl_tail ==   8 && ks == 2) { LAUNCH_TAIL(64, 8, 2) }
+        else if (vl_big ==  64 && vl_tail ==   8 && ks == 4) { LAUNCH_TAIL(64, 8, 4) }
+        else if (vl_big ==  64 && vl_tail ==   8 && ks == 8) { LAUNCH_TAIL(64, 8, 8) }
+        else if (vl_big ==  32 && vl_tail ==  16 && ks == 1) { LAUNCH_TAIL(32, 16, 1) }
+        else if (vl_big ==  32 && vl_tail ==  16 && ks == 2) { LAUNCH_TAIL(32, 16, 2) }
+        else if (vl_big ==  32 && vl_tail ==  16 && ks == 4) { LAUNCH_TAIL(32, 16, 4) }
+        else if (vl_big ==  32 && vl_tail ==  16 && ks == 8) { LAUNCH_TAIL(32, 16, 8) }
+        else if (vl_big ==  32 && vl_tail ==   8 && ks == 1) { LAUNCH_TAIL(32, 8, 1) }
+        else if (vl_big ==  32 && vl_tail ==   8 && ks == 2) { LAUNCH_TAIL(32, 8, 2) }
+        else if (vl_big ==  32 && vl_tail ==   8 && ks == 4) { LAUNCH_TAIL(32, 8, 4) }
+        else if (vl_big ==  32 && vl_tail ==   8 && ks == 8) { LAUNCH_TAIL(32, 8, 8) }
+        else                                                  { LAUNCH_MASKED_ANY_KS(ks) }
     }
 
     #undef LAUNCH_NOTAIL
     #undef LAUNCH_TAIL
+    #undef LAUNCH_MASKED
+    #undef LAUNCH_MASKED_ANY_KS
 }

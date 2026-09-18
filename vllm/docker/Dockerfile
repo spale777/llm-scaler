@@ -60,6 +60,10 @@ ARG no_proxy
 ARG VLLM_VERSION=v0.26.0
 # vllm-xpu-kernels pinned base commit (aligned with Dockerfile.dev).
 ARG VLLM_XPU_KERNELS_COMMIT=a6929869587fa6c40dbe393eedc96eeab076bfbb
+# Build parallelism. SYCL AOT compilation peaks at 2-4 GB per translation unit,
+# so this is bounded by builder RAM rather than core count: budget ~4 GB per job.
+# Override with --build-arg MAX_JOBS=<n>.
+ARG MAX_JOBS=4
 
 ENV VIRTUAL_ENV=/opt/buildenv \
     PATH="/root/.local/bin:/opt/buildenv/bin:${PATH}" \
@@ -132,7 +136,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /src/custom-esimd-kernels-vllm && \
-    TORCH_XPU_ARCH_LIST=bmg-g21 MAX_JOBS=1 python3 setup.py bdist_wheel && \
+    TORCH_XPU_ARCH_LIST=bmg-g21 MAX_JOBS=${MAX_JOBS} python3 setup.py bdist_wheel && \
     cp dist/*.whl ${WHEELS}/ && \
     rm -rf build dist
 
@@ -152,7 +156,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     sed -i 's|^transformers|# transformers|' requirements.txt && \
     uv pip install -r requirements.txt && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
-    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    MAX_JOBS=${MAX_JOBS} CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
     rm -rf build .deps
 
 # Wheel inventory (visible in the build log for sanity).

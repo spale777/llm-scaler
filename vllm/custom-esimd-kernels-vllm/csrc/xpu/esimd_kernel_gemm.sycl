@@ -67,6 +67,10 @@ at::Tensor esimd_gemm_int4_pgrp(
                 "esimd_gemm_int4_pgrp: weight_scale must be fp16");
     TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
                 "esimd_gemm_int4_pgrp: output must be fp16");
+    // The grid has no M dimension: the kernel covers M_TILES tiles of 8 rows
+    // and the dispatcher caps M_TILES at 8, so rows past 64 are never written.
+    TORCH_CHECK(M <= 64,
+                "esimd_gemm_int4_pgrp: M must be <= 64, got M=", M);
     TORCH_CHECK(N % 16 == 0,
                 "esimd_gemm_int4_pgrp: N must be a multiple of 16 (DPAS N tile), got N=", N);
     TORCH_CHECK(K % INT4_GEMM_GROUP_SIZE == 0,
@@ -110,9 +114,10 @@ at::Tensor esimd_gemm_fp8_blockscale(
                 "esimd_gemm_fp8_blockscale: weight_scale must be float32");
     TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
                 "esimd_gemm_fp8_blockscale: output must be fp16");
-    TORCH_CHECK(block_n == 128 && block_k == 128,
-                "esimd_gemm_fp8_blockscale: only 128x128 weight blocks supported, got ",
-                block_n, "x", block_k);
+    TORCH_CHECK(block_k == 128,
+                "esimd_gemm_fp8_blockscale: block_k must be 128, got ", block_k);
+    TORCH_CHECK(block_n == 128 || block_n == 32,
+                "esimd_gemm_fp8_blockscale: block_n must be 128 or 32, got ", block_n);
     TORCH_CHECK(K % block_k == 0,
                 "esimd_gemm_fp8_blockscale: K must be a multiple of block_k(128), got K=", K);
     const int64_t Nb = (N + block_n - 1) / block_n;

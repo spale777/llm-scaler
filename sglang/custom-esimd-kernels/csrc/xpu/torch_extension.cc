@@ -27,6 +27,8 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
   m.def("esimd_gemv_fp8_pert(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp8_pert", torch::kXPU, &esimd_gemv_fp8_pert);
+  m.def("esimd_gemv_fp8_pert_bmg(Tensor input, Tensor weight, Tensor weight_scale, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_fp8_pert_bmg", torch::kXPU, &esimd_gemv_fp8_pert_bmg);
 
   m.def("esimd_gemv_fp8_pert_fused2(Tensor input, "
         "Tensor w0, Tensor s0, Tensor o0, "
@@ -222,12 +224,27 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
   m.impl("esimd_gemv_int4_fused2", torch::kXPU, &esimd_gemv_int4_fused2);
 
   // Fused QKV Split + RMSNorm + RoPE
+  // The impl returns q_out, which is declared Tensor(a!), so the return aliases
+  // a mutable input and `-> Tensor` would tell the dispatcher it is fresh
+  // storage. An alias return is in turn rejected by torch.compile's
+  // auto-functionalize, so discard it in a void lambda and declare `-> ()`.
   m.def("esimd_qkv_split_norm_rope(Tensor qkv_state, "
-        "Tensor q_out, Tensor gate_out, Tensor k_out, Tensor v_out, "
+        "Tensor(a!) q_out, Tensor(b!) gate_out, Tensor(c!) k_out, "
+        "Tensor(d!) v_out, "
         "Tensor norm_wq, Tensor norm_wk, Tensor positions, "
         "int q_heads, int kv_heads, bool attn_output_gate, "
-        "int rotary_dim, Tensor cos_sin_cache, bool normalize_v=False) -> Tensor");
-  m.impl("esimd_qkv_split_norm_rope", torch::kXPU, &esimd_qkv_split_norm_rope);
+        "int rotary_dim, Tensor cos_sin_cache, bool normalize_v=False) -> ()");
+  m.impl("esimd_qkv_split_norm_rope", torch::kXPU,
+         [](at::Tensor qkv_state, at::Tensor q_out, at::Tensor gate_out,
+            at::Tensor k_out, at::Tensor v_out, at::Tensor norm_wq,
+            at::Tensor norm_wk, at::Tensor positions, int64_t q_heads,
+            int64_t kv_heads, bool attn_output_gate, int64_t rotary_dim,
+            at::Tensor cos_sin_cache, bool normalize_v) -> void {
+           esimd_qkv_split_norm_rope(qkv_state, q_out, gate_out, k_out, v_out,
+                                     norm_wq, norm_wk, positions, q_heads,
+                                     kv_heads, attn_output_gate, rotary_dim,
+                                     cos_sin_cache, normalize_v);
+         });
 
   // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)
   m.def("esimd_resadd_norm_gemv_fp8_pert(Tensor hidden_states, Tensor residual, "
@@ -278,34 +295,34 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
   m.impl("esimd_gemv_fp16", torch::kXPU, &esimd_gemv_fp16);
 
   m.def("esimd_norm_gemv_norm_fp16(Tensor residual, Tensor scale_with_root, "
-        "Tensor proj_weight, Tensor pre_ff_weight, Tensor router_logits, "
-        "Tensor moe_input, float eps) -> ()");
+        "Tensor proj_weight, Tensor pre_ff_weight, Tensor(a!) router_logits, "
+        "Tensor(b!) moe_input, float eps) -> ()");
   m.impl("esimd_norm_gemv_norm_fp16", torch::kXPU, &esimd_norm_gemv_norm_fp16);
 
   m.def("esimd_norm_add_norm_gemv_gelu_fp8(Tensor attention_output, "
         "Tensor residual_input, Tensor post_attention_weight, "
         "Tensor pre_feedforward_weight, Tensor gate_up_weight, "
-        "Tensor gate_up_scale, Tensor residual_output, "
-        "Tensor activation_output, float post_attention_eps, "
+        "Tensor gate_up_scale, Tensor(a!) residual_output, "
+        "Tensor(b!) activation_output, float post_attention_eps, "
         "float pre_feedforward_eps) -> ()");
   m.impl("esimd_norm_add_norm_gemv_gelu_fp8", torch::kXPU,
          &esimd_norm_add_norm_gemv_gelu_fp8);
 
   m.def("esimd_rmsnorm_gemv_fp8(Tensor input, Tensor norm_weight, "
-        "Tensor gemv_weight, Tensor gemv_scale, Tensor output, float eps) "
+        "Tensor gemv_weight, Tensor gemv_scale, Tensor(a!) output, float eps) "
         "-> ()");
   m.impl("esimd_rmsnorm_gemv_fp8", torch::kXPU,
          &esimd_rmsnorm_gemv_fp8);
 
   m.def("esimd_dual_rmsnorm_residual_scalar(Tensor x1, Tensor weight1, "
         "Tensor x2, Tensor weight2, Tensor weight3, Tensor residual, "
-        "Tensor output, float eps1, float eps2, float eps3, float scalar) "
+        "Tensor(a!) output, float eps1, float eps2, float eps3, float scalar) "
         "-> ()");
   m.impl("esimd_dual_rmsnorm_residual_scalar", torch::kXPU,
          &esimd_dual_rmsnorm_residual_scalar);
 
-  m.def("esimd_norm_add_norm(Tensor h2_raw, Tensor h1, Tensor w1, Tensor w2, "
-        "Tensor out, float eps1, float eps2) -> ()");
+  m.def("esimd_norm_add_norm(Tensor h2_raw, Tensor(a!) h1, Tensor w1, "
+        "Tensor w2, Tensor(b!) out, float eps1, float eps2) -> ()");
   m.impl("esimd_norm_add_norm", torch::kXPU, &esimd_norm_add_norm);
 
   m.def("esimd_kv_scatter(Tensor k, Tensor v, Tensor(a!) k_cache, "

@@ -78,6 +78,16 @@ struct MoeUpDecodeGeluTanh {
         const int kp_full = (hidden / VL) * VL;
         simd<float, VL> g_acc(0.f), u_acc(0.f);
         for (int k = 0; k < kp_full; k += VL) {
+            // w_gate/w_up are pure streams: prefetch the next tile so the loads
+            // below do not stall on them.
+            if (k + VL < kp_full) {
+                xesimd::lsc_prefetch<uint8_t, VL, xesimd::lsc_data_size::default_size,
+                                     xesimd::cache_hint::cached,
+                                     xesimd::cache_hint::cached>(w_gate + k + VL);
+                xesimd::lsc_prefetch<uint8_t, VL, xesimd::lsc_data_size::default_size,
+                                     xesimd::cache_hint::cached,
+                                     xesimd::cache_hint::cached>(w_up + k + VL);
+            }
             simd<fp16, VL> xv = block_load<fp16, VL>(x + k);
             simd<float, VL> xf = xv;
             g_acc += xf * fp8e4m3_dequant_fast<VL>((block_load<uint8_t, VL>(w_gate + k)));
@@ -135,6 +145,11 @@ struct MoeDownDecode {
         const int kp_full = (inter / VL) * VL;
         simd<float, VL> acc(0.f);
         for (int k = 0; k < kp_full; k += VL) {
+            if (k + VL < kp_full) {
+                xesimd::lsc_prefetch<uint8_t, VL, xesimd::lsc_data_size::default_size,
+                                     xesimd::cache_hint::cached,
+                                     xesimd::cache_hint::cached>(wrow + k + VL);
+            }
             simd<fp16, VL> hv = block_load<fp16, VL>(hi + k);
             simd<float, VL> hf = hv;
             acc += hf * fp8e4m3_dequant_fast<VL>((block_load<uint8_t, VL>(wrow + k)));

@@ -20,6 +20,7 @@
  * Moe_down_q5k_kernel::dots_for() / Moe_finalize_gguf_kernel::shared_dot().
  */
 #pragma once
+#include "utils.h"
 #include <cstdlib>
 #include <cstring>
 

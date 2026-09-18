@@ -1,4 +1,5 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 #include "utils.h"
 #include <cmath>
 
@@ -261,6 +262,19 @@ inline void qkv_split_norm_rope_host(
     uint32_t totalHeads = attnOutputGate
         ? (2 * qHead + 2 * kvHead)
         : (qHead + 2 * kvHead);
+
+    // The kernel writes nothing unless headDim == 256.
+    TORCH_CHECK(hiddenDim == totalHeads * headDim,
+                "qkv_split_norm_rope: hidden dim ", hiddenDim,
+                " is not ", totalHeads, " heads of ", headDim,
+                "; this kernel only supports a head dim of 256");
+
+    // The rope path has two layouts: rotaryDim == 64, and the full-head case
+    // where the cos/sin row is headDim wide. Anything between would be read
+    // with the full-head offsets against a narrower row.
+    TORCH_CHECK(rotaryDim == 64 || rotaryDim == headDim,
+                "qkv_split_norm_rope: rotary dim ", rotaryDim,
+                " must be 64 or the head dim ", headDim);
 
     sycl::range<2> globalRange(totalHeads, ntoks);
     sycl::range<2> localRange(1, 1);

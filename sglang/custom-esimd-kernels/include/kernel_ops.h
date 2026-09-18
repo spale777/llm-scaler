@@ -404,6 +404,12 @@ at::Tensor esimd_gemv_int4_fused2(
     at::Tensor w1, at::Tensor s1, at::Tensor o1);
 
 // MoE grouped GEMM — FP8 E5M2 with per-tensor scale (one scalar per expert)
+
+at::Tensor esimd_moe_gemm_fp8_blockscale(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output, at::Tensor expert_idx,
+    int64_t N, int64_t K, int64_t num_experts, int64_t block_n, int64_t block_k);
+
 at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
     at::Tensor output, at::Tensor expert_idx,

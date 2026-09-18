@@ -1,6 +1,7 @@
 /* torch_extension_topk_v2.cc — Standalone registration for TopK V2 */
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/all.h>
+#include <torch/extension.h>
 #include <torch/library.h>
 #include <Python.h>
 
@@ -15,9 +16,8 @@ TORCH_LIBRARY(esimd_topk_v2, m) {
   m.impl("topk_v2", torch::kXPU, &esimd_moe_topk_v2);
 }
 
-PyMODINIT_FUNC PyInit_esimd_topk_v2() {
-    static struct PyModuleDef module = {
-        PyModuleDef_HEAD_INIT, "esimd_topk_v2", nullptr, 0, nullptr
-    };
-    return PyModule_Create(&module);
-}
+// Ops are registered globally via TORCH_LIBRARY; this only supplies the module
+// init symbol CPython requires to import the .so.
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
+
+

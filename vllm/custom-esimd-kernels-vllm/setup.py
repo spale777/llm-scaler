@@ -11,7 +11,21 @@ import torch
 torch_include = str(Path(torch.__file__).parent / "include")
 
 ext_modules = [
+    
     SyclExtension(
+        name="custom_esimd_kernels_vllm_ar",
+        sources=[
+            "csrc/xpu/torch_extension_ar.cc",
+            "csrc/xpu/ipc_allreduce.sycl",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fno-sycl-early-optimizations"],
+        }
+    ),
+SyclExtension(
         name="custom_esimd_kernels_vllm.custom_esimd_kernels",
         sources=[
             "csrc/xpu/esimd_kernel.sycl",
@@ -55,7 +69,8 @@ ext_modules.append(
 )
 ### for lgrf esimd kernels
 
-### MoE auxiliary kernels — no DPAS, standard compilation
+### The FP8 block-scale prefill kernel holds ~5.5 KB of live DPAS state, which
+### is why this module alone is built with -doubleGRF.
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_vllm.custom_esimd_kernels_moe",
@@ -70,6 +85,8 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen",
+                     "-Xs", "-device bmg -options -doubleGRF",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -237,6 +254,29 @@ ext_modules.append(
     )
 )
 ### Q4_0 quantize kernel
+
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.deepseek_v41",
+        sources=[
+            "csrc/xpu/deepseek_kernels.sycl",
+            "csrc/xpu/torch_extension_deepseek.cc",
+        ],
+        include_dirs=[
+            root.joinpath("csrc"),
+            root.joinpath("csrc/xpu"),
+            root.joinpath("csrc/deepseek_v41")
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-fsycl", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
 
 setup(
     name="custom-esimd-kernels-vllm",

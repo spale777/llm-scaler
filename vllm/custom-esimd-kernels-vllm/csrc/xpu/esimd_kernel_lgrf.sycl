@@ -37,6 +37,27 @@ at::Tensor esimd_gdn_conv_fused(
     int64_t K, int64_t V,
     double scale)
 {
+    // The gdn_conv_fused kernels hardcode 3 state taps and 4 weights, and read
+    // conv_state transposed-only, so the tap axis is always -2. Every pointer
+    // below is a reinterpret_cast<fp16*>, so a bf16 pool would be read with
+    // fp16's exponent/mantissa split and produce wrong numbers silently.
+    TORCH_CHECK(qkvz.scalar_type() == at::kHalf
+                    && conv_state.scalar_type() == at::kHalf
+                    && conv_weight.scalar_type() == at::kHalf
+                    && ssm_state.scalar_type() == at::kHalf
+                    && output.scalar_type() == at::kHalf
+                    && z_out.scalar_type() == at::kHalf,
+                "esimd_gdn_conv_fused: qkvz, conv_state, conv_weight, ssm_state, output and "
+                "z_out must be fp16; this kernel reinterprets their storage "
+                "as fp16");
+    TORCH_CHECK(conv_state.dim() >= 2 && conv_state.size(-2) == 3,
+                "esimd_gdn_conv_fused: this kernel is hardwired to conv_kernel_size=4 "
+                "(3 state taps); conv_state has ",
+                conv_state.dim() >= 2 ? conv_state.size(-2) : -1, " taps.");
+    TORCH_CHECK(conv_weight.size(-1) == 4,
+                "esimd_gdn_conv_fused: conv_weight's last dim must be 4 (the kernel loads 4 "
+                "weights per channel); got ", conv_weight.size(-1));
+
     auto& dpcpp_queue = get_device_queue(qkvz);
 
     // Extract strides (in fp16 elements)
@@ -64,7 +85,8 @@ at::Tensor esimd_gdn_conv_fused(
         p_alog, p_dtbias, p_ba, ba_stride0,
         p_sstate, p_ssidx, p_out, p_zout,
         (int)N, (int)H, (int)HV, (int)K, (int)V,
-        (float)scale, conv_stride0, ssm_stride0,
+        (float)scale, conv_stride0, conv_state.size(0),
+        ssm_stride0, ssm_state.size(0),
         dpcpp_queue);
 
     return output;
@@ -87,6 +109,27 @@ at::Tensor esimd_gdn_conv_fused_seq(
     int64_t K, int64_t V,
     double scale)
 {
+    // The gdn_conv_fused kernels hardcode 3 state taps and 4 weights, and read
+    // conv_state transposed-only, so the tap axis is always -2. Every pointer
+    // below is a reinterpret_cast<fp16*>, so a bf16 pool would be read with
+    // fp16's exponent/mantissa split and produce wrong numbers silently.
+    TORCH_CHECK(qkvz.scalar_type() == at::kHalf
+                    && conv_state.scalar_type() == at::kHalf
+                    && conv_weight.scalar_type() == at::kHalf
+                    && ssm_state.scalar_type() == at::kHalf
+                    && output.scalar_type() == at::kHalf
+                    && z_out.scalar_type() == at::kHalf,
+                "esimd_gdn_conv_fused_seq: qkvz, conv_state, conv_weight, ssm_state, output and "
+                "z_out must be fp16; this kernel reinterprets their storage "
+                "as fp16");
+    TORCH_CHECK(conv_state.dim() >= 2 && conv_state.size(-2) == 3,
+                "esimd_gdn_conv_fused_seq: this kernel is hardwired to conv_kernel_size=4 "
+                "(3 state taps); conv_state has ",
+                conv_state.dim() >= 2 ? conv_state.size(-2) : -1, " taps.");
+    TORCH_CHECK(conv_weight.size(-1) == 4,
+                "esimd_gdn_conv_fused_seq: conv_weight's last dim must be 4 (the kernel loads 4 "
+                "weights per channel); got ", conv_weight.size(-1));
+
     auto& dpcpp_queue = get_device_queue(qkvz);
 
     int64_t qkvz_stride0 = qkvz.stride(0);
@@ -112,7 +155,8 @@ at::Tensor esimd_gdn_conv_fused_seq(
         p_alog, p_dtbias, p_ba, ba_stride0,
         p_sstate, p_ssidx, p_out, p_zout,
         (int)N, (int)H, (int)HV, (int)K, (int)V,
-        (float)scale, conv_stride0, ssm_stride0,
+        (float)scale, conv_stride0, conv_state.size(0),
+        ssm_stride0, ssm_state.size(0),
         dpcpp_queue);
 
     return output;
@@ -140,6 +184,27 @@ at::Tensor esimd_gdn_conv_fused_seq_spec(
     int64_t V,
     double scale)
 {
+    // The gdn_conv_fused kernels hardcode 3 state taps and 4 weights, and read
+    // conv_state transposed-only, so the tap axis is always -2. Every pointer
+    // below is a reinterpret_cast<fp16*>, so a bf16 pool would be read with
+    // fp16's exponent/mantissa split and produce wrong numbers silently.
+    TORCH_CHECK(qkvz.scalar_type() == at::kHalf
+                    && conv_state.scalar_type() == at::kHalf
+                    && conv_weight.scalar_type() == at::kHalf
+                    && ssm_state.scalar_type() == at::kHalf
+                    && output.scalar_type() == at::kHalf
+                    && z_out.scalar_type() == at::kHalf,
+                "esimd_gdn_conv_fused_seq_spec: qkvz, conv_state, conv_weight, ssm_state, output and "
+                "z_out must be fp16; this kernel reinterprets their storage "
+                "as fp16");
+    TORCH_CHECK(conv_state.dim() >= 2 && conv_state.size(-2) == 3,
+                "esimd_gdn_conv_fused_seq_spec: this kernel is hardwired to conv_kernel_size=4 "
+                "(3 state taps); conv_state has ",
+                conv_state.dim() >= 2 ? conv_state.size(-2) : -1, " taps.");
+    TORCH_CHECK(conv_weight.size(-1) == 4,
+                "esimd_gdn_conv_fused_seq_spec: conv_weight's last dim must be 4 (the kernel loads 4 "
+                "weights per channel); got ", conv_weight.size(-1));
+
     auto& dpcpp_queue = get_device_queue(qkvz);
 
     auto* p_qkvz = reinterpret_cast<const fp16*>(qkvz.data_ptr());
@@ -162,7 +227,7 @@ at::Tensor esimd_gdn_conv_fused_seq_spec(
         p_token_indx, p_accepted, (int)num_spec_decodes,
         (int)num_spec_tokens, (int)H, (int)HV, (int)K, (int)V,
         (float)scale, (int)conv_state.size(1), conv_state.stride(0),
-        ssm_state.stride(0),
+        conv_state.size(0), ssm_state.stride(0), ssm_state.size(0),
         dpcpp_queue);
     return output;
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 
 #include "utils.h"
 
@@ -21,13 +22,14 @@ struct NormGemvNormFp16Kernel {
         }
 
         int num_chunks = hidden_size / VL;
-        simd<float, VL> residual_chunks[MAX_CHUNKS];
 
+        // No register cache: a simd<float, VL>[MAX_CHUNKS] array is 16 KB at
+        // hidden_size=2816 / VL=256 against an 8 KB per-thread budget, which
+        // exhausts Level Zero resources. Re-loading residual below hits L3.
         float sum_sq = 0.0f;
         for (int chunk = 0; chunk < num_chunks; ++chunk) {
             int offset = chunk * VL;
             simd<float, VL> values = block_load<fp16, VL>(residual + offset);
-            residual_chunks[chunk] = values;
             sum_sq += reduce<float>(values * values, std::plus<>());
         }
 
@@ -37,7 +39,8 @@ struct NormGemvNormFp16Kernel {
         simd<float, VL> accumulator = 0.0f;
         for (int chunk = 0; chunk < num_chunks; ++chunk) {
             int offset = chunk * VL;
-            simd<float, VL> normalized = residual_chunks[chunk] * inv_rms;
+            simd<float, VL> normalized =
+                simd<float, VL>(block_load<fp16, VL>(residual + offset)) * inv_rms;
 
             if (expert == 0) {
                 simd<float, VL> pre_ff =
@@ -78,6 +81,12 @@ inline void norm_gemv_norm_fp16_host(
                 residual, scale_with_root, proj_weight, pre_ff_weight, \
                 router_logits, moe_input, num_experts, hidden_size, eps}); \
     });
+
+    // No bound on hidden_size: the kernel walks it in whole chunks with a
+    // runtime loop bound and holds no per-thread array sized by it. The ladder
+    // below covers every multiple of 64 exactly, so % 64 is the requirement.
+    TORCH_CHECK(hidden_size % 64 == 0,
+                "norm_gemv_norm: hidden_size must be a multiple of 64, got ", hidden_size);
 
     if (hidden_size % 512 == 0) {
         int chunks = hidden_size / 512;

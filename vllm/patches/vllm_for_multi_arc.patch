@@ -7107,7 +7107,7 @@ index f0647323e..23e1b76a1 100644
 +        use_custom_op = self.use_custom_op_call and not (
 +            self.bypass_custom_all_reduce_in_eager
 +            and not torch.compiler.is_compiling()
-+            and not torch.xpu.is_current_stream_capturing()
++            and not (hasattr(torch, "xpu") and torch.xpu.is_current_stream_capturing())
 +        )
 +        if use_custom_op:
              return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
@@ -8621,7 +8621,7 @@ index f30d6ced1..bdcd35bee 100644
  from vllm.model_executor.layers.quantization.utils.quant_utils import (
      kFp8DynamicTensorSym,
      kFp8DynamicTokenSym,
-@@ -18,6 +22,129 @@ from vllm.platforms import current_platform
+@@ -18,6 +22,144 @@ from vllm.platforms import current_platform
  from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
  from .ScaledMMLinearKernel import FP8ScaledMMLinearKernel, FP8ScaledMMLinearLayerConfig
  
@@ -8693,6 +8693,9 @@ index f30d6ced1..bdcd35bee 100644
 +    weight: torch.Tensor,
 +    weight_scale: torch.Tensor,
 +    bias: torch.Tensor | None,
++    # Inert since the N term was dropped: the kernel bounds N itself, so N=48
++    # needs no exception. Kept because two call sites still pass it; remove it
++    # with them, not before.
 +    allow_qwen_spec_n48: bool = False,
 +) -> torch.Tensor | None:
 +    """Use ESIMD FP8 GEMV/GEMM for decode and small/measured batches."""
@@ -8704,11 +8707,23 @@ index f30d6ced1..bdcd35bee 100644
 +        or weight.ndim != 2
 +        or not 1 <= x.shape[0] <= 64
 +        or x.shape[1] != weight.shape[1]
-+        or (
-+            weight.shape[0] % _ESIMD_FP8_ALIGNMENT != 0
-+            and not (allow_qwen_spec_n48 and weight.shape[0] == 48)
-+        )
-+        or weight.shape[1] % _ESIMD_FP8_ALIGNMENT != 0
++        # No N term: the kernel bounds N itself (`if (n >= N) return;` in
++        # fp8_GEMV_bmg.h), so N only sizes the grid. The %128 here refused
++        # 4,063 of 4,096 N values that are all servable, and needed a hand-cut
++        # exception for N=48 to stay usable -- which is the evidence it
++        # encoded nothing real.
++        #
++        # K is M-dependent, because the two paths differ. At M==1 (GEMV)
++        # select_bmg falls through to vl_big=32 with a masked tail that handles
++        # an arbitrary remainder, so the only real floor is the fp8 packing
++        # granularity. test_gemv_bmg_tail_dispatch sweeps K in [32,8192]
++        # exhaustively and asserts exact element coverage -- including 1056,
++        # the gemma4 down_proj shape the kernel header advertises at 1.78x --
++        # so this is verified statically, though not on device. At M>=2 (GEMM)
++        # the narrow-N arm hard-asserts K % 128 and the ws arms need K % 64 for
++        # VL=64, so relaxing below 128 there turns a silent refusal into an
++        # abort.
++        or weight.shape[1] % (8 if x.shape[0] == 1 else 128) != 0
 +        or x.dtype != torch.float16
 +        or weight.dtype != torch.float8_e4m3fn
 +        or weight_scale.dtype != torch.float32
@@ -13290,7 +13305,7 @@ index 63d97fbd1..cdec38580 100644
              if current_platform.is_cuda_alike() or current_platform.is_xpu():
                  return gemma4_fused_routing_kernel_triton(
                      gating_output, topk, self.per_expert_scale
-@@ -360,8 +889,411 @@ class Gemma4MoE(nn.Module):
+@@ -360,8 +889,431 @@ class Gemma4MoE(nn.Module):
              custom_routing_function=routing_function,
              activation="gelu_tanh",
          )
@@ -13522,6 +13537,26 @@ index 63d97fbd1..cdec38580 100644
 +                self._full_moe_ready = False
 +                return None
 +            w13, w13_scale, w2, w2_scale, native_layout = moe_weights
++            # The kernels tile both extents and store whole tiles. On the
++            # canonical path dispatch_moe_down_decode checks
++            # intermediate_size % 32 (dispatch_moe_up_decode checks
++            # hidden_size % 32, not intermediate); the native entry checks
++            # intermediate_size % 16. Both entries want hidden_size % 32.
++            # The call below is BARE, so a shape this gate admits and the
++            # kernel refuses is an
++            # abort on the first decode token, not a fallback. gemma4-26B has
++            # intermediate 704 unsharded: 176 at TP=4 and 88 at TP=8, so TP=4
++            # aborts on the canonical layout and TP=8 on both.
++            _inter = w13.shape[2] // 2 if native_layout else w13.shape[1] // 2
++            _mod = 16 if native_layout else 32
++            if x.shape[-1] % 64 != 0 or _inter % _mod != 0:
++                logger.info_once(
++                    "Gemma4: ESIMD full-fused MoE decode needs hidden %% 64 and "
++                    "intermediate %% %d; got %d and %d. Using the default path.",
++                    _mod, x.shape[-1], _inter,
++                )
++                self._full_moe_ready = False
++                return None
 +            try:
 +                self._full_moe_op = (
 +                    torch.ops.moe_ops.moe_forward_full_gelu_tanh_decode_native
@@ -16921,7 +16956,7 @@ index 50bc4cce1..999381fc0 100644
  
          self.experts = FusedMoE(
              shared_experts=self.shared_expert,
-@@ -193,6 +288,554 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -193,6 +288,568 @@ class Qwen3NextSparseMoeBlock(nn.Module):
              if self.shared_expert is None
              else None,
          )
@@ -17468,8 +17503,22 @@ index 50bc4cce1..999381fc0 100644
 +                    )
 +                )
 +            )
-+            self._esimd_moe_is_block = block_scale_ready
-+            self._esimd_moe_weight_eligible = scalar_scale_ready or block_scale_ready
++            # The kernels derive intermediate_size = w13.shape[1] // 2 and
++            # TORCH_CHECK hidden_size % 128 == 0 && intermediate_size % 128 == 0
++            # (moe.sycl:1810). Nothing on this side tested it, so a shape that
++            # fails it ABORTED the forward pass instead of falling back:
++            # Qwen3-Next-80B-A3B has I=512, which is 64 per rank at TP=8, and
++            # gemma4-26B MoE has I=704 unsharded -- 352 at TP=2, 176 at TP=4,
++            # 88 at TP=8, none of them a multiple of 128. Check it here so
++            # those configurations take the non-ESIMD path.
++            _w13 = getattr(experts, "w13_weight", None)
++            _dims_ok = _w13 is not None and _w13.dim() == 3 and (
++                _w13.shape[2] % 128 == 0 and (_w13.shape[1] // 2) % 128 == 0
++            )
++            self._esimd_moe_is_block = block_scale_ready and _dims_ok
++            self._esimd_moe_weight_eligible = (
++                (scalar_scale_ready or block_scale_ready) and _dims_ok
++            )
 +            if not self._esimd_moe_weight_eligible:
 +                self._esimd_moe_enabled = False
 +        return self._esimd_moe_weight_eligible

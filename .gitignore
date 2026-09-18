@@ -1,3 +1,15 @@
+# Virtualenvs
+.venv/
+venv/
+.venvs/
+
+# Vendored upstream checkouts (large, contain nested .git)
+references/
+
+# Local scratch and logs
+scratch_*.py
+*.log
+
 # Python
 __pycache__/
 *.py[cod]

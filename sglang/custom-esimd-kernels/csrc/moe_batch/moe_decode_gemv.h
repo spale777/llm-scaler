@@ -1,6 +1,9 @@
 #pragma once
 
 #include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+namespace xesimd = sycl::ext::intel::experimental::esimd;
 
 template<int N>
 SYCL_ESIMD_FUNCTION
@@ -76,6 +79,15 @@ struct MoeUpDecodeGeluTanh {
         simd<float, VL> gate_accumulator = 0.0f;
         simd<float, VL> up_accumulator = 0.0f;
         for (int k = 0; k < full_end; k += VL) {
+            // gate_weight/up_weight are pure streams: prefetch the next tile.
+            if (k + VL < full_end) {
+                xesimd::lsc_prefetch<uint8_t, VL, xesimd::lsc_data_size::default_size,
+                                     xesimd::cache_hint::cached,
+                                     xesimd::cache_hint::cached>(gate_weight + k + VL);
+                xesimd::lsc_prefetch<uint8_t, VL, xesimd::lsc_data_size::default_size,
+                                     xesimd::cache_hint::cached,
+                                     xesimd::cache_hint::cached>(up_weight + k + VL);
+            }
             simd<float, VL> input = block_load<fp16, VL>(x + k);
             gate_accumulator += input * moe_decode_fp8_to_float<VL>(
                 block_load<uint8_t, VL>(gate_weight + k), fp8_mode);
@@ -151,6 +163,11 @@ struct MoeDownDecode {
         const int full_end = (intermediate / VL) * VL;
         simd<float, VL> accumulator = 0.0f;
         for (int k = 0; k < full_end; k += VL) {
+            if (k + VL < full_end) {
+                xesimd::lsc_prefetch<uint8_t, VL, xesimd::lsc_data_size::default_size,
+                                     xesimd::cache_hint::cached,
+                                     xesimd::cache_hint::cached>(weight + k + VL);
+            }
             simd<float, VL> values = block_load<fp16, VL>(input + k);
             accumulator += values * moe_decode_fp8_to_float<VL>(
                 block_load<uint8_t, VL>(weight + k), fp8_mode);

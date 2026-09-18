@@ -10,7 +10,9 @@
 # - This is based on Ubuntu 25.04 desktop version: https://releases.ubuntu.com/25.04/ubuntu-25.04-desktop-amd64.iso
 # - Must run this script as root to ensure consistent environment.
 # - Replace the http_proxy, https_proxy configuration to your own. If your network environment doesn't require proxy, just remove them. 
-# - This script will also disable intel iommu through grub configuration intel_iommu=off for best P2P performance over PCIe.
+# - This script sets intel_iommu=on iommu=pt: passthrough is identity-mapped, so
+#   DMA translation is ~free while isolation stays on. P2P within a PCIe switch
+#   hierarchy is gated by ACS redirect on the downstream ports, not by the IOMMU.
 # - This script covers kernel, GPU firmware, grub configuration and docker libraries, other necessary dirvers/tools/scripts will all be inside vllm/platform evaluation
 #   docker image.
 # - Do reboot to make all changes effect after installation.
@@ -150,11 +152,11 @@ update-initramfs -u
 rm -rf $WORK_DIR
 echo -e "✅ Update GPU firmware successfully"
 
-echo -e "\n[INFO] Disabling intel_iommu..."
+echo -e "\n[INFO] Setting IOMMU to passthrough (intel_iommu=on iommu=pt)..."
 GRUB_FILE="/etc/default/grub"
 if [ -f "$GRUB_FILE" ]; then
   cp "$GRUB_FILE" "${GRUB_FILE}.bak"
-  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=off"/' "$GRUB_FILE"
+  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=on iommu=pt"/' "$GRUB_FILE"
   update-grub
 else
   echo "[ERROR] Could not find $GRUB_FILE"

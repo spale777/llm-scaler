@@ -1,4 +1,5 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
@@ -76,7 +77,19 @@ SYCL_ESIMD_FUNCTION inline simd<fp16, VL> fp8_dequant_fp16(
 inline void select_vl_ks(uint32_t N, uint32_t K, int& vl, int& ks) {
     static const int default_vl = []() {
         const char* value = std::getenv("SGLANG_GEMV_VL_CAP");
-        return value ? std::atoi(value) : 256;
+        if (!value) return 256;
+        // atoi yields 0 for an unparseable string, and 0 reaches the `kpt % vl`
+        // loop below as a divide by zero. Accept only the widths the walk can
+        // terminate on and the ladder has arms for.
+        const int v = std::atoi(value);
+        switch (v) {
+            case 32: case 64: case 128: case 256: case 512:
+                return v;
+            default:
+                TORCH_WARN("SGLANG_GEMV_VL_CAP=", value,
+                           " is not one of {32,64,128,256,512}; using 256");
+                return 256;
+        }
     }();
     static const int ks_mode = []() {
         const char* value = std::getenv("SGLANG_GEMV_KS_MODE");
@@ -1397,8 +1410,10 @@ inline void dpas_v7_auto_dispatch(
     // but K_THREADS=2 better for large N (N>2560) to avoid SLM reduction overhead.
     // K_THREADS=8 tested and was worse (too much SLM reduction cost).
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     #define V7_DISPATCH(KT, MT) dpas_v7_gemm_fp8_pert_host<KT, MT>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q)
     if (k_threads >= 4) {
@@ -1685,8 +1700,10 @@ inline void dpas_v11_auto_dispatch(
     int n_wgs = (n_16 + n_threads - 1) / n_threads;
 
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs * n_threads, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup before the walk, and halve -- same invariant as the V9 site, and it
+    // must also hold across the k_threads*n_threads > 16 loop below.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     // Limit total WG size
     while (k_threads * n_threads > 16) {
@@ -3385,8 +3402,10 @@ inline void dpas_v13_auto_dispatch(
     int m_tiles = ((int)M + 7) / 8;
     int n_wgs = ((int)N + 15) / 16;
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     #define V13_DISPATCH(KT, MT) dpas_v13_gemm_fp8_pert_host<KT, MT>(input, weight, scale_ptr, output, M, N, K, q)
     if (k_threads >= 4) {
@@ -3639,8 +3658,10 @@ inline void dpas_v10_auto_dispatch(
     }
 
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     #define V10_DISPATCH(KT, MT, NT) dpas_v10_gemm_fp8_pert_host<KT, MT, NT>(input, weight, scale_ptr, output, M, N, K, q)
 
@@ -3725,8 +3746,10 @@ inline void dpas_v9_auto_dispatch(
     int m_tiles = ((int)M + 7) / 8;
     int n_wgs = ((int)N + 15) / 16;
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     #define V9_DISPATCH(KT, MT) dpas_v9_gemm_fp8_pert_host<KT, MT>(input, weight, scale_ptr, output, M, N, K, q)
     if (k_threads >= 4) {
@@ -3839,9 +3862,25 @@ inline void batched_gemv_fp8_pert_host(
     else if (vl == 128 && ks == 8) { LAUNCH_BATCHED(128, 8) }
     else if (vl == 64 && ks == 1) { LAUNCH_BATCHED(64, 1) }
     else if (vl == 64 && ks == 2) { LAUNCH_BATCHED(64, 2) }
+    else if (vl == 64 && ks == 4) { LAUNCH_BATCHED(64, 4) }
+    else if (vl == 64 && ks == 8) { LAUNCH_BATCHED(64, 8) }
     else if (vl == 32 && ks == 1) { LAUNCH_BATCHED(32, 1) }
     else if (vl == 32 && ks == 2) { LAUNCH_BATCHED(32, 2) }
-    else                           { LAUNCH_BATCHED(32, 1) }
+    else if (vl == 32 && ks == 4) { LAUNCH_BATCHED(32, 4) }
+    else if (vl == 32 && ks == 8) { LAUNCH_BATCHED(32, 8) }
+    else {
+        // The launched K_SPLIT must equal the template one: the grid is N*ks
+        // with ks lanes per work-group, while the kernel derives kp = K/K_SPLIT
+        // from the template argument. A mismatch makes every lane stride by the
+        // wrong kp, take the K_SPLIT==1 branch (no slm_init, no barrier) and
+        // write the same output element from out-of-range reads. This file's
+        // select_vl_ks floors VL at 32, so its image needs arms down to
+        // (32,4); refuse rather than fall through to a fixed-width arm.
+        TORCH_CHECK(false,
+                    "batched fp8 GEMV: no kernel for vl=", vl, " ks=", ks,
+                    " at N=", N, " K=", K, "; the catch-all would have run "
+                    "VL=32/K_SPLIT=1 against a grid sized for ks lanes");
+    }
 
     #undef LAUNCH_BATCHED
 }
@@ -3860,6 +3899,15 @@ inline void ws_gemm_fp8_pert_host(
     uint32_t M, uint32_t N, uint32_t K,
     int fp8_mode,
     sycl::queue& q) {
+
+    // K >= VL: the kernel's tail block_loads at K - VL, so a smaller K reads
+    // below both buffers. The dispatch keeps this true down to VL=16 by
+    // selecting a narrower arm; the kernel is VL-generic (simd<float,VL>, no
+    // DPAS) and the tail's overlap zeroing is exact at every width. Checked
+    // here rather than at the dispatcher because several arms feed this host.
+    TORCH_CHECK(K >= (uint32_t)VL,
+                "ws_gemm_fp8_pert: K=", K, " is below the vector length ", VL,
+                "; the tail offset K - VL would be negative");
 
     int m_tiles = ((int)M + TILE_M - 1) / TILE_M;
 
@@ -4064,6 +4112,11 @@ inline void GEMM_fp8_pert_dispatch(
             mpar_gemm_fp8_pert_host<128, 4, 16>(
                 input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
         } else {
+            // The mpar kernel walks K in whole VL=128 steps with no tail, so a
+            // K that is not a multiple of 128 reads past the row.
+            TORCH_CHECK(K % 128 == 0,
+                        "esimd_gemm_fp8_pert: K must be a multiple of 128 on "
+                        "the narrow-N path, got K=", K);
             mpar_gemm_fp8_pert_host<128, 1, 16>(
                 input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
         }
@@ -4072,7 +4125,12 @@ inline void GEMM_fp8_pert_dispatch(
         // only compute rows [0..63] and leave rows [64..M-1] uninitialized,
         // which propagates NaN through subsequent layers. Fall back to WS
         // which has a real 2D grid and per-row bounds check.
-        ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        // The kernel's tail computes K - VL, so VL must not exceed K; VL=64
+        // serves any K >= 64 exactly.
+        if      (K % 128 == 0) ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 64)      ws_gemm_fp8_pert_host<64,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 32)      ws_gemm_fp8_pert_host<32,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else                   ws_gemm_fp8_pert_host<16,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else if (K % 64 == 0 && fp8_mode == 0) {
         // V9: Transposed load + fused dequant-VNNI (E4M3 only, best for M>=2)
         dpas_v9_auto_dispatch(input, weight, scale_ptr, output, M, N, K, q);
@@ -4082,8 +4140,14 @@ inline void GEMM_fp8_pert_dispatch(
     } else if (M <= 3) {
         batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else if (M <= 8) {
-        ws_gemm_fp8_pert_host<128, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        if      (K % 128 == 0) ws_gemm_fp8_pert_host<128, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 64)      ws_gemm_fp8_pert_host<64,  8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 32)      ws_gemm_fp8_pert_host<32,  8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else                   ws_gemm_fp8_pert_host<16,  8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else {
-        ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        if      (K % 128 == 0) ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 64)      ws_gemm_fp8_pert_host<64,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 32)      ws_gemm_fp8_pert_host<32,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else                   ws_gemm_fp8_pert_host<16,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     }
 }

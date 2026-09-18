@@ -45,11 +45,16 @@ at::Tensor esimd_sdpa_prefill_dpas(
     const int total_q    = q.size(0);
     const int n_heads    = q.size(1);
     const int hd         = q.size(2);
+    const int num_kv_blocks = key_cache.size(0);
     const int block_size = key_cache.size(1);
     const int n_kv_heads = key_cache.size(2);
     const int batch      = cu_seqlens_q.size(0) - 1;
     const int max_nblks  = block_table.size(1);
 
+    // kv_surf_h is num_kv_blocks * phys_rows_per_block - 1, which underflows to
+    // 0xFFFFFFFF at zero and would disable the hardware bounds clamp.
+    TORCH_CHECK(num_kv_blocks > 0,
+                "prefill_dpas: key_cache has no blocks");
     TORCH_CHECK(hd == 256,
         "esimd_sdpa_prefill_dpas: head_dim must be 256, got ", hd);
     TORCH_CHECK(q.scalar_type() == key_cache.scalar_type());
@@ -86,26 +91,26 @@ at::Tensor esimd_sdpa_prefill_dpas(
                 q_us, kc_us, vc_us, o_us, bt_i, sl_i, qsl_i,
                 n_heads, n_kv_heads, hd, block_size, max_nblks,
                 kv_stride_block, kv_stride_pos, kv_stride_head,
-                sc, total_q, batch, dpcpp_queue);
+                sc, total_q, batch, num_kv_blocks, dpcpp_queue);
         else
             sdp_paged_prefill_dpas_host<true, false>(
                 q_us, kc_us, vc_us, o_us, bt_i, sl_i, qsl_i,
                 n_heads, n_kv_heads, hd, block_size, max_nblks,
                 kv_stride_block, kv_stride_pos, kv_stride_head,
-                sc, total_q, batch, dpcpp_queue);
+                sc, total_q, batch, num_kv_blocks, dpcpp_queue);
     } else if (q.scalar_type() == at::kHalf) {
         if (is_causal)
             sdp_paged_prefill_dpas_host<false, true>(
                 q_us, kc_us, vc_us, o_us, bt_i, sl_i, qsl_i,
                 n_heads, n_kv_heads, hd, block_size, max_nblks,
                 kv_stride_block, kv_stride_pos, kv_stride_head,
-                sc, total_q, batch, dpcpp_queue);
+                sc, total_q, batch, num_kv_blocks, dpcpp_queue);
         else
             sdp_paged_prefill_dpas_host<false, false>(
                 q_us, kc_us, vc_us, o_us, bt_i, sl_i, qsl_i,
                 n_heads, n_kv_heads, hd, block_size, max_nblks,
                 kv_stride_block, kv_stride_pos, kv_stride_head,
-                sc, total_q, batch, dpcpp_queue);
+                sc, total_q, batch, num_kv_blocks, dpcpp_queue);
     } else {
         TORCH_CHECK(false,
             "esimd_sdpa_prefill_dpas: unsupported dtype (expected fp16 or bf16)");

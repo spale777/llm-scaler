@@ -1,5 +1,6 @@
 """Python wrappers for custom ESIMD kernels."""
 import torch
+import torch.compiler
 import torch.nn.functional as F
 
 _ops = torch.ops.custom_esimd_kernels_vllm
@@ -18,6 +19,7 @@ def esimd_gemv_fp8_pern(
     return _ops.esimd_gemv_fp8_pern(input, weight, weight_scale, output, N, K)
 
 
+@torch.compiler.disable
 def esimd_gemv_fp8_pern_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor, N0: int,
@@ -33,6 +35,7 @@ def esimd_gemv_fp8_pern_fused2(
     return _ops.esimd_gemv_fp8_pern_fused2(input, w0, s0, o0, N0, w1, s1, o1, N1, K)
 
 
+@torch.compiler.disable
 def esimd_gemv_fp8_pern_fused3(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor, N0: int,
@@ -209,6 +212,7 @@ def esimd_gemm_int4_pgrp(
 
 # ---- Fused QKV Split + RMSNorm + RoPE ----
 
+@torch.compiler.disable
 def esimd_qkv_split_norm_rope(
     qkv_state: torch.Tensor,
     q_out: torch.Tensor,
@@ -244,6 +248,7 @@ def esimd_qkv_split_norm_rope(
         q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
 
 
+@torch.compiler.disable
 def esimd_qkv_split_norm_rope_v(
     qkv_state: torch.Tensor,
     q_out: torch.Tensor,
@@ -273,6 +278,7 @@ def esimd_qkv_split_norm_rope_v(
         q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
 
 
+@torch.compiler.disable
 def esimd_qkv_split_norm_rope_muse_glimmer(
     qkv_state: torch.Tensor,
     q_out: torch.Tensor,
@@ -302,6 +308,7 @@ def esimd_qkv_split_norm_rope_muse_glimmer(
         q_heads, kv_heads, float(q_scale), cos_sin_cache)
 
 
+@torch.compiler.disable
 def esimd_qkv_split_norm_rope_muse_glimmer_neox(
     qkv_state: torch.Tensor,
     q_out: torch.Tensor,
@@ -1993,3 +2000,27 @@ def esimd_gemv_fp8_pert_bmg(
 ) -> torch.Tensor:
     """BMG-tuned FP8 per-tensor GEMV with K_SPLIT and tail handling."""
     return _ops.esimd_gemv_fp8_pert_bmg(input, weight, weight_scale, output)
+
+@torch.compiler.disable
+def deepseek_v41_fp4_gemm(
+    a: torch.Tensor,
+    b_fp4: torch.Tensor,
+    b_scales: torch.Tensor,
+) -> torch.Tensor:
+    """NOT IMPLEMENTED -- the binding raises.
+
+    Xe2 XMX carries no FP8 or FP4 matrix arithmetic (FP16/BF16/INT8/INT4/INT2
+    only), so any working kernel must dequantize to a supported type before the
+    dpas; fp4_gemm.h is still a skeleton.
+    """
+    return torch.ops.custom_esimd_kernels_vllm.deepseek_v41_fp4_gemm(a, b_fp4, b_scales)
+
+@torch.compiler.disable
+def deepseek_v41_noaux_tc_topk(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Computes Top-K gating using the DeepSeek V4.1 noaux_tc algorithm (sqrtsoftplus).
+    Returns (weights, indices)."""
+    return torch.ops.custom_esimd_kernels_vllm.deepseek_v41_noaux_tc_topk(logits, bias, top_k)

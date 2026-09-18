@@ -7,6 +7,7 @@
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/library.h>
+#include <torch/extension.h>
 #include <Python.h>
 #include <sycl/sycl.hpp>
 
@@ -83,8 +84,8 @@ TORCH_LIBRARY_IMPL(custom_esimd_kernels_vllm, XPU, m) {
     m.impl("q4_0_quantize", &q4_0_quantize);
 }
 
-PyMODINIT_FUNC PyInit_q4_0_quant_ops() {
-    static struct PyModuleDef module = {
-        PyModuleDef_HEAD_INIT, "q4_0_quant_ops", nullptr, 0, nullptr};
-    return PyModule_Create(&module);
-}
+// Ops are registered globally via TORCH_LIBRARY_IMPL; this only supplies the
+// module init symbol CPython requires to import the .so.
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
+
+

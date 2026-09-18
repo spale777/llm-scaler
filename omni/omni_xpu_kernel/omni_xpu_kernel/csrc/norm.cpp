@@ -1323,6 +1323,12 @@ torch::Tensor layer_norm(
 
     int64_t input_size = input.size(0);
     int64_t hidden_size = input.size(1);
+    // The kernels walk hidden_size in whole 64/32-wide blocks with no tail, so a
+    // residue is dropped silently and mean/variance are taken over a short row.
+    // TORCH_CHECK, not assert(): -DNDEBUG is set at every setup.py site.
+    TORCH_CHECK(hidden_size > 0 && hidden_size <= 8192 && hidden_size % 32 == 0,
+                "hidden_size must be nonzero, <=8192 and divisible by 32, got ",
+                hidden_size);
 
     if (weight.has_value()) {
         TORCH_CHECK(weight->numel() == hidden_size, "Weight size must match hidden_size");
@@ -1411,6 +1417,12 @@ void fused_add_rms_norm(
 
     int64_t input_size = input.size(0);
     int64_t hidden_size = input.size(1);
+    // The kernels walk hidden_size in whole 64/32-wide blocks with no tail, so a
+    // residue is dropped silently and mean/variance are taken over a short row.
+    // TORCH_CHECK, not assert(): -DNDEBUG is set at every setup.py site.
+    TORCH_CHECK(hidden_size > 0 && hidden_size <= 8192 && hidden_size % 32 == 0,
+                "hidden_size must be nonzero, <=8192 and divisible by 32, got ",
+                hidden_size);
 
     if (hidden_size % 64 == 0 && hidden_size >= 2048) {
         const int nb = hidden_size / 64;

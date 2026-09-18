@@ -68,6 +68,14 @@ def esimd_gemv_fp8_pert(
     return _ops.esimd_gemv_fp8_pert(input, weight, weight_scale, output)
 
 
+def esimd_gemv_fp8_pert_bmg(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """BMG-tuned FP8 per-tensor GEMV with K_SPLIT and tail handling."""
+    return _ops.esimd_gemv_fp8_pert_bmg(input, weight, weight_scale, output)
+
+
 def esimd_gemv_fp8_pert_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
@@ -214,8 +222,9 @@ def esimd_gemv_q4_k_m(
     dequant cost is independent of M, so it dominates already at M=2).
 
     input [M,K] fp16 (row-major); output [M,N] fp16.
-    N=weight.size(0), K=weight.size(1)*2. K not a multiple of 512 falls back to
-    M separate M=1 GEMVs (still no fp16 dequant round-trip).
+    N=weight.size(0), K=weight.size(1)*2. The gate is K % (Q4_K_VL / 2), so the
+    modulus is 256, not Q4_K_VL=512; below it, K falls back to M separate M=1
+    GEMVs (still no fp16 dequant round-trip).
     """
     return _ops.esimd_gemv_q4_k_m(input, weight, weight_scale, weight_min, output)
 
@@ -467,7 +476,7 @@ def esimd_qkv_split_norm_rope(
     rotary_dim: int = 256,
     cos_sin_cache: torch.Tensor = None,
     normalize_v: bool = False,
-) -> torch.Tensor:
+) -> None:
     """Fused QKV Split + RMSNorm(weight+1.0, eps=1e-6) + RoPE.
 
     qkv_state:     [nTokens, hiddenDim] fp16 — packed QKV projection output
@@ -484,7 +493,9 @@ def esimd_qkv_split_norm_rope(
                    False keeps the Qwen3 plain-copy behaviour.
     headDim=256 only.
     """
-    return _ops.esimd_qkv_split_norm_rope(
+    # Declared `-> ()`: the outputs are the buffers passed in, and returning one
+    # would misdeclare an alias of q_out as fresh storage.
+    _ops.esimd_qkv_split_norm_rope(
         qkv_state, q_out, gate_out, k_out, v_out,
         norm_wq, norm_wk, positions,
         q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache,
@@ -2090,4 +2101,22 @@ def splitk_decode_attention(
         scratch,
         max_seq_len,
         num_splits,
+    )
+
+def esimd_moe_gemm_fp8_blockscale(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    expert_idx: torch.Tensor,
+    output: torch.Tensor,
+    block_n: int = 128,
+    block_k: int = 128
+):
+    """FP8 Blockscale MoE GEMM."""
+    N = weight.size(1)
+    K = weight.size(2)
+    num_experts = weight.size(0)
+    _ops.esimd_moe_gemm_fp8_blockscale(
+        input, weight, weight_scale, output, expert_idx,
+        N, K, num_experts, block_n, block_k
     )

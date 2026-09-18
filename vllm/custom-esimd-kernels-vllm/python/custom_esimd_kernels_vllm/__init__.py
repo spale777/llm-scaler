@@ -101,3 +101,16 @@ from custom_esimd_kernels_vllm.ops import (
     moe_tiny_fp16_shared_up,
     moe_tiny_fp16_shared_finalize,
 )
+try:
+    import custom_esimd_kernels_vllm_ar
+except ImportError:
+    pass
+
+# Optional: setup_sycl.py builds do not produce this module.
+try:
+    from custom_esimd_kernels_vllm import deepseek_v41
+except ImportError:
+    pass
+
+# Deliberately no __all__: it would have to name every op imported above, and a
+# partial one hides the rest from `import *`.

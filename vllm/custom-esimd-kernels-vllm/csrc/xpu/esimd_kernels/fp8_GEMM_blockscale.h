@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* fp8_GEMM_blockscale.h — w8a16 block-scaled FP8 GEMM (DeepSeek-style).
  *
  * Computes  output[M, N] = input[M, K] @ dequant(weight[N, K])^T
@@ -28,6 +29,10 @@
 #include "utils.h"
 #include <cstdint>
 
+// B70 (BMG-G31) has 32 Xe cores x 8 vector engines x 8 hardware threads per
+// engine in small-GRF mode. K-split dispatch aims to fill that.
+static constexpr int BMG_HW_THREADS = 2048;
+
 namespace fp8_blockscale {
 
 // fp8_e4m3 field widths.
@@ -37,6 +42,10 @@ namespace fp8_blockscale {
 // Branchless fp8_e4m3fn -> fp16 conversion used by the oneDNN JIT path.
 // Shifting the encoded byte into the fp16 subnormal range and multiplying by
 // 2^8 maps all finite E4M3 values exactly, including E4M3 subnormals.
+//
+// NaN behaviour: E4M3FN has no infinity, and the two NaN encodings 0x7F / 0xFF
+// decode to +-480.0 rather than propagating NaN. All 254 finite values are
+// exact.
 template <uint32_t N>
 inline simd<fp16, N> fp8e4m3_to_fp16(simd<uint8_t, N> x) {
   simd<uint16_t, N> u16 = convert<uint16_t>(x);
@@ -59,9 +68,10 @@ inline simd<fp16, N> fp8e4m3_to_fp16(simd<uint8_t, N> x) {
 // through SLM. This mirrors the near-peak-bandwidth per-tensor decode kernel.
 //   VL       K elements loaded per iteration (multiple of BK=128)
 //   K_SPLIT  threads per work-group (K reduction fan-in)
-//   BK       weight scale K-block (128)
+//   BK       weight scale K-block
+//   BN       weight scale N-block
 //   MAX_M    compile-time upper bound on rows handled per launch
-template <int VL, int K_SPLIT, int BK, int MAX_M>
+template <int VL, int K_SPLIT, int BK, int BN, int MAX_M>
 struct gemv_block_bmg_kernel {
   const fp16* input;      // [M, K]
   const uint8_t* weight;  // [N, K] fp8_e4m3 bits
@@ -80,7 +90,7 @@ struct gemv_block_bmg_kernel {
     const int kp = K / K_SPLIT;   // per-thread K span (multiple of VL)
     const int ks = lid * kp;
     const uint8_t* w_row = weight + (size_t)n * K;
-    const float* s_row = wscale + (size_t)(n / 128) * Kb;
+    const float* s_row = wscale + (size_t)(n / BN) * Kb;
 
     simd<float, MAX_M> acc = 0.0f;
 
@@ -136,13 +146,13 @@ struct gemv_block_bmg_kernel {
   }
 };
 
-template <int VL, int K_SPLIT, int MAX_M>
+template <int VL, int K_SPLIT, int BN, int MAX_M>
 inline void launch_gemv_block_bmg(const fp16* input, const uint8_t* weight,
                                   const float* wscale, fp16* output, int M, int N,
                                   int K, sycl::queue& q) {
   constexpr int BK = 128;
   const int Kb = K / BK;
-  gemv_block_bmg_kernel<VL, K_SPLIT, BK, MAX_M> kern{
+  gemv_block_bmg_kernel<VL, K_SPLIT, BK, BN, MAX_M> kern{
       input, weight, wscale, output, M, N, K, Kb};
   sycl::range<1> global(static_cast<size_t>(N) * K_SPLIT);
   sycl::range<1> local(K_SPLIT);
@@ -152,27 +162,27 @@ inline void launch_gemv_block_bmg(const fp16* input, const uint8_t* weight,
 }
 
 // Dispatch (VL, K_SPLIT) for one M-tile. VL prefers 256; K_SPLIT is raised to
-// keep ~640 HW threads busy for small N, subject to K/K_SPLIT staying a multiple
+// keep BMG_HW_THREADS busy for small N, subject to K/K_SPLIT staying a multiple
 // of VL.
-template <int MAX_M>
+template <int BN, int MAX_M>
 inline void dispatch_gemv_block_bmg(const fp16* input, const uint8_t* weight,
                                     const float* wscale, fp16* output, int M,
                                     int N, int K, sycl::queue& q) {
   const int VL = (K % 256 == 0) ? 256 : 128;
 
-  // Target K_SPLIT so that N*K_SPLIT >= 640 (BMG occupancy), K%ks==0 and
+  // Target K_SPLIT so that N*K_SPLIT >= BMG_HW_THREADS (BMG occupancy), K%ks==0 and
   // (K/ks)%VL==0.
   int target = 1;
-  if (N * 8 <= 640) target = 8;
-  else if (N * 4 <= 640) target = 4;
-  else if (N * 2 <= 640) target = 2;
+  if (N * 8 <= BMG_HW_THREADS) target = 8;
+  else if (N * 4 <= BMG_HW_THREADS) target = 4;
+  else if (N * 2 <= BMG_HW_THREADS) target = 2;
   int ks = 1;
   for (int s = target; s >= 1; s >>= 1) {
     if (K % s == 0 && (K / s) % VL == 0) { ks = s; break; }
   }
 
 #define BS_DISPATCH(V, S)                                                      \
-  launch_gemv_block_bmg<V, S, MAX_M>(input, weight, wscale, output, M, N, K, q)
+  launch_gemv_block_bmg<V, S, BN, MAX_M>(input, weight, wscale, output, M, N, K, q)
   if (VL == 256) {
     switch (ks) {
       case 8: BS_DISPATCH(256, 8); break;
@@ -199,33 +209,44 @@ inline void gemm_fp8_blockscale_host(const fp16* input, const uint8_t* weight,
                                      uint32_t M, uint32_t N, uint32_t K,
                                      uint32_t block_n, uint32_t block_k,
                                      sycl::queue& q) {
+  // The kernels hardcode a 128-element N-block and take BK as a template
+  // constant; these parameters are signature compatibility only.
+  TORCH_CHECK(block_k == 128,
+              "gemm_fp8_blockscale_host: block_k must be 128, got ", block_k);
+  TORCH_CHECK(block_n == 128 || block_n == 32,
+              "gemm_fp8_blockscale_host: block_n must be 128 or 32, got ",
+              block_n);
+
+#define BS_BY_BN(MM, ...)                                                      \
+  do {                                                                         \
+    if (block_n == 32) dispatch_gemv_block_bmg<32, MM>(__VA_ARGS__);            \
+    else               dispatch_gemv_block_bmg<128, MM>(__VA_ARGS__);           \
+  } while (0)
   if (M == 1) {
-    dispatch_gemv_block_bmg<1>(input, weight, weight_scale, output, 1, (int)N,
-                               (int)K, q);
+    BS_BY_BN(1, input, weight, weight_scale, output, 1, (int)N, (int)K, q);
     return;
   }
   if (M <= 8) {
-    dispatch_gemv_block_bmg<8>(input, weight, weight_scale, output, (int)M,
-                               (int)N, (int)K, q);
+    BS_BY_BN(8, input, weight, weight_scale, output, (int)M, (int)N, (int)K, q);
     return;
   }
   if (M <= 12) {
-    dispatch_gemv_block_bmg<12>(input, weight, weight_scale, output, (int)M,
-                                (int)N, (int)K, q);
+    BS_BY_BN(12, input, weight, weight_scale, output, (int)M, (int)N, (int)K, q);
     return;
   }
   constexpr uint32_t TILE = 8;
   for (uint32_t m0 = 0; m0 < M; m0 += TILE) {
     const int mt = (M - m0 < TILE) ? (int)(M - m0) : (int)TILE;
-    dispatch_gemv_block_bmg<TILE>(input + (size_t)m0 * K, weight, weight_scale,
-                                  output + (size_t)m0 * N, mt, (int)N, (int)K, q);
+    BS_BY_BN(TILE, input + (size_t)m0 * K, weight, weight_scale,
+             output + (size_t)m0 * N, mt, (int)N, (int)K, q);
   }
+#undef BS_BY_BN
 }
 
 // Decode-only dual GEMV for two block-scaled weights sharing the same input.
 // A single grid spans both output-channel ranges, eliminating the second host
 // submission while preserving each matrix's independent [Nb, Kb] scale table.
-template <int VL, int K_SPLIT, int BK>
+template <int VL, int K_SPLIT, int BK, int BN>
 struct gemv_block_fused2_bmg_kernel {
   const fp16* input;
   const uint8_t* weight0;
@@ -248,7 +269,7 @@ struct gemv_block_fused2_bmg_kernel {
     const float* scale = second ? scale1 : scale0;
     fp16* output = second ? output1 : output0;
     const uint8_t* w_row = weight + (size_t)n * K;
-    const float* s_row = scale + (size_t)(n / 128) * Kb;
+    const float* s_row = scale + (size_t)(n / BN) * Kb;
     const int kp = K / K_SPLIT;
     const int ks = lid * kp;
     float acc = 0.0f;
@@ -289,7 +310,7 @@ inline void launch_gemv_block_fused2(
     fp16* output0, int N0, const uint8_t* weight1, const float* scale1,
     fp16* output1, int N1, int K, sycl::queue& q) {
   constexpr int BK = 128;
-  gemv_block_fused2_bmg_kernel<VL, K_SPLIT, BK> kern{
+  gemv_block_fused2_bmg_kernel<VL, K_SPLIT, BK, 128> kern{
       input, weight0, scale0, output0, weight1, scale1, output1,
       N0, N1, K, K / BK};
   const int groups = N0 + N1;
@@ -306,9 +327,9 @@ inline void gemv_fp8_blockscale_fused2_host(
   const int VL = (K % 256 == 0) ? 256 : 128;
   const int total_n = (int)(N0 + N1);
   int target = 1;
-  if (total_n * 8 <= 640) target = 8;
-  else if (total_n * 4 <= 640) target = 4;
-  else if (total_n * 2 <= 640) target = 2;
+  if (total_n * 8 <= BMG_HW_THREADS) target = 8;
+  else if (total_n * 4 <= BMG_HW_THREADS) target = 4;
+  else if (total_n * 2 <= BMG_HW_THREADS) target = 2;
   int ks = 1;
   for (int s = target; s >= 1; s >>= 1) {
     if (K % s == 0 && (K / s) % VL == 0) { ks = s; break; }
@@ -336,6 +357,10 @@ inline void gemv_fp8_blockscale_fused2_host(
 
 // Qwen GDN input projection: block-scaled qkvz plus the intentionally-FP16 ba
 // projection share one input and one launch.
+// These fused decode paths are 128-block only; DeepSeek's 32-block shapes
+// route through the main kernel.
+static constexpr int BN_FP16_FUSED2 = 128;
+
 template <int VL, int K_SPLIT>
 struct gemv_block_fp16_fused2_bmg_kernel {
   const fp16* input;
@@ -370,7 +395,7 @@ struct gemv_block_fp16_fused2_bmg_kernel {
       if (fp16_matrix) {
         acc += reduce<float>(iv * wf, std::plus<>());
       } else {
-        const float* s_row = scale0 + (size_t)(n / 128) * Kb;
+        const float* s_row = scale0 + (size_t)(n / BN_FP16_FUSED2) * Kb;
 #pragma unroll
         for (int sb = 0; sb < VL / 128; sb++) {
           acc +=
@@ -417,8 +442,8 @@ inline void gemv_fp8_blockscale_fp16_fused2_host(
     uint32_t N1, uint32_t K, sycl::queue& q) {
   const int VL = (K % 256 == 0) ? 256 : 128;
   const int total_n = (int)(N0 + N1);
-  int target = total_n * 8 <= 640 ? 8 : total_n * 4 <= 640 ? 4
-                                  : total_n * 2 <= 640 ? 2 : 1;
+  int target = total_n * 8 <= BMG_HW_THREADS ? 8 : total_n * 4 <= BMG_HW_THREADS ? 4
+                                  : total_n * 2 <= BMG_HW_THREADS ? 2 : 1;
   int ks = 1;
   for (int s = target; s >= 1; s >>= 1) {
     if (K % s == 0 && (K / s) % VL == 0) { ks = s; break; }

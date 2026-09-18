@@ -61,6 +61,27 @@ SYCL_ESIMD_FUNCTION inline simd<float, VL> fp8_dequant_rng(
  *   Reduce sum_sq → inv_rms
  *   Loop 2 (K/VL iters): normalize stored residual, load weight, FMA
  * ================================================================ */
+/* Residual-only pre-pass: settles residual_ptr before the N-work-group grid
+ * reads it. */
+struct ResAddResidualOnly_kernel {
+    const fp16* hidden_ptr;
+    fp16*       residual_ptr;
+    int K;
+
+    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
+        constexpr int VL = 512;
+        int k = 0;
+        for (; k + VL <= K; k += VL) {
+            simd<fp16, VL> h = block_load<fp16, VL>(hidden_ptr + k);
+            simd<fp16, VL> r = block_load<fp16, VL>(residual_ptr + k);
+            block_store<fp16, VL>(residual_ptr + k, h + r);
+        }
+        for (; k < K; ++k) {
+            residual_ptr[k] = (fp16)(hidden_ptr[k] + residual_ptr[k]);
+        }
+    }
+};
+
 struct ResAddNormGEMV_fp8_pert_kernel {
     fp16*          hidden_ptr;   // [1, K] — input (read-only for this kernel)
     fp16*          residual_ptr; // [1, K] — updated in-place
@@ -76,23 +97,17 @@ struct ResAddNormGEMV_fp8_pert_kernel {
     template<int MAX_CHUNKS>
     void run_impl(int n) const SYCL_ESIMD_FUNCTION {
         constexpr int VL = 512;
-        simd<float, VL> res_chunks[MAX_CHUNKS];
+        // No register cache: a simd<float,VL>[MAX_CHUNKS] array is VL*4*MC
+        // bytes of GRF against a ~8 KB per-thread budget, and exhausting it
+        // exhausts Level Zero resources. Pass 2 re-loads residual from L3,
+        // settled by the residual-only pre-pass.
         int n_chunks = K / VL;
 
         float sum_sq = 0.0f;
 
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + offset);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
-
-            simd<float, VL> added = h + r;
-            res_chunks[c] = added;
-
-            if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
-            }
-
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + offset);
             simd<float, VL> sq = added * added;
             sq.select<256,1>(0) += sq.select<256,1>(256);
             sq.select<128,1>(0) += sq.select<128,1>(128);
@@ -114,7 +129,8 @@ struct ResAddNormGEMV_fp8_pert_kernel {
             int offset = c * VL;
 
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + offset);
-            simd<float, VL> normed = res_chunks[c] * inv_rms * nw;
+            simd<float, VL> res = block_load<fp16, VL>(residual_ptr + offset);
+            simd<float, VL> normed = res * inv_rms * nw;
 
             if (n == 0) {
                 block_store<fp16, VL>(normed_out + offset, simd<fp16, VL>(normed));
@@ -164,6 +180,12 @@ inline void resadd_norm_gemv_fp8_pert_host(
     int fp8_mode,
     sycl::queue& q)
 {
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(1, 1),
+            ResAddResidualOnly_kernel{hidden_ptr, residual_ptr, K});
+    });
+
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(N, 1),

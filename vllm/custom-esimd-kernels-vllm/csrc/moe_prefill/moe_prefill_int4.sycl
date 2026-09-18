@@ -88,6 +88,9 @@ sycl::event moe_prefill_gather_forward_kernel(
                 expert_offsets[i] = slm_offsets[i];
                 rows_for_experts[i] = slm_counters[i];
             }
+            // Every lane must finish copying before Phase 4 advances the cursor;
+            // lanes with lid >= num_experts do no Phase 3 work at all.
+            item.barrier(sycl::access::fence_space::local_space);
 
             // Phase 4: Scatter expert_tokens (store pair_idx, not token_idx)
             //          and simultaneously record the inverse permutation.
@@ -125,6 +128,18 @@ sycl::event moe_prefill_up_forward_kernel(
     IT* intermediate, const int* expert_offsets, const int* expert_tokens,
     int num_experts, int total_seqlen, int hidden_size, int intermediate_size, int top_k)
 {
+    // gather() takes uint32 byte offsets. Offsets stride by hidden_size on the
+    // input side and by intermediate_size on the output and down-projection
+    // sides, and the inner gathers add one more row on top of the base.
+    {
+        const int64_t stride = hidden_size > intermediate_size
+                                   ? hidden_size : intermediate_size;
+        TORCH_CHECK(((int64_t)total_seqlen + 1) * stride * 2 <= 0xFFFFFFFFLL,
+                    "moe prefill: total_seqlen=", total_seqlen,
+                    " x max(hidden_size=", hidden_size,
+                    ", intermediate_size=", intermediate_size,
+                    ") exceeds the 4 GiB gather offset range");
+    }
     static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
     static_assert(N == 16,          "up kernel currently assumes N=16 to fit the GRF budget");
     static_assert(BS % 16 == 0,     "BS must be multiple of 16 (= 16 kp per group)");
@@ -517,6 +532,10 @@ torch::Tensor moe_prefill_up_forward_v2(
                 "gate_up_qweight K dim must equal hidden_size/8");
     TORCH_CHECK(intermediate_size % 16 == 0,
                 "intermediate_size must be multiple of 16 (N-tile)");
+    // The up GEMM walks K in whole BS=128 groups with no tail arm.
+    TORCH_CHECK(hidden_size % 128 == 0,
+                "hidden_size must be a multiple of 128 (K group), got ",
+                hidden_size);
     TORCH_CHECK(gate_up_scale.size(2) == two_inter,
                 "gate_up_scale last dim must equal 2*intermediate_size");
 
@@ -583,6 +602,10 @@ torch::Tensor moe_prefill_down_forward_v2(
     TORCH_CHECK(intermediate_size == K_packed * 8,
                 "down_qweight K dim must equal intermediate_size/8");
     TORCH_CHECK(hidden_size % 32 == 0, "hidden_size must be multiple of 32 (N-tile)");
+    // The down GEMM walks K in whole BS=128 groups with no tail arm.
+    TORCH_CHECK(intermediate_size % 128 == 0,
+                "intermediate_size must be a multiple of 128 (K group), got ",
+                intermediate_size);
 
     torch::Tensor expert_output = torch::empty(
         {total_seqlen, hidden_size},

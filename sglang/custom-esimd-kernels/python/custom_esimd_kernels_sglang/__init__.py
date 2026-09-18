@@ -73,6 +73,7 @@ _EXPORTS = [
     "esimd_gemv_fp8_pern_fused2",
     "esimd_gemv_fp8_pern_fused3",
     "esimd_gemv_fp8_pert",
+    "esimd_gemv_fp8_pert_bmg",
     "esimd_gemv_fp8_pert_fused2",
     "esimd_gemv_fp8_pert_fused3",
     # INT4 GEMV ops
@@ -115,6 +116,7 @@ _EXPORTS = [
     "esimd_moe_gather",
     "esimd_moe_gemm_fp8",
     "esimd_moe_gemm_fp8_pert",
+    "esimd_moe_gemm_fp8_blockscale",
     "esimd_gemm_fp8_pert",
     "esimd_gemm_int4_pgrp",
     "esimd_gemv_fp16",

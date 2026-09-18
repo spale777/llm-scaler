@@ -12,6 +12,7 @@
  * weight[k] = sign[k] * scale[k/32] * grid[index[k/4]][k%4].
  */
 #pragma once
+#include "utils.h"
 
 namespace iq3s_esimd_detail = sycl::ext::intel::esimd::detail;
 

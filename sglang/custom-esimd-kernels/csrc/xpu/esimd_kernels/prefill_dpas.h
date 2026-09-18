@@ -57,6 +57,10 @@ static constexpr uint32_t PF_S_SLM_BASE   = 0x10000;  // 32 KB
 static constexpr uint32_t PF_MAX_SLM_BASE = 0x18000;  // 4 KB
 static constexpr uint32_t PF_SUM_SLM_BASE = 0x19000;  // 4 KB
 static constexpr uint32_t PF_TOTAL_SLM    = 0x1A000;  // 104 KB total
+// Xe2-HPG provides 128 KB of SLM per Xe core, so this fits with 24 KB spare.
+// Exceeding it makes the kernel fail to launch rather than run slowly.
+static_assert(PF_TOTAL_SLM <= 128u * 1024u,
+              "prefill_dpas SLM request exceeds the 128 KB Xe2 per-core budget");
 
 // Cross-subgroup exchange of the running max / partial sums / S tiles goes
 // through SLM. A named barrier only orders execution, it does not make the
@@ -90,6 +94,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
     int num_tokens,
     int max_q_tiles_per_req,
     int batch,
+    int num_kv_blocks,
     sycl::nd_item<1>& ndi)
 {
     constexpr float LOG2E = sycl::ext::intel::esimd::detail::log2e;
@@ -186,8 +191,13 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
 
     // 2D surface parameters — FIXED BASE for entire KV cache
     uint32_t kv_surf_w = kv_row_bytes - 1;
-    // Safe upper bound for surface height — covers any practical allocation
-    uint32_t kv_surf_h = 0x3FFFFFU;
+    // Surface height is the largest Y that KV_PHYS_Y can emit. Y is
+    // (phys_block << phys_block_shift) + pos, so it peaks at
+    // (num_kv_blocks - 1) * phys_rows_per_block + block_size - 1.
+    // phys_rows_per_block is 2*block_size when K and V interleave; going a full
+    // stride further would let the interleaved V base read past the tensor.
+    uint32_t kv_surf_h = (uint32_t)(
+        (int64_t)(num_kv_blocks - 1) * phys_rows_per_block + block_size - 1);
     uint32_t kv_x_k = kv_head_off_u32;
 
     // ============================================================
@@ -879,7 +889,7 @@ inline void sdp_paged_prefill_dpas_host(
     int block_size, int max_blocks_per_seq,
     int64_t kv_stride_block, int64_t kv_stride_pos, int64_t kv_stride_head,
     float attn_scale,
-    int num_tokens, int batch,
+    int num_tokens, int batch, int num_kv_blocks,
     sycl::queue& dpcpp_queue)
 {
     // Each WG handles up to PF_WG_Q_ROWS query rows.
@@ -904,6 +914,7 @@ inline void sdp_paged_prefill_dpas_host(
                 num_tokens,
                 max_q_tiles_per_req,
                 batch,
+                num_kv_blocks,
                 ndi);
         });
     });

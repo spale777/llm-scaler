@@ -17,7 +17,11 @@ ENV http_proxy=${http_proxy} https_proxy=${https_proxy} no_proxy=${no_proxy}
 ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
 ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
 ENV UV_BREAK_SYSTEM_PACKAGES=1
-ENV MAX_JOBS=1
+# Build parallelism. SYCL AOT compilation peaks at 2-4 GB per translation unit,
+# so this is bounded by builder RAM rather than core count: budget ~4 GB per job.
+# Override with --build-arg MAX_JOBS=<n>.
+ARG MAX_JOBS=4
+ENV MAX_JOBS=${MAX_JOBS}
 
 # Pinned to upstream (sgl-project) releases/commits instead of the
 # analytics-zoo dev-bmg forks. All BMG-specific changes are carried as

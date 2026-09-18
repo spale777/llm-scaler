@@ -806,6 +806,10 @@ struct matmul_primitive_cache_t {
 
   // this won't be needed if primitive_cache have good default constructor
   static inline primitive_cache& get_cache(const int device_id) {
+    // mappings is a fixed 16-element array and device_id arrives from
+    // mat1.device().index() unvalidated, so a 17th device would index past a
+    // thread_local object and corrupt TLS rather than fault.
+    c10::xpu::check_device_index(device_id);
     auto& mapping = mappings[device_id];
     if (mapping.max_size() == 0) {
       mapping.resize(max_cache_capacity);

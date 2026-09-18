@@ -1,4 +1,5 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 #include <cstdlib>
 #include <string>
 #include "utils.h"
@@ -109,6 +110,9 @@ inline void select_vl_ks(uint32_t N, uint32_t K, int& vl, int& ks) {
 
     int kpt = K / ks;
     while (vl > kpt || kpt % vl != 0) {
+        // Floor 32: every ladder below instantiates the full
+        // {512,256,128,64,32} x {1,2,4,8} grid, so any split the walk settles
+        // on has an arm.
         if (vl > 32) {
             vl /= 2;
         } else if (ks > 1) {
@@ -118,6 +122,14 @@ inline void select_vl_ks(uint32_t N, uint32_t K, int& vl, int& ks) {
             break;
         }
     }
+    // kpt = K / ks truncates, so unless ks divides K the threads cover only
+    // ks*kpt elements; the kpt % vl check below sees the truncated value.
+    TORCH_CHECK(K % (uint32_t)ks == 0,
+                "fp8 GEMV: K=", K, " is not divisible by the K-split ", ks,
+                "; the tail would be dropped silently");
+    TORCH_CHECK(kpt % vl == 0,
+                "fp8 GEMV: K=", K, " has no supported (vl, ks) split; the "
+                "kernel loop has no tail path");
 }
 
 inline void GEMV_fp8_pern_host(
@@ -149,14 +161,29 @@ inline void GEMV_fp8_pern_host(
 
     if (vl == 512 && ks == 1) { LAUNCH(512, 1) }
     else if (vl == 512 && ks == 2) { LAUNCH(512, 2) }
+    else if (vl == 512 && ks == 4) { LAUNCH(512, 4) }
+    else if (vl == 512 && ks == 8) { LAUNCH(512, 8) }
     else if (vl == 256 && ks == 1) { LAUNCH(256, 1) }
     else if (vl == 256 && ks == 2) { LAUNCH(256, 2) }
     else if (vl == 256 && ks == 4) { LAUNCH(256, 4) }
+    else if (vl == 256 && ks == 8) { LAUNCH(256, 8) }
     else if (vl == 128 && ks == 1) { LAUNCH(128, 1) }
     else if (vl == 128 && ks == 2) { LAUNCH(128, 2) }
     else if (vl == 128 && ks == 4) { LAUNCH(128, 4) }
     else if (vl == 128 && ks == 8) { LAUNCH(128, 8) }
-    else { LAUNCH(128, 1) }
+    else if (vl ==  64 && ks == 1) { LAUNCH(64, 1) }
+    else if (vl ==  64 && ks == 2) { LAUNCH(64, 2) }
+    else if (vl ==  64 && ks == 4) { LAUNCH(64, 4) }
+    else if (vl ==  64 && ks == 8) { LAUNCH(64, 8) }
+    else if (vl ==  32 && ks == 1) { LAUNCH(32, 1) }
+    else if (vl ==  32 && ks == 2) { LAUNCH(32, 2) }
+    else if (vl ==  32 && ks == 4) { LAUNCH(32, 4) }
+    else if (vl ==  32 && ks == 8) { LAUNCH(32, 8) }
+    else {
+        TORCH_CHECK(false,
+                    "fp8 GEMV: no kernel for vl=", vl, " ks=", ks,
+                    " at K=", K, "; select_vl_ks emitted a split with no arm");
+    }
 
     #undef LAUNCH
 }
@@ -272,14 +299,29 @@ inline void GEMV_fp8_pern_fused_host(
 
     if (vl == 512 && ks == 1) { LAUNCH_FUSED(512, 1) }
     else if (vl == 512 && ks == 2) { LAUNCH_FUSED(512, 2) }
+    else if (vl == 512 && ks == 4) { LAUNCH_FUSED(512, 4) }
+    else if (vl == 512 && ks == 8) { LAUNCH_FUSED(512, 8) }
     else if (vl == 256 && ks == 1) { LAUNCH_FUSED(256, 1) }
     else if (vl == 256 && ks == 2) { LAUNCH_FUSED(256, 2) }
     else if (vl == 256 && ks == 4) { LAUNCH_FUSED(256, 4) }
+    else if (vl == 256 && ks == 8) { LAUNCH_FUSED(256, 8) }
     else if (vl == 128 && ks == 1) { LAUNCH_FUSED(128, 1) }
     else if (vl == 128 && ks == 2) { LAUNCH_FUSED(128, 2) }
     else if (vl == 128 && ks == 4) { LAUNCH_FUSED(128, 4) }
     else if (vl == 128 && ks == 8) { LAUNCH_FUSED(128, 8) }
-    else { LAUNCH_FUSED(128, 1) }
+    else if (vl ==  64 && ks == 1) { LAUNCH_FUSED(64, 1) }
+    else if (vl ==  64 && ks == 2) { LAUNCH_FUSED(64, 2) }
+    else if (vl ==  64 && ks == 4) { LAUNCH_FUSED(64, 4) }
+    else if (vl ==  64 && ks == 8) { LAUNCH_FUSED(64, 8) }
+    else if (vl ==  32 && ks == 1) { LAUNCH_FUSED(32, 1) }
+    else if (vl ==  32 && ks == 2) { LAUNCH_FUSED(32, 2) }
+    else if (vl ==  32 && ks == 4) { LAUNCH_FUSED(32, 4) }
+    else if (vl ==  32 && ks == 8) { LAUNCH_FUSED(32, 8) }
+    else {
+        TORCH_CHECK(false,
+                    "fp8 GEMV: no kernel for vl=", vl, " ks=", ks,
+                    " at K=", K, "; select_vl_ks emitted a split with no arm");
+    }
 
     #undef LAUNCH_FUSED
 }
@@ -364,12 +406,16 @@ inline void GEMV_fp8_pert_host(
     // bmg kernel matches or trails, so we keep v2 as the default.
     static const bool _disable_bmg = std::getenv("DISABLE_BMG_GEMV") &&
                                      std::string(std::getenv("DISABLE_BMG_GEMV")) == "1";
+    // Unconditional, and not under DISABLE_BMG_GEMV: for a K the ladder cannot
+    // split, every arm leaves kpt % vl != 0, so this is the only correct path.
+    // The flag is a performance selector and governs the clause below only.
+    if (K % 128 != 0 || (K < 512 && K % 256 != 0)) {
+        GEMV_fp8_pert_bmg_host(p_in, p_w, p_sc, p_out, N, K, fp8_mode, q);
+        return;
+    }
     if (!_disable_bmg) {
-        if (K % 64 != 0 || (K < 512 && K % 256 != 0)) {
-            GEMV_fp8_pert_bmg_host(p_in, p_w, p_sc, p_out, N, K, fp8_mode, q);
-            return;
-        }
-        // K in {1024, 1056, 1152, ...} — bmg is faster when vl=32 fallback
+        // A performance guess, not a correctness requirement: whether bmg's
+        // masked tail beats the wide arm these K select is unmeasured.
         if (K >= 1024 && K < 2048 && (K % 256 != 0)) {
             GEMV_fp8_pert_bmg_host(p_in, p_w, p_sc, p_out, N, K, fp8_mode, q);
             return;
@@ -388,16 +434,33 @@ inline void GEMV_fp8_pert_host(
                 GEMV_fp8_pert_kernel<V, S>{p_in, p_w, p_sc, p_out, (int)N, (int)K, fp8_mode}); \
         });
 
+    // The selector emits the full {512,256,128,64,32} x {1,2,4,8} grid -- 20
+    // reachable pairs -- and every one needs an arm here.
     if (vl == 512 && ks == 1) { LAUNCH_PERT(512, 1) }
     else if (vl == 512 && ks == 2) { LAUNCH_PERT(512, 2) }
+    else if (vl == 512 && ks == 4) { LAUNCH_PERT(512, 4) }
+    else if (vl == 512 && ks == 8) { LAUNCH_PERT(512, 8) }
     else if (vl == 256 && ks == 1) { LAUNCH_PERT(256, 1) }
     else if (vl == 256 && ks == 2) { LAUNCH_PERT(256, 2) }
     else if (vl == 256 && ks == 4) { LAUNCH_PERT(256, 4) }
+    else if (vl == 256 && ks == 8) { LAUNCH_PERT(256, 8) }
     else if (vl == 128 && ks == 1) { LAUNCH_PERT(128, 1) }
     else if (vl == 128 && ks == 2) { LAUNCH_PERT(128, 2) }
     else if (vl == 128 && ks == 4) { LAUNCH_PERT(128, 4) }
     else if (vl == 128 && ks == 8) { LAUNCH_PERT(128, 8) }
-    else if (vl == 64 && ks == 1) { LAUNCH_PERT(64, 1) }    else if (vl == 64 && ks == 2) { LAUNCH_PERT(64, 2) }    else if (vl == 64 && ks == 4) { LAUNCH_PERT(64, 4) }    else if (vl == 32 && ks == 1) { LAUNCH_PERT(32, 1) }    else if (vl == 32 && ks == 2) { LAUNCH_PERT(32, 2) }    else { LAUNCH_PERT(32, 1) }
+    else if (vl ==  64 && ks == 1) { LAUNCH_PERT(64, 1) }
+    else if (vl ==  64 && ks == 2) { LAUNCH_PERT(64, 2) }
+    else if (vl ==  64 && ks == 4) { LAUNCH_PERT(64, 4) }
+    else if (vl ==  64 && ks == 8) { LAUNCH_PERT(64, 8) }
+    else if (vl ==  32 && ks == 1) { LAUNCH_PERT(32, 1) }
+    else if (vl ==  32 && ks == 2) { LAUNCH_PERT(32, 2) }
+    else if (vl ==  32 && ks == 4) { LAUNCH_PERT(32, 4) }
+    else if (vl ==  32 && ks == 8) { LAUNCH_PERT(32, 8) }
+    else {
+        TORCH_CHECK(false,
+                    "fp8 GEMV: no kernel for vl=", vl, " ks=", ks,
+                    " at K=", K, "; select_vl_ks emitted a split with no arm");
+    }
 
     #undef LAUNCH_PERT
 }
@@ -513,14 +576,29 @@ inline void GEMV_fp8_pert_fused_host(
 
     if (vl == 512 && ks == 1) { LAUNCH_PERT_FUSED(512, 1) }
     else if (vl == 512 && ks == 2) { LAUNCH_PERT_FUSED(512, 2) }
+    else if (vl == 512 && ks == 4) { LAUNCH_PERT_FUSED(512, 4) }
+    else if (vl == 512 && ks == 8) { LAUNCH_PERT_FUSED(512, 8) }
     else if (vl == 256 && ks == 1) { LAUNCH_PERT_FUSED(256, 1) }
     else if (vl == 256 && ks == 2) { LAUNCH_PERT_FUSED(256, 2) }
     else if (vl == 256 && ks == 4) { LAUNCH_PERT_FUSED(256, 4) }
+    else if (vl == 256 && ks == 8) { LAUNCH_PERT_FUSED(256, 8) }
     else if (vl == 128 && ks == 1) { LAUNCH_PERT_FUSED(128, 1) }
     else if (vl == 128 && ks == 2) { LAUNCH_PERT_FUSED(128, 2) }
     else if (vl == 128 && ks == 4) { LAUNCH_PERT_FUSED(128, 4) }
     else if (vl == 128 && ks == 8) { LAUNCH_PERT_FUSED(128, 8) }
-    else { LAUNCH_PERT_FUSED(128, 1) }
+    else if (vl ==  64 && ks == 1) { LAUNCH_PERT_FUSED(64, 1) }
+    else if (vl ==  64 && ks == 2) { LAUNCH_PERT_FUSED(64, 2) }
+    else if (vl ==  64 && ks == 4) { LAUNCH_PERT_FUSED(64, 4) }
+    else if (vl ==  64 && ks == 8) { LAUNCH_PERT_FUSED(64, 8) }
+    else if (vl ==  32 && ks == 1) { LAUNCH_PERT_FUSED(32, 1) }
+    else if (vl ==  32 && ks == 2) { LAUNCH_PERT_FUSED(32, 2) }
+    else if (vl ==  32 && ks == 4) { LAUNCH_PERT_FUSED(32, 4) }
+    else if (vl ==  32 && ks == 8) { LAUNCH_PERT_FUSED(32, 8) }
+    else {
+        TORCH_CHECK(false,
+                    "fp8 GEMV: no kernel for vl=", vl, " ks=", ks,
+                    " at K=", K, "; select_vl_ks emitted a split with no arm");
+    }
 
     #undef LAUNCH_PERT_FUSED
 }

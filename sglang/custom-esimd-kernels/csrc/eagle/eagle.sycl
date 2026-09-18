@@ -351,11 +351,25 @@ torch::Tensor gdn_eagle(
 ) {
     TORCH_CHECK(ssm_state_idx.dim() == 2);
     TORCH_CHECK(qkvz.scalar_type() == torch::kBFloat16 || qkvz.scalar_type() == torch::kHalf);
+    // These tensors are reinterpret-cast to uint32_t* and the kernel's only
+    // guard is `acceptedId < 1`, which on uint32 rejects 0 alone: the -1 skip
+    // sentinel would become 0xFFFFFFFF and pass. Checking values needs a device
+    // sync; checking the dtype does not, so refuse the unsigned shape.
+    TORCH_CHECK(ssm_state_idx.scalar_type() == torch::kInt32
+                    && accepted_tokens.scalar_type() == torch::kInt32,
+                "gdn_eagle: ssm_state_idx and accepted_tokens must be int32; "
+                "they carry a -1 skip sentinel that an unsigned tensor cannot "
+                "represent. Got ", ssm_state_idx.scalar_type(), " and ",
+                accepted_tokens.scalar_type());
     int64_t conv_stride0 = conv_state.stride(0);
 
     int64_t ssm_stride0 = state_in.stride(0);
     int64_t ba_stride0 = ba.stride(0);
     int64_t ssm_state_idx_stride0 = ssm_state_idx.stride(0);
+    // The kernels stride this tensor by nTokens, which matches its real row
+    // stride only while it is contiguous with nTokens columns; otherwise each
+    // read lands on the wrong row and yields a plausible slot id for the wrong
+    // sequence. Shapes only, so no device sync.
     uint32_t cacheIdx;
     uint32_t* dumpTemp = nullptr;
     uint32_t totalDims = state_in.dim();
@@ -373,6 +387,12 @@ torch::Tensor gdn_eagle(
     TORCH_CHECK(hiddenDim == (headQk * 2 + headV * 2) * headDim);
     TORCH_CHECK(headDim == 128);
     TORCH_CHECK(nTokens <= 4);
+    TORCH_CHECK(ssm_state_idx_stride0 == (int64_t)nTokens
+                    && ssm_state_idx.size(1) == (int64_t)nTokens,
+                "gdn_eagle: ssm_state_idx must be contiguous with nTokens (",
+                nTokens, ") columns; the kernels index it as "
+                "[batch * nTokens + t]. Got stride(0)=",
+                ssm_state_idx_stride0, " size(1)=", ssm_state_idx.size(1));
 
     torch::Tensor gdn_out = torch::empty({batches * nTokens, headV, headDim},
         torch::device(qkvz.device()).dtype(qkvz.scalar_type()));
@@ -418,6 +438,12 @@ void page_attn_decode(
 ) {
   TORCH_CHECK(block_table.dim() == 2);
   TORCH_CHECK(seq_lens.dim() == 1);
+  // seq_lens is read as uint32 by the kernel; an int64 tensor would be
+  // reinterpreted pairwise, giving every other batch a length of zero.
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt,
+              "seq_lens must be int32, got ", seq_lens.scalar_type());
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "block_table must be int32, got ", block_table.scalar_type());
   TORCH_CHECK(key_cache.dim() == 4,
               "key_cache must be [num_pages, page_size, num_kv_heads, head_dim]");
   TORCH_CHECK(value_cache.dim() == 4,
@@ -426,6 +452,19 @@ void page_attn_decode(
               "key_cache and value_cache must have identical shape");
   TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
               "key_cache and value_cache must have identical page stride");
+  // The inner strides are derived from the sizes, so a transposed or otherwise
+  // non-standard view would be read with the wrong layout rather than refused.
+  TORCH_CHECK(key_cache.stride(1) == value_cache.stride(1) &&
+                  key_cache.stride(2) == value_cache.stride(2) &&
+                  key_cache.stride(3) == value_cache.stride(3),
+              "key_cache and value_cache must have identical strides");
+  TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
+              "key/value cache head_dim must be contiguous");
+  TORCH_CHECK(key_cache.stride(2) == key_cache.size(3) &&
+                  key_cache.stride(1) ==
+                      (int64_t)key_cache.size(2) * key_cache.size(3),
+              "key/value cache must be [num_pages, page_size, num_kv_heads, "
+              "head_dim] in memory order");
   TORCH_CHECK(query.dim() == 3, "query must be [batches, num_q_heads, head_dim]");
   TORCH_CHECK(query.scalar_type() == torch::kHalf || query.scalar_type() == torch::kBFloat16,
               "query must be fp16 or bf16");
@@ -458,6 +497,11 @@ void page_attn_decode(
   uint32_t hiddenDimPMax = ((maxSeqLen + 63) / 64);
   uint32_t reduceCount = ((maxSeqLen + 1023) / 1024);
   uint32_t nTokens = 1;
+  // The page table must be able to address max_seq_len. Comparing against
+  // seq_lens instead would need a device sync, which breaks graph capture.
+  TORCH_CHECK((int64_t)block_table.size(1) * (int64_t)pageSize >= max_seq_len,
+              "block_table addresses ", block_table.size(1) * (int64_t)pageSize,
+              " tokens but max_seq_len is ", max_seq_len);
   uint32_t pageTableSizeLog2 = getHighestBit(pageSize);
   uint32_t pageTableBatchStride = block_table.stride(0);
 
@@ -866,11 +910,37 @@ void build_tree_kernel_efficient(
     at::Tensor retrive_next_token, at::Tensor retrive_next_sibling,
     int64_t topk, int64_t depth, int64_t draft_token_num, int64_t tree_mask_mode) {
   int bs = parent_list.size(0);
-  auto q = c10::xpu::getCurrentXPUStream().queue();
+  TORCH_CHECK(draft_token_num > 0 && draft_token_num <= 1024,
+              "build_tree_kernel_efficient: draft_token_num=", draft_token_num,
+              " must be in [1, 1024] to serve as the work-group size");
+  TORCH_CHECK(topk > 0, "build_tree_kernel_efficient: topk must be positive");
+  // depth forms the parent_list row stride topk * (depth - 1) + 1; at depth 0
+  // that stride goes negative.
+  TORCH_CHECK(depth > 0,
+              "build_tree_kernel_efficient: depth must be positive, got ", depth);
+  // The index tensors are read as int64_t*; an int32 tensor would be paired
+  // into indices around 2^32.
+  TORCH_CHECK(parent_list.scalar_type() == at::kLong &&
+                  selected_index.scalar_type() == at::kLong &&
+                  verified_seq_len.scalar_type() == at::kLong,
+              "build_tree_kernel_efficient: parent_list, selected_index and "
+              "verified_seq_len must be int64");
+  TORCH_CHECK(positions.scalar_type() == at::kLong &&
+                  retrive_index.scalar_type() == at::kLong &&
+                  retrive_next_token.scalar_type() == at::kLong &&
+                  retrive_next_sibling.scalar_type() == at::kLong,
+              "build_tree_kernel_efficient: the output index tensors must be "
+              "int64");
+  TORCH_CHECK(tree_mask.scalar_type() == at::kByte ||
+                  tree_mask.scalar_type() == at::kBool,
+              "build_tree_kernel_efficient: tree_mask must be uint8 or bool");
+  auto q = c10::xpu::getCurrentXPUStream(parent_list.device().index()).queue();
   size_t local = static_cast<size_t>(draft_token_num);
   size_t global = static_cast<size_t>(bs) * local;
   if (tree_mask_mode == BT_QLEN_ONLY_BITPACKING) {
-    int nbpi = (draft_token_num > 16) ? 4 : (draft_token_num > 8 ? 2 : 1);
+    // The highest bit written is for cur_position + 1 = draft_token_num - 1,
+    // so a row needs (draft_token_num - 1) / 8 + 1 bytes.
+    int nbpi = (draft_token_num - 1) / 8 + 1;
     BuildTreeEfficientPackedFn k{
         static_cast<int64_t*>(parent_list.data_ptr()),
         static_cast<int64_t*>(selected_index.data_ptr()),
@@ -920,9 +990,22 @@ struct VerifyTreeGreedyFn {
   const int64_t* target_predict;      // [bs, num_draft_tokens]
   int num_speculative_tokens;
   int num_draft_tokens;
+  int predicts_numel;
   void operator()(sycl::nd_item<1> it) const {
     int bx = it.get_group(0);
+    // retrive_index is device data; a stale entry would index predicts out
+    // of range on every write below.
     int64_t last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
+    // Every output for this row must be written even when the index is
+    // unusable: accept_token_num drives how many tokens the scheduler commits.
+    for (int j = 0; j < num_speculative_tokens; ++j) {
+      accept_index[bx * num_speculative_tokens + j] = -1;
+    }
+    if (last_accepted_retrive_idx < 0 ||
+        last_accepted_retrive_idx >= predicts_numel) {
+      accept_token_num[bx] = 0;
+      return;
+    }
     accept_index[bx * num_speculative_tokens] = (int32_t)last_accepted_retrive_idx;
     int num_accepted_tokens = 0;
     int64_t cur_index = 0;
@@ -933,6 +1016,12 @@ struct VerifyTreeGreedyFn {
         int64_t draft_token_id = candidates[bx * num_draft_tokens + cur_index];
         int64_t target_token_id = target_predict[last_accepted_retrive_idx];
         if (draft_token_id == target_token_id) {
+          // An unusable draft index ends the accept run; the outputs below
+          // still get written.
+          if (draft_index < 0 || draft_index >= predicts_numel) {
+            cur_index = -1;
+            break;
+          }
           predicts[last_accepted_retrive_idx] = (int32_t)target_token_id;
           ++num_accepted_tokens;
           accept_index[bx * num_speculative_tokens + num_accepted_tokens] = (int32_t)draft_index;
@@ -965,7 +1054,7 @@ void verify_tree_greedy(
   int batch_size = candidates.size(0);
   int num_spec_step = accept_index.size(1);
   int num_draft_tokens = candidates.size(1);
-  auto q = c10::xpu::getCurrentXPUStream().queue();
+  auto q = c10::xpu::getCurrentXPUStream(predicts.device().index()).queue();
   VerifyTreeGreedyFn k{
       static_cast<int32_t*>(predicts.data_ptr()),
       static_cast<int32_t*>(accept_index.data_ptr()),
@@ -975,7 +1064,7 @@ void verify_tree_greedy(
       static_cast<const int64_t*>(retrive_next_token.data_ptr()),
       static_cast<const int64_t*>(retrive_next_sibling.data_ptr()),
       static_cast<const int64_t*>(target_predict.data_ptr()),
-      num_spec_step, num_draft_tokens};
+      num_spec_step, num_draft_tokens, (int)predicts.numel()};
   // One work-item per request (CUDA grid=bs, block=1).
   q.submit([&](sycl::handler& h) {
     h.parallel_for(sycl::nd_range<1>(static_cast<size_t>(batch_size), 1), k);
@@ -1018,7 +1107,9 @@ struct CausalConv1dVerifyFn {
   int W;          // conv_kernel_size
   int act;        // 1 = silu/swish
   int cs_stride0; // conv_state.stride(0) = conv_dim*(W-1)
+  int cs_rows;    // conv_state.size(0)
   int ic_stride0; // inter_conv.stride(0) = N*conv_dim*(W-1)
+  int ic_rows;    // inter_conv.size(0)
   // x/out element strides. Channel-major [bs,conv_dim,N]: (conv_dim*N, N, 1).
   // Token-major   [bs,N,conv_dim]:                        (N*conv_dim, 1, conv_dim).
   int xs_n, xs_c, xs_t;
@@ -1028,18 +1119,31 @@ struct CausalConv1dVerifyFn {
     int c = it.get_id(1);   // channel
     if (c >= conv_dim) return;
     int Wm1 = W - 1;
-    const T* cs = conv_state + (int64_t)cache_indices[n] * cs_stride0 + (int64_t)c * Wm1;
+    // A negative cache_indices entry would read before the allocation. Gate
+    // the history load rather than returning (this kernel writes `out` for
+    // every row) and start the window at zero rather than clamping to row 0,
+    // which would read another sequence's live state.
+    const bool have_slot = cache_indices[n] >= 0 && cache_indices[n] < cs_rows;
+    const T* cs = have_slot
+        ? conv_state + (int64_t)cache_indices[n] * cs_stride0 + (int64_t)c * Wm1
+        : nullptr;
     const T* xc = x + (int64_t)n * xs_n + (int64_t)c * xs_c;
     T* oc = out + (int64_t)n * os_n + (int64_t)c * os_c;
     const T* wc = conv_w + (int64_t)c * W;
     float bias = (conv_bias != nullptr) ? (float)conv_bias[c] : 0.0f;
-    T* icbase = inter_conv + (int64_t)inter_indices[n] * ic_stride0;
+    // triton passes -1 for a slot with no intermediate cache. Only the cache
+    // write is skipped; out is still produced for this row.
+    const bool has_inter = inter_indices[n] >= 0 && inter_indices[n] < ic_rows;
+    T* icbase = has_inter
+        ? inter_conv + (int64_t)inter_indices[n] * ic_stride0
+        : inter_conv;
 
     // rolling window of the last W values (init = conv_state's W-1 + first x).
     // We keep a local window of size W: win[0..W-2] = history, win[W-1] = current.
     float win[8];  // W<=8 (conv_kernel typically 4); guard below
-    // load history (W-1 values) from conv_state
-    for (int i = 0; i < Wm1; ++i) win[i] = (float)cs[i];
+    // load history (W-1 values) from conv_state; a padding slot has no history,
+    // so the window starts at zero and `out` is still produced for the row.
+    for (int i = 0; i < Wm1; ++i) win[i] = have_slot ? (float)cs[i] : 0.0f;
 
     for (int t = 0; t < N; ++t) {
       // shift: the current token's value goes to win[W-1]; window for this step
@@ -1055,8 +1159,10 @@ struct CausalConv1dVerifyFn {
       for (int w = 0; w < Wm1 - 1; ++w) win[w] = win[w + 1];
       if (Wm1 > 0) win[Wm1 - 1] = xt;
       // cache the post-step (W-1)-window into inter_conv[inter_slot, t, c, :]
-      T* ic = icbase + ((int64_t)t * conv_dim + c) * Wm1;
-      for (int w = 0; w < Wm1; ++w) ic[w] = (T)win[w];
+      if (has_inter) {
+        T* ic = icbase + ((int64_t)t * conv_dim + c) * Wm1;
+        for (int w = 0; w < Wm1; ++w) ic[w] = (T)win[w];
+      }
     }
   }
 };
@@ -1084,9 +1190,16 @@ void causal_conv1d_verify_impl(
   TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   TORCH_CHECK(x.stride(token_major ? 2 : 1) >= 1 && x.stride(token_major ? 1 : 2) >= 1,
               "x strides must be positive");
-  auto qd = c10::xpu::getCurrentXPUStream().queue();
+  auto qd = c10::xpu::getCurrentXPUStream(out.device().index()).queue();
   int cs_stride0 = conv_state.stride(0);
+  int cs_rows    = (int)conv_state.size(0);
   int ic_stride0 = inter_conv.stride(0);
+  int ic_rows    = (int)inter_conv.size(0);
+  // These index tensors are cast to const int*; an int64 tensor would be
+  // read pairwise, giving every other entry the value 0.
+  TORCH_CHECK(cache_indices.scalar_type() == at::kInt &&
+                  inter_indices.scalar_type() == at::kInt,
+              "verify: cache_indices and inter_indices must be int32");
   // Take x's real strides so a column slice of a wider buffer (token-major
   // mixed_qkv = projected_states_qkvz[:, :qkv_dim]) can be read in place.
   const int s_n = (int)x.stride(0);
@@ -1104,8 +1217,8 @@ void causal_conv1d_verify_impl(
         (const fp16*)biasp, (const fp16*)conv_state.data_ptr(),
         (fp16*)inter_conv.data_ptr(), (fp16*)out.data_ptr(),
         (const int*)cache_indices.data_ptr(), (const int*)inter_indices.data_ptr(),
-        conv_dim, N, W, (int)activation, cs_stride0, ic_stride0,
-        s_n, s_c, s_t, o_n, o_c, o_t};
+        conv_dim, N, W, (int)activation, cs_stride0, cs_rows, ic_stride0,
+        ic_rows, s_n, s_c, s_t, o_n, o_c, o_t};
     qd.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<2>(bs, conv_dim), kf); });
   } else {
     CausalConv1dVerifyFn<bf16> kf{
@@ -1113,8 +1226,8 @@ void causal_conv1d_verify_impl(
         (const bf16*)biasp, (const bf16*)conv_state.data_ptr(),
         (bf16*)inter_conv.data_ptr(), (bf16*)out.data_ptr(),
         (const int*)cache_indices.data_ptr(), (const int*)inter_indices.data_ptr(),
-        conv_dim, N, W, (int)activation, cs_stride0, ic_stride0,
-        s_n, s_c, s_t, o_n, o_c, o_t};
+        conv_dim, N, W, (int)activation, cs_stride0, cs_rows, ic_stride0,
+        ic_rows, s_n, s_c, s_t, o_n, o_c, o_t};
     qd.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<2>(bs, conv_dim), kf); });
   }
 }
@@ -1194,7 +1307,9 @@ struct GdnTargetVerifyFn {
   const ST* ssm_state;         // [slots,Hv,V,K] ST, READ-only
   ST* inter;                   // [slots, cache_steps, Hv, V, K] ST, WRITTEN
   const int ssm_stride0;
+  const int ssm_rows;          // ssm_state.size(0)
   const int inter_stride0;     // = cache_steps*Hv*V*K
+  const int inter_rows;        // intermediate.size(0)
   const int* query_start_loc;
   const int* cache_indices;
   const int* inter_indices;
@@ -1242,16 +1357,33 @@ struct GdnTargetVerifyFn {
     float st[GDN_VPSG * KB];
     float ql[KB], kl[KB], vl[GDN_VPSG];
 
-    const ST* ssm_ptr = ssm_state + (int64_t)cache_indices[batch_id] * ssm_stride0;
+    // A negative cache_indices entry would seed the recurrence from before the
+    // allocation. Seed from zero rather than clamping to row 0, which reads
+    // another sequence's live state, and still produce `out`.
+    const bool have_slot = cache_indices[batch_id] >= 0
+                      && cache_indices[batch_id] < ssm_rows;
+    const ST* ssm_ptr = have_slot
+        ? ssm_state + (int64_t)cache_indices[batch_id] * ssm_stride0
+        : nullptr;
     // load initial state (verify ALWAYS has an initial state = post-prefill)
     for (int j = 0; j < GDN_VPSG; ++j)
       for (int i = 0; i < KB; ++i)
-        st[j * KB + i] = (float)ssm_ptr[hv * head_k_dim * head_v_dim +
-                                       (KB * sg_lid + i) + (hvd + j) * head_k_dim];
+        st[j * KB + i] = have_slot
+            ? (float)ssm_ptr[hv * head_k_dim * head_v_dim +
+                             (KB * sg_lid + i) + (hvd + j) * head_k_dim]
+            : 0.0f;
 
     int s0 = query_start_loc[batch_id];
     int s1 = query_start_loc[batch_id + 1];
-    int inter_base = inter_indices[batch_id] * inter_stride0;  // into `inter`
+    // triton passes -1 for a slot with no intermediate cache. Only the cache
+    // write is skipped; out is still produced for this row.
+    const bool has_inter = inter_indices[batch_id] >= 0
+                      && inter_indices[batch_id] < inter_rows;
+    // int64_t: the bound above gates the index, but an int32 product still
+    // wraps for a slot the guard declared legal, and the wrapped value becomes
+    // a write base below.
+    int64_t inter_base = has_inter
+        ? (int64_t)inter_indices[batch_id] * inter_stride0 : 0;
     int step = 0;
     for (int t = s0; t < s1; ++t, ++step) {
       float beta = act_sigmoid((float)b[(int64_t)t * b_rs + hv]);
@@ -1302,8 +1434,9 @@ struct GdnTargetVerifyFn {
           out[t * num_v_heads * head_v_dim + hv * head_v_dim + hvd + i] = (T)res[i];
 
       // (1) cache the post-token state into the intermediate buffer at `step`.
-      if (step < cache_steps) {
-        ST* ip = inter + inter_base + step * num_v_heads * head_v_dim * head_k_dim;
+      if (has_inter && step < cache_steps) {
+        ST* ip = inter + inter_base
+               + (int64_t)step * num_v_heads * head_v_dim * head_k_dim;
         for (int j = 0; j < GDN_VPSG; ++j)
           for (int i = 0; i < KB; ++i)
             ip[hv * head_k_dim * head_v_dim + (KB * sg_lid + i) + (hvd + j) * head_k_dim] =
@@ -1343,13 +1476,20 @@ void gdn_target_verify_impl(
   const int bs = query_start_loc.size(0) - 1;
   const int num_v_bucket = (V + GDN_VPG - 1) / GDN_VPG;
 
-  auto qd = c10::xpu::getCurrentXPUStream().queue();
+  auto qd = c10::xpu::getCurrentXPUStream(out.device().index()).queue();
   sycl::range<3> local(1, 1, GDN_GROUP);
   sycl::range<3> global(bs, Hv, num_v_bucket);
   sycl::nd_range<3> range(global * local, local);
 
   int ssm_stride0 = ssm_state.stride(0);
-  int inter_stride0 = cache_steps * Hv * V * K;
+  // Take intermediate's real row stride rather than assuming the packed
+  // layout, matching how inter_conv is handled in the fused variant.
+  TORCH_CHECK(intermediate.stride(-1) == 1,
+              "gdn_target_verify: intermediate must be row-dense");
+  int inter_stride0 = (int)intermediate.stride(0);
+  TORCH_CHECK(inter_stride0 >= cache_steps * Hv * V * K,
+              "gdn_target_verify: intermediate row stride ", inter_stride0,
+              " is below the ", cache_steps * Hv * V * K, " it must span");
   // a/b may be strided slices of a packed [T, 2*Hv] mixed_ba buffer, so take
   // their real row stride instead of assuming Hv.
   TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a/b must be [T, Hv]");
@@ -1358,6 +1498,9 @@ void gdn_target_verify_impl(
   const int a_rs = (int)a.stride(0);
   const int b_rs = (int)b.stride(0);
 
+  TORCH_CHECK(query_start_loc.scalar_type() == at::kInt,
+              "gdn_target_verify: query_start_loc must be int32");
+
 #define GDNV_LAUNCH(T_, KB_, ST_)                                                 \
   do {                                                                           \
     GdnTargetVerifyFn<T_, KB_, ST_> kf{                                          \
@@ -1365,7 +1508,8 @@ void gdn_target_verify_impl(
         (const T_*)v.data_ptr(), (const T_*)a.data_ptr(), (const T_*)b.data_ptr(),\
         (const float*)A_log.data_ptr(), (const float*)dt_bias.data_ptr(),        \
         (const ST_*)ssm_state.data_ptr(), (ST_*)intermediate.data_ptr(),         \
-        ssm_stride0, inter_stride0,                                              \
+        ssm_stride0, (int)ssm_state.size(0),                                     \
+        inter_stride0, (int)intermediate.size(0),                                \
         (const int*)query_start_loc.data_ptr(), (const int*)cache_indices.data_ptr(),\
         (const int*)inter_indices.data_ptr(),                                    \
         Hk, K, Hv, V, (int)cache_steps,                                          \
@@ -1484,6 +1628,7 @@ struct GdnFusedVerifyFn {
   int Hk, K, Hv, V, ratio, W, conv_dim, qkvz_dim, allq, allk;
   int act, cache_steps;
   int ssm_stride0, cs_stride0, issm_stride0, ic_stride0;
+  int ssm_rows, cs_rows, issm_rows, ic_rows;
 
   static inline float act_sigmoid(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
   static inline float act_softplus(float x, float beta = 1.0f, float thr = 20.0f) {
@@ -1505,7 +1650,13 @@ struct GdnFusedVerifyFn {
   // and raw column rawc. history = conv_state[slot, r, :W-1]; inputs from qkvz[*, rawc].
   inline float conv_one(int slot, int r, int rawc, int t, int s0) const {
     int Wm1 = W - 1;
-    const T* cs = conv_state + (int64_t)slot * cs_stride0 + (int64_t)r * Wm1;
+    // A negative slot would read a full conv_state row before the allocation.
+    // Not clamped to row 0 (that reads another sequence's live state): the
+    // history taps read zero instead, so the caller still gets a defined value.
+    const bool have_slot = slot >= 0 && slot < cs_rows;
+    const T* cs = have_slot
+        ? conv_state + (int64_t)slot * cs_stride0 + (int64_t)r * Wm1
+        : nullptr;
     const T* wc = conv_w + (int64_t)r * W;
     float acc = (conv_b != nullptr) ? (float)conv_b[r] : 0.0f;
     // window positions correspond to absolute tokens [t-(W-1) .. t]; tokens < s0
@@ -1517,7 +1668,7 @@ struct GdnFusedVerifyFn {
         xv = (float)qkvz[(int64_t)tok * (Hk * qkvz_dim) + rawc];
       } else {
         int hidx = (Wm1) + (tok - s0);    // history index in [0,W-1): tok=s0-1 -> W-2
-        xv = (float)cs[hidx];
+        xv = have_slot ? (float)cs[hidx] : 0.0f;
       }
       acc += xv * (float)wc[w];
     }
@@ -1544,15 +1695,28 @@ struct GdnFusedVerifyFn {
     float st[GDN_VPSG * KB];
     float ql[KB], kl[KB], vl[GDN_VPSG];
 
+    // A negative slot would seed the recurrence from before the allocation.
+    // Seed from zero rather than clamping to row 0, which reads another
+    // sequence's live state, and keep producing out, zout and inter_ssm.
     int slot = cache_indices[batch_id];
-    const float* ssm_ptr = ssm_state + (int64_t)slot * ssm_stride0;
+    const bool have_slot = slot >= 0 && slot < ssm_rows;
+    const float* ssm_ptr = have_slot
+        ? ssm_state + (int64_t)slot * ssm_stride0
+        : nullptr;
     for (int j = 0; j < GDN_VPSG; ++j)
       for (int i = 0; i < KB; ++i)
-        st[j * KB + i] = ssm_ptr[hv * K * V + (KB * sg_lid + i) + (hvd + j) * K];
+        st[j * KB + i] = have_slot
+            ? ssm_ptr[hv * K * V + (KB * sg_lid + i) + (hvd + j) * K]
+            : 0.0f;
 
     int s0 = query_start_loc[batch_id];
     int s1 = query_start_loc[batch_id + 1];
-    int inter_base_ssm = inter_indices[batch_id] * issm_stride0;
+    const bool has_inter = inter_indices[batch_id] >= 0
+                      && inter_indices[batch_id] < issm_rows;
+    // int64_t: an int32 product wraps for an index the bound accepted, and
+    // becomes a write base.
+    int64_t inter_base_ssm = has_inter
+        ? (int64_t)inter_indices[batch_id] * issm_stride0 : 0;
     int step = 0;
     for (int t = s0; t < s1; ++t, ++step) {
       // ---- gating from RAW interleaved b/a (per-k-head [b(ratio)|a(ratio)]) ----
@@ -1615,8 +1779,8 @@ struct GdnFusedVerifyFn {
         }
 
       // ---- cache per-step ssm intermediate (post-token state) ----
-      if (step < cache_steps) {
-        float* ip = inter_ssm + inter_base_ssm + step * Hv * V * K;
+      if (has_inter && step < cache_steps) {
+        float* ip = inter_ssm + inter_base_ssm + (int64_t)step * Hv * V * K;
         for (int j = 0; j < GDN_VPSG; ++j)
           for (int i = 0; i < KB; ++i)
             ip[hv * K * V + (KB * sg_lid + i) + (hvd + j) * K] = st[j * KB + i];
@@ -1642,6 +1806,7 @@ struct GdnFusedConvWindowFn {
   const int* inter_indices;
   int Hk, K, Hv, V, ratio, W, conv_dim, qkvz_dim, allq, allk;
   int cache_steps, cs_stride0, ic_stride0;
+  int cs_rows, ic_rows;
   // reordered row -> raw qkvz column (inverse of the reorder map)
   inline int raw_of_row(int r) const {
     if (r < allq) { int kh = r / K, d = r % K; return kh * qkvz_dim + d; }
@@ -1659,11 +1824,16 @@ struct GdnFusedConvWindowFn {
     int s1 = query_start_loc[n + 1];
     int Tn = s1 - s0;
     if (step >= Tn) return;
+    // cs[] is dereferenced below whenever tok < s0, so a negative slot reads
+    // before the allocation. This kernel writes only inter_conv, so unlike its
+    // siblings a bare return abandons no output.
     int slot = cache_indices[n];
+    if (slot < 0 || slot >= cs_rows) return;
     int rawc = raw_of_row(r);
     const T* cs = conv_state + (int64_t)slot * cs_stride0 + (int64_t)r * Wm1;
     // window AFTER consuming token (s0+step) = inputs at absolute tokens
     // [s0+step-(W-2) .. s0+step], i.e. the last W-1 inputs feeding the NEXT tap.
+    if (inter_indices[n] < 0 || inter_indices[n] >= ic_rows) return;
     T* ic = inter_conv + (int64_t)inter_indices[n] * ic_stride0 +
             ((int64_t)step * conv_dim + r) * Wm1;
     int tcur = s0 + step;
@@ -1701,12 +1871,32 @@ void gdn_fused_verify(
   const int bs = query_start_loc.size(0) - 1;
   const int num_v_bucket = (V + GDN_VPG - 1) / GDN_VPG;
 
-  auto qd = c10::xpu::getCurrentXPUStream().queue();
+  auto qd = c10::xpu::getCurrentXPUStream(out.device().index()).queue();
   const void* biasp = conv_bias.has_value() ? conv_bias->data_ptr() : nullptr;
   int ssm_stride0 = ssm_state.stride(0);
+  int ssm_rows = (int)ssm_state.size(0);
   int cs_stride0 = conv_state.stride(0);
+  int cs_rows = (int)conv_state.size(0);
+  // inter_ssm's stride is computed rather than read from the tensor, so the
+  // issm_rows bound below is only sound if the assumed stride is the real one.
+  // On a strided pool view the bound passes while the write lands in a live
+  // neighbour's slot: wrong slot, in bounds, silent.
+  TORCH_CHECK(inter_ssm.stride(-1) == 1,
+              "gdn_fused_verify: inter_ssm must be row-dense");
+  TORCH_CHECK(inter_ssm.stride(0) == (int64_t)cache_steps * Hv * V * K,
+              "gdn_fused_verify: inter_ssm row stride ", inter_ssm.stride(0),
+              " != the packed ", (int64_t)cache_steps * Hv * V * K,
+              " this kernel assumes; a strided view would write into a "
+              "neighbouring slot");
   int issm_stride0 = cache_steps * Hv * V * K;
+  int issm_rows = (int)inter_ssm.size(0);
   int ic_stride0 = inter_conv.stride(0);
+  int ic_rows = (int)inter_conv.size(0);
+  // These index tensors are cast to const int*; an int64 tensor would be
+  // read pairwise, giving every other entry the value 0.
+  TORCH_CHECK(cache_indices.scalar_type() == at::kInt &&
+                  inter_indices.scalar_type() == at::kInt,
+              "verify: cache_indices and inter_indices must be int32");
 
   sycl::range<3> local(1, 1, GDN_GROUP);
   sycl::range<3> global(bs, Hv, num_v_bucket);
@@ -1726,7 +1916,8 @@ void gdn_fused_verify(
         (const int*)inter_indices.data_ptr(),                                    \
         Hk, K, Hv, V, ratio, W, conv_dim, qkvz_dim, allq, allk,                  \
         (int)activation, (int)cache_steps,                                       \
-        ssm_stride0, cs_stride0, issm_stride0, ic_stride0};                      \
+        ssm_stride0, cs_stride0, issm_stride0, ic_stride0,                       \
+        ssm_rows, cs_rows, issm_rows, ic_rows};                                  \
     qd.submit([&](sycl::handler& h) { h.parallel_for(range, kf); });             \
     GdnFusedConvWindowFn<T_> cw{                                                 \
         (const T_*)qkvz.data_ptr(), (const T_*)conv_state.data_ptr(),            \
@@ -1734,7 +1925,7 @@ void gdn_fused_verify(
         (const int*)query_start_loc.data_ptr(), (const int*)cache_indices.data_ptr(),\
         (const int*)inter_indices.data_ptr(),                                    \
         Hk, K, Hv, V, ratio, W, conv_dim, qkvz_dim, allq, allk,                  \
-        (int)cache_steps, cs_stride0, ic_stride0};                              \
+        (int)cache_steps, cs_stride0, ic_stride0, cs_rows, ic_rows};            \
     qd.submit([&](sycl::handler& h) {                                            \
       h.parallel_for(sycl::range<3>(bs, cache_steps, conv_dim), cw); });         \
   } while (0)
@@ -1941,7 +2132,7 @@ void assign_draft_cache_locs_p1(
   TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "seq_lens int64");
   TORCH_CHECK(out_cache_loc.scalar_type() == at::kLong, "out_cache_loc int64");
   int bs = req_pool_indices.size(0);
-  auto q = c10::xpu::getCurrentXPUStream().queue();
+  auto q = c10::xpu::getCurrentXPUStream(req_pool_indices.device().index()).queue();
   AssignDraftCacheLocsP1Fn k{
       static_cast<const int64_t*>(req_pool_indices.data_ptr()),
       static_cast<int32_t*>(req_to_token.data_ptr()),
@@ -1960,7 +2151,7 @@ void create_extend_after_decode_spec_info_xpu(
   TORCH_CHECK(positions.scalar_type() == at::kLong, "positions int64");
   TORCH_CHECK(new_verified_id.scalar_type() == at::kInt, "new_verified_id int32");
   int bs = seq_lens.size(0);
-  auto q = c10::xpu::getCurrentXPUStream().queue();
+  auto q = c10::xpu::getCurrentXPUStream(verified_id.device().index()).queue();
   CreateExtendAfterDecodeFn k{
       static_cast<const int32_t*>(verified_id.data_ptr()),
       static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -1976,7 +2167,7 @@ void align_evict_mask_to_page_size_xpu(
   TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "seq_lens int64");
   TORCH_CHECK(evict_mask.scalar_type() == at::kBool, "evict_mask bool");
   int bs = seq_lens.size(0);
-  auto q = c10::xpu::getCurrentXPUStream().queue();
+  auto q = c10::xpu::getCurrentXPUStream(seq_lens.device().index()).queue();
   AlignEvictMaskFn k{
       static_cast<const int64_t*>(seq_lens.data_ptr()),
       static_cast<bool*>(evict_mask.data_ptr()),
@@ -1992,7 +2183,7 @@ void get_target_cache_loc_xpu(
   TORCH_CHECK(out_cache_loc.scalar_type() == at::kLong, "out_cache_loc int64");
   TORCH_CHECK(accept_length.scalar_type() == at::kInt, "accept_length int32");
   int bs = accept_length.size(0);
-  auto q = c10::xpu::getCurrentXPUStream().queue();
+  auto q = c10::xpu::getCurrentXPUStream(tgt_cache_loc.device().index()).queue();
   GetTargetCacheLocFn k{
       static_cast<int64_t*>(tgt_cache_loc.data_ptr()),
       static_cast<int64_t*>(to_free_slots.data_ptr()),
@@ -2011,7 +2202,7 @@ void filter_finished_cache_loc_xpu(
   TORCH_CHECK(accept_length.scalar_type() == at::kInt, "accept_length int32");
   TORCH_CHECK(accept_length_filter.scalar_type() == at::kInt, "accept_length_filter int32");
   int bs = accept_length.size(0);
-  auto q = c10::xpu::getCurrentXPUStream().queue();
+  auto q = c10::xpu::getCurrentXPUStream(out_cache_loc.device().index()).queue();
   FilterFinishedCacheLocFn k{
       static_cast<const int64_t*>(out_cache_loc.data_ptr()),
       static_cast<int64_t*>(tgt_cache_loc.data_ptr()),
@@ -2040,7 +2231,7 @@ void mamba_state_scatter(
   int64_t src_layer_stride = src_req_size * src_step_size * E;
   int64_t total = R * L * E;
   if (total <= 0) return;
-  auto q = c10::xpu::getCurrentXPUStream().queue();
+  auto q = c10::xpu::getCurrentXPUStream(dst.device().index()).queue();
   const int WG = 256;
   size_t global = ((size_t)(total + WG - 1) / WG) * WG;
   const int32_t* dip = static_cast<const int32_t*>(dst_indices.data_ptr());
@@ -2083,7 +2274,49 @@ void splitk_decode_attention(
   uint32_t page_table_stride = block_table.size(1);
   uint32_t splits = static_cast<uint32_t>(num_splits);
 
+  // Both arms reinterpret the operands as fp16 and the index tensors as
+  // uint32_t; there is no bf16 or int64 instantiation to fall back to.
+  TORCH_CHECK(query.scalar_type() == at::kHalf &&
+                  key_cache.scalar_type() == at::kHalf &&
+                  value_cache.scalar_type() == at::kHalf &&
+                  out.scalar_type() == at::kHalf,
+              "splitk_decode_attention: query, key_cache, value_cache and out "
+              "must all be fp16");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt &&
+                  seq_lens.scalar_type() == at::kInt,
+              "splitk_decode_attention: block_table and seq_lens must be int32");
+  // The kernel masks the page offset with page_size - 1, so a non-power-of-two
+  // page size selects the wrong KV token rather than failing.
+  TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0,
+              "splitk_decode_attention: page_size must be a power of two, got ",
+              page_size);
+  TORCH_CHECK(num_splits > 0,
+              "splitk_decode_attention: num_splits must be positive, got ",
+              num_splits);
+  TORCH_CHECK(num_q_heads % num_kv_heads == 0,
+              "splitk_decode_attention: num_q_heads=", num_q_heads,
+              " is not a multiple of num_kv_heads=", num_kv_heads);
+  TORCH_CHECK((int64_t)page_table_stride * (int64_t)page_size >= max_seq_len,
+              "splitk_decode_attention: block_table addresses ",
+              (int64_t)page_table_stride * (int64_t)page_size,
+              " tokens but max_seq_len is ", max_seq_len);
+  TORCH_CHECK(query.dim() == 3 && key_cache.dim() == 4 &&
+                  value_cache.dim() == 4 && block_table.dim() == 2,
+              "splitk_decode_attention: expected query [B,H,D], caches "
+              "[pages, page_size, H_kv, D] and block_table [B, pages]");
+  TORCH_CHECK(key_cache.sizes() == value_cache.sizes(),
+              "splitk_decode_attention: key and value caches must match");
+  TORCH_CHECK(seq_lens.numel() >= batches &&
+                  (uint32_t)block_table.size(0) >= batches,
+              "splitk_decode_attention: seq_lens and block_table must cover ",
+              batches, " batches");
+
   size_t token_groups = static_cast<size_t>(batches) * num_q_heads * splits;
+  TORCH_CHECK(scratch.scalar_type() == at::kFloat &&
+                  (size_t)scratch.numel() >=
+                      token_groups * (head_dim + 2),
+              "splitk_decode_attention: scratch must hold ",
+              token_groups * (head_dim + 2), " floats, got ", scratch.numel());
   float* partial_acc = scratch.data_ptr<float>();
   float* partial_max = partial_acc + token_groups * head_dim;
   float* partial_sum = partial_max + token_groups;

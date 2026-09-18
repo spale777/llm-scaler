@@ -289,7 +289,15 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase2(
   int kvHeadIdx = globalLinearId1 / gqaGroups;
   int qGroupIdx = globalLinearId1 % gqaGroups;
   uint32_t kvSeqLen = batchKvSeqLen[batchIdx];
+  // pTempOut is strided by reduceCount, which comes from the host's
+  // longestBatch hint, while groupIdx is bounded by this batch's device-side
+  // seq_len. A seq_len past the hint would write into the next batch's region,
+  // so bound the group count by the extent that was actually allocated.
   int kvSeqOutGroup = (kvSeqLen + 1023) >> 10;
+  {
+    int allocatedGroups = (int)((longestBatch + 1023) >> 10);
+    if (kvSeqOutGroup > allocatedGroups) kvSeqOutGroup = allocatedGroups;
+  }
   uint32_t pageTableSize = 1 << pageTableSizeLog2;
   uint32_t pageTableLoopMask = (1 << pageTableSizeLog2) - 1;
   uint32_t pageTableBase = pageTableBatchStride * batchIdx;
@@ -459,7 +467,10 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase2(
   float softmaxMulVal = __ESIMD_DNS::sum<float, float, 16>(softmaxSum);
 
   if ((flag & 0x1) == 1) {
-    softmaxMulVal = 1.0f / softmaxMulVal;
+    // Phase3 of this same file guards the identical reciprocal (:574) and
+    // says why. Phase3 only runs when maxKvSeqLen > 1024, so below that this
+    // is the only reciprocal on the path.
+    softmaxMulVal = (softmaxMulVal > 0.0f) ? (1.0f / softmaxMulVal) : 0.0f;
     outputFp32 = outputFp32 * softmaxMulVal;
     simd<T, 16> outputTemp = outputFp32;
     block_store<T, 16>((T*)out + outputOffset, outputTemp);
@@ -497,11 +508,16 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase3(
   uint32_t kvSeqLen = batchKvSeqLen[batchIdx];
   uint32_t headQ = headKv * gqaRatio;
   uint32_t reduceCount = (longestBatch + 1023) >> 10;
+  // reduceCount sizes pTempOut from the host's longestBatch hint;
+  // effectiveReduceCount indexes it from this batch's device-side seq_len.
+  // A seq_len past the hint would read beyond the batch's region, so clamp.
   uint32_t effectiveReduceCount = (kvSeqLen + 1023) >> 10;
+  if (effectiveReduceCount > reduceCount) effectiveReduceCount = reduceCount;
   uint32_t channelOffset = globalLinearId0;
   uint32_t outDim = headQ * headDim * sizeof(float);
   uint32_t widthT = headQ * headDim * sizeof(float) - 1;
-  uint32_t heightT = effectiveReduceCount - 1;
+  // effectiveReduceCount is 0 for an empty batch; heightT would wrap.
+  uint32_t heightT = (effectiveReduceCount > 0) ? (effectiveReduceCount - 1) : 0;
   float* batchPTempOut = pTempOut + batchIdx * reduceCount * headQ * headDim;
   uint32_t vX = channelOffset * 16 + headDim * globalLinearId1;
   uint32_t vY = 0;
@@ -556,7 +572,9 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase3(
   }
 
   float softmaxMul = __ESIMD_DNS::sum<float, float, 16>(smSumFp32.select<16, 1>(0));
-  softmaxMul = 1.0f / softmaxMul;
+  // An empty batch contributes no exp() terms, so the sum stays 0 and the
+  // reciprocal would make every output lane NaN.
+  softmaxMul = (softmaxMul > 0.0f) ? (1.0f / softmaxMul) : 0.0f;
   output.select<16, 1>(0) = output.select<16, 1>(0)* softmaxMul;
   simd<T, 16> outputTemp = output.select<16, 1>(0);
   block_store<T, 16>((T*)out + outOffset, outputTemp);

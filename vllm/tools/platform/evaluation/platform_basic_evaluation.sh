@@ -1,6 +1,19 @@
 #!/bin/bash
 set -eo pipefail
 
+export CCL_ATL_TRANSPORT=ofi
+# Selects oneCCL's P2P path over the host-staged USM fallback; the benchmark's
+# -m flag does not.
+export CCL_TOPO_P2P_ACCESS=1
+
+# Benchmarking only, not for a serving environment: NEOReadDebugKeys gates the
+# other NEO keys, and render compression otherwise inflates apparent bandwidth.
+export NEOReadDebugKeys=1
+export RenderCompressedBuffersEnabled=0
+
+# FI_PROVIDER is left unset on purpose so libfabric picks per communicator (shm
+# intra-node, tcp/verbs inter-node).
+
 # === Error Handling ===
 CURRENT_STEP=""
 function print_info()    { echo -e "\033[1;34m[INFO]\033[0m $1"; }
@@ -72,7 +85,26 @@ if [ "$count" -ge 2 ]; then
 
     step "Running ze_peer bi-directional read test"
     ./tools/level-zero-tests/ze_peer -o read -t transfer_bw -s 0 -d 1 -b 2>&1 | tee -a "$LOG"
-    
+
+    # On a uniform switch fabric bandwidth is roughly flat across destinations;
+    # asymmetric routing and a single downgraded link only show up in the sweep.
+    step "Running ze_peer 0->N write sweep"
+    for d in $(seq 1 $((count - 1))); do
+        echo "--- ze_peer 0 -> $d ---" | tee -a "$LOG"
+        ./tools/level-zero-tests/ze_peer -o write -t transfer_bw -s 0 -d "$d" 2>&1 | tee -a "$LOG"
+    done
+
+    # Aggregate switch bandwidth with disjoint pairs running concurrently.
+    if [ "$count" -ge 8 ]; then
+        step "Running ze_peer 4-pair concurrent write test"
+        ./tools/level-zero-tests/ze_peer -o write -t transfer_bw \
+            --parallel_pair_targets 0:1,2:3,4:5,6:7 2>&1 | tee -a "$LOG"
+    elif [ "$count" -ge 4 ]; then
+        step "Running ze_peer 2-pair concurrent write test"
+        ./tools/level-zero-tests/ze_peer -o write -t transfer_bw \
+            --parallel_pair_targets 0:1,2:3 2>&1 | tee -a "$LOG"
+    fi
+
 #    if [ "$count" -ge 4 ]; then
 #        step "Running ze_peer 2 pair uni-directional write test"
 #        ./tools/level-zero-tests/ze_peer -o write -t transfer_bw --parallel_pair_targets 0:1,2:3 2>&1 | tee -a "$LOG"
@@ -107,7 +139,9 @@ function run_ccl_test() {
     local op=$1
     local outfile="$RESULT_DIR/${op}_outplace_128M.csv"
     step "Running 1CCL ${op^^} test"
-    mpirun -np 2 /usr/bin/1ccl_benchmark \
+    # -m is --sycl_mem_type; `usm` is the only value this build accepts, and an
+    # unrecognised one exits with a parse error that aborts the whole script.
+    mpirun -np "${CCL_RANKS:-$count}" /usr/bin/1ccl_benchmark \
         -a gpu -m usm -u device -e in_order \
         -l "$op" -i 50 -w 20 -f 512 -t 67108864 \
         -j off -p 0 -d float16 -q 0 -o "$outfile" 2>&1 | tee -a "$LOG"

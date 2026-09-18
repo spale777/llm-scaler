@@ -291,6 +291,9 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     static torch::Tensor cached_effective_alpha;       // [H*128] fp32
     static int64_t cached_H = -1;
     static c10::ScalarType cached_dtype = c10::ScalarType::Undefined;
+    // Part of the cache key: the cached tensors and the raw data_ptr() handed to
+    // the kernel are valid only on the device they were built for.
+    static c10::Device cached_device{c10::DeviceType::CPU};
     constexpr int RECHECK_INTERVAL = 500;
 
     int call_num = sdp_call_counter.fetch_add(1);
@@ -326,12 +329,23 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     const void* alpha_ptr;
     torch::Tensor v_scaled;       // keep alive if scaling
 
-    if (needs_scaling && cached_H == H && cached_dtype == v.scalar_type()) {
-        // Fast V-scaling: use cached v_scale_broadcast and effective_alpha
-        // Only V division is per-call (V changes each call)
-        v_scaled = v / cached_v_scale_broadcast;
-        v_ptr = v_scaled.data_ptr();
-        alpha_ptr = cached_effective_alpha.data_ptr();
+    bool fast_path = false;
+    if (needs_scaling) {
+        // Read under the same mutex the writers take: an unguarded read can tear
+        // a torch::Tensor assignment and free the storage being read.
+        std::lock_guard<std::mutex> guard(cache_mutex);
+        if (cached_H == H && cached_dtype == v.scalar_type()
+                && cached_device == v.device()) {
+            // Fast V-scaling: use cached v_scale_broadcast and effective_alpha.
+            // Only the V division is per-call (V changes each call).
+            v_scaled = v / cached_v_scale_broadcast;
+            v_ptr = v_scaled.data_ptr();
+            alpha_ptr = cached_effective_alpha.data_ptr();
+            fast_path = true;
+        }
+    }
+    if (fast_path) {
+        // handled above
     } else if (needs_scaling) {
         // Cache miss (shape/dtype changed) — full recompute
         auto v_absmax = v.abs().amax(/*dim=*/{0, 1, 3});
@@ -349,6 +363,7 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
         cached_effective_alpha = effective_alpha;
         cached_H = H;
         cached_dtype = v.scalar_type();
+        cached_device = v.device();
     } else {
         // Fast path: V values are small, no scaling needed
         v_ptr = v.data_ptr();

@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* fp16_GEMV.h — FP16×FP16→FP16/FP32 GEMV for small-batch decode.
  *
  * Mirrors the fp8_GEMV_v2 dispatch pattern (templated VL + K_SPLIT,
@@ -163,6 +164,13 @@ inline void select_vl_ks_fp16(uint32_t N, uint32_t K, int& vl, int& ks) {
             break;
         }
     }
+    // The walk-down breaks at vl=32/ks=1 whether or not the split divides K,
+    // and the ladder catch-all ignores the selection, so an indivisible K
+    // either overreads or drops its tail. K % 32 == 0 is exactly the set that
+    // is safe.
+    TORCH_CHECK(K % 32 == 0 && K % ks == 0 && (K / ks) % vl == 0,
+                "fp16 GEMV: K=", K, " has no supported (vl, ks) split "
+                "(needs K % 32 == 0); the kernel loop has no tail path");
 }
 
 inline void GEMV_fp16_host(

@@ -13,6 +13,7 @@
  *              1,  13, 25, 38, 53, 69, 89,113}
  */
 #pragma once
+#include "utils.h"
 
 namespace iq4_esimd_detail = sycl::ext::intel::esimd::detail;
 

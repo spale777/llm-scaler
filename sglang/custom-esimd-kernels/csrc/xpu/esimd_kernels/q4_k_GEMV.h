@@ -203,10 +203,9 @@ struct Q4_K_gemv_wide_kernel {
 inline void q4_k_gemv_host(
     const fp16* input, const uint8_t* weight, const fp16* scale,
     const fp16* minv, fp16* output, uint32_t N, uint32_t K, sycl::queue& q) {
-    // Wide path requires K % VL == 0. Every GGUF k-quant tensor has
-    // K % 256 == 0 (256 = super-block), and TP row-splits keep that property,
-    // so the 512/256 pair covers every shard seen in practice. The K_SPLIT
-    // kernel below stays as the fallback for anything else.
+    // Wide path requires K % VL == 0. A whole GGUF k-quant tensor has
+    // K % 256 == 0 (256 = super-block), but a TP row-split need not: 5120/8 is
+    // 640 and 5376/8 is 672. The K_SPLIT kernel below is the fallback.
     //
     // Kill switch: the wide path wins the isolated microbenchmark by ~2.6x but
     // was measured to LOSE ~1.8 ms of e2e decode on a launch-bound step, where
@@ -376,12 +375,23 @@ inline void q4_k_gemv_M_launch(
 // M=16 (MTP verify at concurrency 4 x 4 draft tokens) costs one pass with
 // the 16-tile but two with the 8-tile. M only adds one AW-wide accumulator
 // per row, while the weight/product registers are M-independent.
-// q4_k_gemv_M_launch picks the VL=512 or VL=256 tile instantiation from K, so
-// every K is served by the tiled kernel (no per-row M=1 fan-out).
+// q4_k_gemv_M_launch picks the VL=512 or VL=256 tile from K; a K that divides
+// neither is served per-row by the M=1 host, which has a real tail.
 inline void q4_k_gemv_M_host(
     const fp16* input, const uint8_t* weight, const fp16* scale,
     const fp16* minv, fp16* output, uint32_t M, uint32_t N, uint32_t K, uint32_t ldo,
     sycl::queue& q) {
+    // The M-tiled kernel walks K in whole VL chunks with no tail, and the
+    // narrow arm is VL=256. Fall back to the tail-correct M=1 host rather than
+    // truncating, as iq4_gemv_M_host does.
+    if (K % (Q4_K_VL / 2) != 0) {
+        for (uint32_t m = 0; m < M; m++) {
+            q4_k_gemv_host(input + (size_t)m * K, weight, scale, minv,
+                           output + (size_t)m * ldo, N, K, q);
+        }
+        return;
+    }
+
     uint32_t m0 = 0;
     while (m0 < M) {
         uint32_t r = M - m0;

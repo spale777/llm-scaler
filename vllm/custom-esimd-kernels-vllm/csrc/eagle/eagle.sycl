@@ -454,6 +454,12 @@ static void page_attn_decode_separate_impl(
 ) {
   TORCH_CHECK(block_table.dim() == 2);
   TORCH_CHECK(seq_lens.dim() == 1);
+  // seq_lens is read as uint32; an int64 tensor would be reinterpreted
+  // pairwise, giving every other batch a length of zero.
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt,
+              "seq_lens must be int32, got ", seq_lens.scalar_type());
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "block_table must be int32, got ", block_table.scalar_type());
   TORCH_CHECK(key_cache.dim() == 4,
               "key_cache must be [num_blocks, page_size, num_kv_heads, head_dim]");
   TORCH_CHECK(value_cache.dim() == 4,
@@ -498,6 +504,11 @@ static void page_attn_decode_separate_impl(
   uint32_t hiddenDimPMax = ((maxSeqLen + 63) / 64);
   uint32_t reduceCount = ((maxSeqLen + 1023) / 1024);
   uint32_t nTokens = 1;
+  // The page table must be able to address max_seq_len. Comparing against
+  // seq_lens instead would need a device sync, which breaks graph capture.
+  TORCH_CHECK((int64_t)block_table.size(1) * (int64_t)pageSize >= max_seq_len,
+              "block_table addresses ", block_table.size(1) * (int64_t)pageSize,
+              " tokens but max_seq_len is ", max_seq_len);
   uint32_t pageTableSizeLog2 = getHighestBit(pageSize);
   uint32_t pageTableBatchStride = block_table.stride(0);
 

@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* accum_norm_add_norm.h — Fused (top_k sum) + Norm × w1 + Add to h1 + Norm × w2.
  *
  * Designed for gemma4 MoE outlet with no-accum MoE kernel:
@@ -35,10 +36,13 @@ struct AccumNormAddNorm_kernel {
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
         int n_chunks = K / VL;
-        simd<float, VL> h2_chunks[MAX_CHUNKS];
 
-        // Pass 1: load all top_k routed_output rows for this token; sum into
-        // h2_chunks; accumulate sum_sq for RMS_1 along the way.
+        // No register cache: a simd<float, VL>[MAX_CHUNKS] array reaches 16 KB
+        // against an ~8 KB per-thread budget. Pass 2 re-sums the routed rows
+        // instead; they are L3 hot.
+
+        // Pass 1: sum the top_k routed_output rows for this token and
+        // accumulate sum_sq for RMS_1.
         float sum_sq_1 = 0.0f;
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
@@ -48,7 +52,6 @@ struct AccumNormAddNorm_kernel {
                     routed_output + (size_t)k * K + offset);
                 s += r;
             }
-            h2_chunks[c] = s;
             simd<float, VL> sq = s * s;
             sum_sq_1 += reduce<float>(sq, std::plus<>());
         }
@@ -62,7 +65,12 @@ struct AccumNormAddNorm_kernel {
             int offset = c * VL;
             simd<float, VL> w1 = block_load<fp16, VL>(w1_ptr + offset);
             simd<float, VL> h1 = block_load<fp16, VL>(h1_ptr + offset);
-            simd<float, VL> h2_normed = h2_chunks[c] * inv_rms_1 * w1;
+            simd<float, VL> h2 = 0.0f;
+            for (int k = 0; k < top_k; k++) {
+                h2 += simd<float, VL>(block_load<fp16, VL>(
+                    routed_output + (size_t)k * K + offset));
+            }
+            simd<float, VL> h2_normed = h2 * inv_rms_1 * w1;
             simd<float, VL> h1_new = h2_normed + h1;
             block_store<fp16, VL>(h1_ptr + offset, simd<fp16, VL>(h1_new));
             simd<float, VL> sq = h1_new * h1_new;
@@ -94,6 +102,12 @@ inline void accum_norm_add_norm_host(
     sycl::queue& q)
 {
     #define LAUNCH_ANAN(V, MC)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(1, 1),                 AccumNormAddNorm_kernel<V, MC>{                     routed_output, h1_ptr, w1_ptr, w2_ptr, out_ptr,                     K, top_k, eps1, eps2});         });
+
+    // The kernel streams rather than caching chunks, so MAX_CHUNKS only picks
+    // the instantiation. The ladder covers every multiple of 64 exactly.
+    // The narrowest arm is VL=64 and the kernel walks K in whole chunks.
+    TORCH_CHECK(K % 64 == 0,
+                "accum_norm_add_norm: K must be a multiple of 64, got ", K);
 
     if (K % 512 == 0) {
         int mc = K / 512;

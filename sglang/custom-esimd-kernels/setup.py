@@ -33,8 +33,7 @@ ext_modules = [
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-Xs", "-device bmg", "-funroll-loops", "-Xs", "-options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
@@ -65,7 +64,8 @@ ext_modules.append(
 )
 ### for lgrf esimd kernels
 
-### MoE auxiliary kernels — no DPAS, standard compilation
+### The FP8 block-scale prefill kernel holds ~5.5 KB of live DPAS state, which
+### is why this module alone is built with -doubleGRF.
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_sglang.custom_esimd_kernels_moe",
@@ -79,8 +79,7 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-Xs", "-device bmg -options -doubleGRF", "-funroll-loops", "-Xs", "-options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
@@ -147,8 +146,7 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-Xs", "-device bmg", "-funroll-loops", "-Xs", "-options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,

@@ -1,4 +1,6 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
+#include "utils.h"
 
 /*
  * Speculative variant of the sequential Qwen3.5/Qwen3.6 GDN kernel.
@@ -33,7 +35,7 @@ ESIMD_INLINE simd<float, 2> gdn_spec_update_seq(
     simd<float, 64>& h1_lo,
     simd<float, 64>& h1_hi,
     fp16* ssm_state_ptr,
-    int64_t ssm_stride0,
+    int64_t ssm_stride0, int64_t ssm_rows,
     int save_state_idx,
     int tid,
     int hv,
@@ -67,7 +69,9 @@ ESIMD_INLINE simd<float, 2> gdn_spec_update_seq(
 
     const int vi0 = tid * 2;
     fp16* save_base = nullptr;
-    if (save_state_idx > 0) {
+    // `>= 0`, not `> 0`: slot 0 is a real, writable slot and -1 is the
+    // sentinel, matching the host guard on this path.
+    if (save_state_idx >= 0 && save_state_idx < ssm_rows) {
         save_base = ssm_state_ptr +
             (int64_t)save_state_idx * ssm_stride0 +
             (int64_t)hv * gdn_V * gdn_K;
@@ -127,8 +131,8 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
     int gdn_V,
     float attn_scale,
     int conv_state_len,
-    int64_t conv_stride0,
-    int64_t ssm_stride0,
+    int64_t conv_stride0, int64_t conv_rows,
+    int64_t ssm_stride0, int64_t ssm_rows,
     nd_item<3>& ndi)
 {
     slm_init<2048>();
@@ -194,13 +198,27 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
     // kernel skips such a sequence without touching either cache.
     const int init_ssm_state_idx =
         spec_state_indices_ptr[state_row + init_col];
-    if (init_ssm_state_idx <= 0) {
+    if (init_ssm_state_idx < 0 || init_ssm_state_idx >= ssm_rows) {
+        // Both outputs are declared mutable and the caller allocates them with
+        // empty(), so returning here would hand back the allocation untouched.
+        const int vi0_null = tid * 2;
+        for (int t = 0; t < num_spec_tokens; ++t) {
+            const int global_t = token_indx_ptr[state_row + t];
+            const int64_t row = (int64_t)global_t * HV * gdn_V +
+                (int64_t)hv * gdn_V;
+            block_store<fp16, 2>(output_ptr + row + vi0_null,
+                                 simd<fp16, 2>(fp16(0)));
+            if (tid < 2) {
+                block_store<fp16, 64>(z_out_ptr + row + tid * 64,
+                                      simd<fp16, 64>(fp16(0)));
+            }
+        }
         return;
     }
     const int init_conv_state_idx = spec_state_indices_ptr[
         state_row + (packed_conv_state ? 0 : init_col)];
     fp16* init_conv_state = nullptr;
-    if (init_conv_state_idx > 0) {
+    if (init_conv_state_idx >= 0 && init_conv_state_idx < conv_rows) {
         init_conv_state =
             conv_state_ptr + (int64_t)init_conv_state_idx * conv_stride0 +
             (packed_conv_state ? (int64_t)init_col * dim : 0);
@@ -279,7 +297,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
         const int conv_save_state_idx = packed_conv_state
             ? spec_state_indices_ptr[state_row]
             : save_state_idx;
-        if (conv_save_state_idx > 0) {
+        if (conv_save_state_idx >= 0 && conv_save_state_idx < conv_rows) {
             fp16* save_state =
                 conv_state_ptr +
                 (int64_t)conv_save_state_idx * conv_stride0;
@@ -387,7 +405,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
         simd<float, 2> o_acc = gdn_spec_update_seq<WG_SIZE>(
             q_lo, q_hi, k_lo, k_hi, v_f32, A_log_ptr, dt_bias_ptr,
             ba_ptr, ba_offset, h0_lo, h0_hi, h1_lo, h1_hi, ssm_state_ptr,
-            ssm_stride0, save_state_idx, tid, hv, HV, gdn_K, gdn_V,
+            ssm_stride0, ssm_rows, save_state_idx, tid, hv, HV, gdn_K, gdn_V,
             attn_scale);
 
         fp16* out = output_ptr + (int64_t)global_t * HV * gdn_V +
@@ -440,8 +458,8 @@ inline void gdn_conv_fused_seq_spec_host(
     int V,
     float scale,
     int conv_state_len,
-    int64_t conv_stride0,
-    int64_t ssm_stride0,
+    int64_t conv_stride0, int64_t conv_rows,
+    int64_t ssm_stride0, int64_t ssm_rows,
     sycl::queue& q)
 {
     TORCH_CHECK(H == 8 && (HV == 16 || HV == 24) && K == 128 && V == 128,
@@ -467,7 +485,7 @@ inline void gdn_conv_fused_seq_spec_host(
                 ssm_state_ptr, output_ptr, z_out_ptr, token_indx_ptr,
                 num_accepted_tokens_ptr, num_spec_decodes, num_spec_tokens,
                 H, HV, K, V, scale, conv_state_len, conv_stride0,
-                ssm_stride0, ndi);
+                conv_rows, ssm_stride0, ssm_rows, ndi);
         });
     });
 }

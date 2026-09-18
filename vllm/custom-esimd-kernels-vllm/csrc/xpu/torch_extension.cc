@@ -187,21 +187,21 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.impl("esimd_fused_add_rms_norm_batched", torch::kXPU, &esimd_fused_add_rms_norm_batched);
 
   m.def("esimd_norm_gemv_norm_fp16(Tensor residual, Tensor scale_with_root, "
-        "Tensor proj_w, Tensor pre_ff_w, Tensor router_logits, Tensor moe_input, "
+        "Tensor proj_w, Tensor pre_ff_w, Tensor(a!) router_logits, Tensor(b!) moe_input, "
         "float eps) -> ()");
   m.impl("esimd_norm_gemv_norm_fp16", torch::kXPU, &esimd_norm_gemv_norm_fp16);
 
-  m.def("esimd_scaled_resadd_norm_gemv_fp8_pert(Tensor hidden_states, Tensor residual, "
-        "Tensor norm_weight, Tensor qkv_weight, Tensor qkv_scale, Tensor qkv_out, "
+  m.def("esimd_scaled_resadd_norm_gemv_fp8_pert(Tensor hidden_states, Tensor(a!) residual, "
+        "Tensor norm_weight, Tensor qkv_weight, Tensor qkv_scale, Tensor(b!) qkv_out, "
         "float eps, float scalar) -> ()");
   m.impl("esimd_scaled_resadd_norm_gemv_fp8_pert", torch::kXPU, &esimd_scaled_resadd_norm_gemv_fp8_pert);
 
-  m.def("esimd_norm_add_norm(Tensor h2_raw, Tensor h1, Tensor w1, Tensor w2, "
-        "Tensor out, float eps1, float eps2) -> ()");
+  m.def("esimd_norm_add_norm(Tensor h2_raw, Tensor(a!) h1, Tensor w1, "
+        "Tensor w2, Tensor(b!) out, float eps1, float eps2) -> ()");
   m.impl("esimd_norm_add_norm", torch::kXPU, &esimd_norm_add_norm);
 
-  m.def("esimd_accum_norm_add_norm(Tensor routed_output, Tensor h1, "
-        "Tensor w1, Tensor w2, Tensor out, int top_k, "
+  m.def("esimd_accum_norm_add_norm(Tensor routed_output, Tensor(a!) h1, "
+        "Tensor w1, Tensor w2, Tensor(b!) out, int top_k, "
         "float eps1, float eps2) -> ()");
   m.impl("esimd_accum_norm_add_norm", torch::kXPU, &esimd_accum_norm_add_norm);
 

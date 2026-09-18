@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 
 #include "int4_GEMV.h"
 #include "utils.h"
@@ -24,8 +25,11 @@ struct ResAddRMSNorm_int4_kernel {
     float eps;
 
     void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
+        // The stores are full-width, so the loop must stop at the last whole
+        // chunk; the host rejects a K that would leave a residue.
+        const int k_end = (K / VL) * VL;
         float sum_sq = 0.0f;
-        for (int offset = 0; offset < K; offset += VL) {
+        for (int offset = 0; offset < k_end; offset += VL) {
             simd<float, VL> hidden = block_load<fp16, VL>(hidden_ptr + offset);
             simd<float, VL> residual = block_load<fp16, VL>(residual_ptr + offset);
             simd<float, VL> added = hidden + residual;
@@ -35,7 +39,7 @@ struct ResAddRMSNorm_int4_kernel {
 
         float inv_rms = sycl::ext::intel::esimd::rsqrt(
             simd<float, 8>(sum_sq / static_cast<float>(K) + eps))[0];
-        for (int offset = 0; offset < K; offset += VL) {
+        for (int offset = 0; offset < k_end; offset += VL) {
             simd<float, VL> residual = block_load<fp16, VL>(residual_ptr + offset);
             simd<float, VL> weight = block_load<fp16, VL>(norm_w_ptr + offset);
             simd<float, VL> normed = residual * inv_rms * weight;
@@ -57,6 +61,11 @@ inline void resadd_norm_gemv_int4_pert_host(
                 ResAddRMSNorm_int4_kernel<V>{ \
                     hidden_ptr, residual_ptr, norm_w_ptr, normed_out, K, eps}); \
         });
+
+    // The kernel stores whole VL-wide chunks, and the narrowest arm is 128.
+    TORCH_CHECK(K % 128 == 0,
+                "resadd_norm_gemv_int4_pert: K must be a multiple of 128, got K=",
+                K);
 
     if      (K % 512 == 0) { LAUNCH_RESADD_NORM(512) }
     else if (K % 256 == 0) { LAUNCH_RESADD_NORM(256) }

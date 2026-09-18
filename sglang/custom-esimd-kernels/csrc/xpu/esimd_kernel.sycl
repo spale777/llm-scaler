@@ -7,6 +7,7 @@
 #include <sycl/sycl.hpp>
 
 #include "esimd_kernels/fp8_GEMV_v2.h"
+#include "esimd_kernels/fp8_GEMV_bmg.h"
 #include "esimd_kernels/dual_rmsnorm_residual_scalar.h"
 #include "esimd_kernels/qkv_split_norm_rope.h"
 #include "esimd_kernels/norm_gemv_fused.h"
@@ -95,6 +96,23 @@ at::Tensor esimd_gemv_fp8_pert(
     EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
     auto& dpcpp_queue = get_device_queue(input);
     GEMV_fp8_pert_host(p_in, p_w, p_sc, p_out, N, K, get_fp8_mode(weight), dpcpp_queue);
+    return output;
+}
+
+// BMG-tuned FP8 GEMV: VL_BIG=256 with a masked tail, so it serves any K the
+// v2 ladder can only split narrowly.
+at::Tensor esimd_gemv_fp8_pert_bmg(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1);
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_fp8_pert_bmg_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const uint8_t*>(weight.data_ptr()),
+        weight_scale.data_ptr<float>(),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        (uint32_t)N, (uint32_t)K, get_fp8_mode(weight), dpcpp_queue);
     return output;
 }
 
@@ -937,9 +955,9 @@ void esimd_resadd_norm_gemv_q8_ba(
         reinterpret_cast<int8_t*>(w0.data_ptr()),
         reinterpret_cast<const fp16*>(s0.data_ptr()),
         reinterpret_cast<fp16*>(o0.data_ptr()),
-        nullptr, (float)eps, M, hidden, E, (int)w0.size(0), dpcpp_queue);
+        reinterpret_cast<fp16*>(p_xn), (float)eps, M, hidden, E,
+        (int)w0.size(0), dpcpp_queue);
     TORCH_CHECK(ok, "esimd_resadd_norm_gemv_q8_ba: unsupported hidden ", hidden);
-    (void)p_xn;
 }
 
 #include "esimd_kernels/resadd_norm_gemv_kq.h"
@@ -1161,6 +1179,12 @@ void esimd_norm_gemv_q8_0(
     TORCH_CHECK(HV > 0 && x.size(0) % HV == 0,
                 "esimd_norm_gemv_q8_0: rows ", x.size(0), " not a multiple of HV ", HV);
     const int M = (int)(x.size(0) / HV);
+    // An empty x passes the divisibility check above (0 % HV == 0) and the host
+    // then returns false on M < 1, so the refusal below would blame V and HV
+    // instead of the row count.
+    TORCH_CHECK(M >= 1,
+                "esimd_norm_gemv_q8_0: x has ", x.size(0), " rows, which is "
+                "fewer than one group of HV=", HV);
 
     const bool ok = gdn_norm_gated_q8_host(
         reinterpret_cast<const fp16*>(p_x), reinterpret_cast<const fp16*>(p_z),
@@ -1169,7 +1193,13 @@ void esimd_norm_gemv_q8_0(
         reinterpret_cast<const fp16*>(s0.data_ptr()),
         reinterpret_cast<fp16*>(o0.data_ptr()),
         (float)eps, (int)HV, (int)V, (int)w0.size(0), M, dpcpp_queue);
-    TORCH_CHECK(ok, "esimd_norm_gemv_q8_0: unsupported head_v_dim ", V);
+    // `ok` is false from either switch -- V's, or the inner HV one, which
+    // serves only {2,4,8,16,32} -- so the message must name both axes. The
+    // caller sets a sticky off-flag and never retries.
+    TORCH_CHECK(ok, "esimd_norm_gemv_q8_0: no kernel for head_v_dim=", V,
+                " with num_v_heads=", HV,
+                " (head_v_dim must be 64/128/256 and num_v_heads one of "
+                "2/4/8/16/32)");
 }
 
 // Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input vector.
@@ -1218,11 +1248,22 @@ at::Tensor esimd_qkv_split_norm_rope(
     EXTRACT_PTR(p_v, v_out);
     EXTRACT_PTR(p_nwq, norm_wq);
     EXTRACT_PTR(p_nwk, norm_wk);
+    // positions is reinterpreted as uint32; an int64 tensor reads pairwise,
+    // giving every other token the wrong rotation. The _onyx siblings branch
+    // on the dtype instead.
+    TORCH_CHECK(positions.scalar_type() == at::kInt,
+                "qkv_split_norm_rope: positions must be int32, got ",
+                positions.scalar_type());
+    TORCH_CHECK(positions.is_contiguous(),
+                "qkv_split_norm_rope: positions must be contiguous");
     auto p_pos = reinterpret_cast<uint32_t*>(positions.data_ptr());
     // cos_sin_cache: [max_pos, rotary_dim] fp16, interleaved [cos, sin] per position
     auto p_cs = reinterpret_cast<sycl::half*>(cos_sin_cache.data_ptr());
 
     uint32_t ntoks = qkv_state.size(0);
+    TORCH_CHECK(positions.numel() >= ntoks,
+                "qkv_split_norm_rope: positions holds ", positions.numel(),
+                " entries for ", ntoks, " tokens");
     uint32_t hiddenDim = qkv_state.size(1);
 
     auto& dpcpp_queue = get_device_queue(qkv_state);
@@ -1256,7 +1297,16 @@ at::Tensor esimd_resadd_norm_gemv_fp8_pert(
     // no crash, no NaN, just quietly wrong numbers. Fail loudly instead.
     TORCH_CHECK(K % 512 == 0,
                 "esimd_resadd_norm_gemv_fp8_pert: K must be a multiple of 512, got K=", K);
+    // No K bound here: the kernel streams and its grid is K-independent.
+    TORCH_CHECK(K <= 8192,
+                "esimd_resadd_norm_gemv_fp8_pert: K must be <= 8192, got K=", K);
 
+    // normed_out must not alias residual: pass 2 re-loads residual from L3
+    // while only work-group 0 writes normed_out, with no ordering against the
+    // other work-groups' loads.
+    TORCH_CHECK(normed_out.data_ptr() != residual.data_ptr(),
+                "resadd_norm_gemv: normed_out must not alias residual; "
+                "work-group 0's store races every other group's read");
     auto& dpcpp_queue = get_device_queue(hidden_states);
 
     resadd_norm_gemv_fp8_pert_host(
@@ -1342,6 +1392,12 @@ at::Tensor esimd_resadd_norm_gemv_int4_pert(
 {
     int N = (int)gemv_weight.size(0);
     int K = (int)hidden_states.size(1);
+    // normed_out must not alias residual: pass 2 re-loads residual from L3
+    // while only work-group 0 writes normed_out, with no ordering against the
+    // other work-groups' loads.
+    TORCH_CHECK(normed_out.data_ptr() != residual.data_ptr(),
+                "resadd_norm_gemv: normed_out must not alias residual; "
+                "work-group 0's store races every other group's read");
     auto& dpcpp_queue = get_device_queue(hidden_states);
 
     resadd_norm_gemv_int4_pert_host(
@@ -1377,6 +1433,12 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
 
     fp16* new_residual_ptr = new_residual.defined()
         ? reinterpret_cast<fp16*>(new_residual.data_ptr()) : nullptr;
+
+    // Both kernels index w1 with w0's K -- there is a single K field -- so w0
+    // and w1 must share it on every path, M-tiled included.
+    TORCH_CHECK(w1.size(1) == K,
+                "resadd_norm_gemv2: w1 must share w0's K=", K, ", got ",
+                w1.size(1));
 
     // M > 1 (TARGET_VERIFY): use the M-tiled kernel, which dequantises each
     // weight chunk once and reuses it across all M rows.
@@ -1467,6 +1529,28 @@ at::Tensor esimd_rms_norm_gated(
 {
     int rows = (int)x.size(0);
     int V = (int)x.size(1);
+
+    // The kernel's loads and stores are hardwired to 128 elements; V is used
+    // only for the row offset and the mean divisor. V=64 makes rows overlap
+    // and the last row read past the tensor; V=256 leaves half of every row
+    // unwritten while dividing by the full V.
+    TORCH_CHECK(V == 128,
+                "esimd_rms_norm_gated: only a head dim of 128 is supported, "
+                "got ", V);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Half &&
+                    z.scalar_type() == at::ScalarType::Half &&
+                    weight.scalar_type() == at::ScalarType::Half &&
+                    output.scalar_type() == at::ScalarType::Half,
+                "esimd_rms_norm_gated: all tensors must be fp16");
+    TORCH_CHECK(z.sizes() == x.sizes() && output.sizes() == x.sizes(),
+                "esimd_rms_norm_gated: x, z and output must have one shape");
+    TORCH_CHECK(weight.numel() == V,
+                "esimd_rms_norm_gated: weight holds ", weight.numel(),
+                " elements for a head dim of ", V);
+    TORCH_CHECK(x.is_contiguous() && z.is_contiguous() &&
+                    output.is_contiguous() && weight.is_contiguous(),
+                "esimd_rms_norm_gated: tensors must be contiguous");
+
     auto& dpcpp_queue = get_device_queue(x);
 
     rms_norm_gated_host(
@@ -1522,6 +1606,21 @@ at::Tensor esimd_gemv_fp16(
     at::Tensor output) {
     int64_t n = weight.size(0);
     int64_t k = weight.size(1);
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half &&
+                    weight.scalar_type() == at::ScalarType::Half &&
+                    output.scalar_type() == at::ScalarType::Half,
+                "esimd_gemv_fp16: all tensors must be fp16");
+    // The kernel grid is N work-groups with no M dimension: it computes one
+    // row and indexes output[n], so a taller input leaves the rest unwritten.
+    TORCH_CHECK(input.numel() == k,
+                "esimd_gemv_fp16: this kernel computes a single row of ", k,
+                " elements, got ", input.numel());
+    TORCH_CHECK(output.numel() == n,
+                "esimd_gemv_fp16: output must hold ", n, " elements, got ",
+                output.numel());
+    TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() &&
+                    output.is_contiguous(),
+                "esimd_gemv_fp16: tensors must be contiguous");
     auto& queue = get_device_queue(input);
     GEMV_fp16_host(
         reinterpret_cast<const fp16*>(input.data_ptr()),
@@ -1547,14 +1646,21 @@ void esimd_norm_gemv_norm_fp16(
             && router_logits.scalar_type() == at::kHalf
             && moe_input.scalar_type() == at::kHalf,
         "Gemma4 router-fusion tensors must be fp16");
+    // Dim-relative rather than pinned to one hidden size: the caller gate
+    // carries no shape term, so a literal bound aborts the forward pass instead
+    // of falling back. N and K come from proj_weight, and the kernel walks
+    // every other tensor over exactly that range.
+    const int n_experts = static_cast<int>(proj_weight.size(0));
+    const int hidden = static_cast<int>(proj_weight.size(1));
     TORCH_CHECK(
-        residual.numel() == 2816
-            && scale_with_root.numel() == 2816
-            && proj_weight.sizes() == at::IntArrayRef({128, 2816})
-            && pre_ff_weight.numel() == 2816
-            && router_logits.numel() == 128
+        residual.numel() == hidden
+            && scale_with_root.numel() == hidden
+            && pre_ff_weight.numel() == hidden
+            && router_logits.numel() == n_experts
             && moe_input.sizes() == residual.sizes(),
-        "Gemma4-26B router fusion requires E=128 and H=2816");
+        "Gemma4 router fusion: proj_weight is [", n_experts, ",", hidden,
+        "], so residual/scale_with_root/pre_ff_weight/moe_input must hold ",
+        hidden, " elements and router_logits ", n_experts);
     TORCH_CHECK(
         residual.is_contiguous()
             && scale_with_root.is_contiguous()
@@ -1627,6 +1733,15 @@ void esimd_norm_add_norm_gemv_gelu_fp8(
             && residual_output.is_contiguous()
             && activation_output.is_contiguous(),
         "Gemma4 dense-fusion tensors must be contiguous");
+    // residual_output must not alias residual_input. One work-group per
+    // intermediate column reads the whole residual row while only
+    // output_idx == 0 writes it, and there is no cross-work-group ordering (a
+    // SYCL barrier is work-group local). Loop 3 re-reads the same buffer after
+    // that store, so aliasing silently gives each column a different divisor.
+    TORCH_CHECK(residual_output.data_ptr() != residual_input.data_ptr(),
+                "esimd_norm_add_norm_gemv_gelu_fp8: residual_output must not "
+                "alias residual_input; the cross-work-group residual update has "
+                "no ordering against the other work-groups' reads");
     auto& queue = get_device_queue(attention_output);
     norm_add_norm_gemv_gelu_fp8_host(
         reinterpret_cast<const fp16*>(attention_output.data_ptr()),
@@ -1760,6 +1875,20 @@ void esimd_norm_add_norm(
     double eps1,
     double eps2) {
     int k = static_cast<int>(h2_raw.size(-1));
+    // The kernel is a single work-item indexed only by K: it writes one row.
+    TORCH_CHECK(h2_raw.numel() == k && h1.numel() == k && out.numel() == k,
+                "esimd_norm_add_norm: expects a single row of ", k,
+                " elements, got h2_raw=", h2_raw.numel(),
+                " h1=", h1.numel(), " out=", out.numel());
+    TORCH_CHECK(h2_raw.scalar_type() == at::ScalarType::Half &&
+                    h1.scalar_type() == at::ScalarType::Half &&
+                    w1.scalar_type() == at::ScalarType::Half &&
+                    w2.scalar_type() == at::ScalarType::Half &&
+                    out.scalar_type() == at::ScalarType::Half,
+                "esimd_norm_add_norm: all tensors must be fp16");
+    // Every VL arm walks K in whole chunks with no tail.
+    TORCH_CHECK(k % 64 == 0,
+                "esimd_norm_add_norm: K must be a multiple of 64, got K=", k);
     auto& queue = get_device_queue(h2_raw);
     norm_add_norm_host(
         reinterpret_cast<const fp16*>(h2_raw.data_ptr()),
@@ -1829,6 +1958,10 @@ void xpu_create_kv_indices(
     const int* kv_start_idx_ptr = kv_start_idx.data_ptr<int>();
     int* kv_indices_ptr = kv_indices.data_ptr<int>();
     const int64_t req_stride = req_to_token.stride(0);
+    // kv_indptr holds device-side offsets; a stale or over-long one would
+    // scatter past the end of kv_indices.
+    const int64_t kv_indices_numel = kv_indices.numel();
+    const int64_t req_rows = req_to_token.size(0);
     auto& queue = get_device_queue(req_to_token);
     queue.parallel_for<XpuCreateKvIndicesKernel>(
         sycl::range<1>(batch_size * max_len), [=](sycl::id<1> item) {
@@ -1842,7 +1975,14 @@ void xpu_create_kv_indices(
                ? req_pool_indices_i64[row]
                : req_pool_indices_i32[row];
            const int start = has_start ? kv_start_idx_ptr[row] : 0;
-           kv_indices_ptr[kv_indptr_ptr[row] + offset] =
+           if (req < 0 || req >= req_rows) {
+               return;
+           }
+           const int64_t dst = (int64_t)kv_indptr_ptr[row] + offset;
+           if (dst < 0 || dst >= kv_indices_numel) {
+               return;
+           }
+           kv_indices_ptr[dst] =
                req_to_token_ptr[
                    req * req_stride + start + offset];
         });
@@ -1856,6 +1996,31 @@ void esimd_kv_scatter(
     at::Tensor indices) {
     int tokens = static_cast<int>(k.size(0));
     int row_dim = static_cast<int>(k.size(-1));
+
+    TORCH_CHECK(k.scalar_type() == at::ScalarType::Half &&
+                    v.scalar_type() == at::ScalarType::Half &&
+                    k_cache.scalar_type() == at::ScalarType::Half &&
+                    v_cache.scalar_type() == at::ScalarType::Half,
+                "esimd_kv_scatter: k, v and both caches must be fp16");
+    // indices is read as int64 by the kernel.
+    TORCH_CHECK(indices.scalar_type() == at::kLong,
+                "esimd_kv_scatter: indices must be int64, got ",
+                indices.scalar_type());
+    TORCH_CHECK(indices.numel() >= tokens,
+                "esimd_kv_scatter: indices holds ", indices.numel(),
+                " entries for ", tokens, " tokens");
+    TORCH_CHECK(v.size(0) == tokens && v.size(-1) == row_dim,
+                "esimd_kv_scatter: k and v must have the same shape");
+    TORCH_CHECK(k_cache.size(-1) == row_dim && v_cache.size(-1) == row_dim,
+                "esimd_kv_scatter: cache row is ", k_cache.size(-1),
+                " but k row is ", row_dim);
+    // The narrowest arm is VL=32 and the kernel copies whole chunks.
+    TORCH_CHECK(row_dim % 32 == 0,
+                "esimd_kv_scatter: row_dim must be a multiple of 32, got ",
+                row_dim);
+    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous(),
+                "esimd_kv_scatter: caches must be contiguous");
+
     int64_t k_stride = k.stride(0);
     int64_t v_stride = v.stride(0);
     auto& queue = get_device_queue(k);
@@ -1865,7 +2030,7 @@ void esimd_kv_scatter(
         reinterpret_cast<fp16*>(k_cache.data_ptr()),
         reinterpret_cast<fp16*>(v_cache.data_ptr()),
         reinterpret_cast<const int64_t*>(indices.data_ptr()),
-        tokens, row_dim, k_stride, v_stride, queue);
+        tokens, row_dim, k_cache.numel() / row_dim, k_stride, v_stride, queue);
 }
 
 at::Tensor esimd_rmsnorm_residual_scalar(
@@ -1876,6 +2041,24 @@ at::Tensor esimd_rmsnorm_residual_scalar(
     double eps,
     double scalar) {
     int k = static_cast<int>(x.size(-1));
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Half &&
+                    weight.scalar_type() == at::ScalarType::Half &&
+                    residual.scalar_type() == at::ScalarType::Half &&
+                    output.scalar_type() == at::ScalarType::Half,
+                "esimd_rmsnorm_residual_scalar: all tensors must be fp16");
+    // The kernel is a single work-item over one row, walking K in whole
+    // VL=256 chunks with no tail.
+    // The kernel block_loads weight across all of k, so it must be k long.
+    TORCH_CHECK(x.numel() == k && output.numel() == k && residual.numel() == k
+                    && weight.numel() == k,
+                "esimd_rmsnorm_residual_scalar: expects a single row of ", k,
+                " elements");
+    TORCH_CHECK(k % 256 == 0,
+                "esimd_rmsnorm_residual_scalar: K must be a multiple of 256, "
+                "got ", k);
+    TORCH_CHECK(x.is_contiguous() && output.is_contiguous() &&
+                    residual.is_contiguous() && weight.is_contiguous(),
+                "esimd_rmsnorm_residual_scalar: tensors must be contiguous");
     auto& queue = get_device_queue(x);
     rmsnorm_residual_scalar_host(
         reinterpret_cast<const fp16*>(x.data_ptr()),

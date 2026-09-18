@@ -271,6 +271,11 @@ inline bool resadd_norm_gemv_kq_mt_host(
     const fp16* wf, fp16* of, int ldf, int off,
     float eps, int M, int K, int N4, int N6, int NF, sycl::queue& q) {
     if (K % RNQM_VL != 0) return false;
+    // `nr` must not alias `res`: every work-group reads the whole residual row
+    // but only block 0 writes the updated one, so an in-place buffer lets block
+    // 0's stores race the other blocks' loads, giving a per-work-group rstd.
+    // No barrier can order it -- a SYCL barrier is work-group local.
+    if (nr == res) return false;
     if (M < 2) return false;                       // M == 1 uses the plain kernel
     if ((long)M * K * (long)sizeof(fp16) + RNQM_WGS * (long)sizeof(float) >
         RNQM_SLM_MAX)

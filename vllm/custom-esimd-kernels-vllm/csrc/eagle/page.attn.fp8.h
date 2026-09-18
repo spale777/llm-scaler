@@ -433,7 +433,14 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
   int kvHeadIdx = globalLinearId1 / gqaGroups;
   int qGroupIdx = globalLinearId1 % gqaGroups;
   uint32_t kvSeqLen = batchKvSeqLen[batchIdx];
+  // pTempOut is strided by reduceCount, from the host's longestBatch hint,
+  // while groupIdx follows this batch's device-side seq_len, so the group count
+  // must be bounded by what was allocated.
   int kvSeqOutGroup = (kvSeqLen + 1023) >> 10;
+  {
+    int allocatedGroups = (int)((longestBatch + 1023) >> 10);
+    if (kvSeqOutGroup > allocatedGroups) kvSeqOutGroup = allocatedGroups;
+  }
   uint32_t pageTableSize = 1 << pageTableSizeLog2;
   uint32_t pageTableLoopMask = (1 << pageTableSizeLog2) - 1;
   uint32_t pageTableBase = pageTableBatchStride * batchIdx;
@@ -972,7 +979,14 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase2Fp8(
   int batchIdx = globalLinearId2;
   int kvHeadIdx = globalLinearId1;                   // one work-group per kv-head
   uint32_t kvSeqLen = batchKvSeqLen[batchIdx];
+  // pTempOut is strided by reduceCount, from the host's longestBatch hint,
+  // while groupIdx follows this batch's device-side seq_len, so the group count
+  // must be bounded by what was allocated.
   int kvSeqOutGroup = (kvSeqLen + 1023) >> 10;
+  {
+    int allocatedGroups = (int)((longestBatch + 1023) >> 10);
+    if (kvSeqOutGroup > allocatedGroups) kvSeqOutGroup = allocatedGroups;
+  }
   uint32_t pageTableSize = 1 << pageTableSizeLog2;
   uint32_t pageTableLoopMask = (1 << pageTableSizeLog2) - 1;
   uint32_t pageTableBase = pageTableBatchStride * batchIdx;

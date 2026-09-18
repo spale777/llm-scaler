@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* fused_add_rms_norm_batched.h — Batched Fused residual add + RMSNorm.
  *
  * Multi-row version of fused_add_rms_norm.h:
@@ -39,8 +40,7 @@ struct FusedAddRmsNorm_batched_kernel {
 
             block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
 
-            // VL-generic pairwise tree (the previous hand-rolled version
-            // started at select<256> and so was only valid for VL == 512).
+            // VL-generic pairwise tree.
             sum_sq += sycl::ext::intel::esimd::detail::sum<float, float, VL>(added * added);
         }
 
@@ -62,6 +62,13 @@ inline void fused_add_rms_norm_batched_host(
     fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
     int rows, int K, float eps, sycl::queue& q)
 {
+    // The kernel walks K in whole VL-wide chunks with no tail, so VL must
+    // divide K and the narrowest arm is 64. A remainder would be summed short
+    // while dividing by the full K, and left stale in hidden and residual.
+    TORCH_CHECK(K % 64 == 0,
+                "fused_add_rms_norm_batched: K must be a multiple of 64, got K=",
+                K);
+
     #define LAUNCH_FARNB(V)                                                   \
         q.submit([&](sycl::handler& cgh) {                                    \
             cgh.parallel_for(                                                 \

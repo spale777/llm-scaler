@@ -105,7 +105,7 @@ if ! is_docker; then
   GRUB_FILE="/etc/default/grub"
   if [ -f "$GRUB_FILE" ]; then
     cp "$GRUB_FILE" "${GRUB_FILE}.bak"
-    sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=off"/' "$GRUB_FILE"
+    sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_iommu=on iommu=pt"/' "$GRUB_FILE"
     update-grub 2>&1 | tee -a "$LOGFILE"
     log_info "Disabled IOMMU in GRUB and updated configuration."
   else

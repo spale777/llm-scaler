@@ -61,6 +61,15 @@ SYCL_ESIMD_FUNCTION inline T h_min(simd<T, N> v) {
     }
 }
 
+// Xe2 vector engines are SIMD16-native, so a one-work-item group leaves most
+// issue slots idle. These kernels are row-parallel with no SLM or barriers, so
+// the group width is free; the global range is rounded up and every kernel
+// bounds-checks its own index.
+static constexpr size_t MOE_WG = 16;
+static inline size_t round_up_wg(size_t n) {
+    return ((n + MOE_WG - 1) / MOE_WG) * MOE_WG;
+}
+
 // ============================================================================
 // MoE Auxiliary Ops: TopK, Scatter, SiLU_and_Mul, Gather
 //
@@ -116,7 +125,7 @@ struct MoE_TopK_V2_Kernel {
         static_assert(TOPK <= 16, "TOPK must be <= 16");
         constexpr int C = 64;  // chunk size
 
-        int row = item.get_group(0);
+        int row = (int)item.get_global_id(0);
         if (row >= T) return;
 
         const fp16* row_ptr = router_logits + (size_t)row * NUM_EXPERTS;
@@ -225,7 +234,7 @@ inline void moe_topk_v2_host(
 {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>({(size_t)T}, {1}),
+            sycl::nd_range<1>({round_up_wg((size_t)T)}, {MOE_WG}),
             MoE_TopK_V2_Kernel<NUM_EXPERTS, TOPK>{logits, values, indices, T});
     });
 }
@@ -285,7 +294,7 @@ struct MoE_TopK_Kernel {
         constexpr int NUM_EXPERTS = 128;
         constexpr int TOPK = 8;
 
-        int row = item.get_group(0);
+        int row = (int)item.get_global_id(0);
         if (row >= T) return;
 
         // Load 128 fp16 → fp32
@@ -371,7 +380,7 @@ inline void moe_topk_host(
 {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>({(size_t)T}, {1}),
+            sycl::nd_range<1>({round_up_wg((size_t)T)}, {MOE_WG}),
             MoE_TopK_Kernel{logits, values, indices, T});
     });
 }
@@ -386,10 +395,11 @@ struct MoE_Scatter_Kernel {
     const int32_t* sorted_token_ids; // [T*topk]
     fp16* scattered_hidden;         // [T*topk, K]
     fp16* scattered_weights;        // [T*topk]
-    int K, topk;
+    int K, topk, total_expanded;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        int dest_pos = item.get_group(0);
+        int dest_pos = (int)item.get_global_id(0);
+        if (dest_pos >= total_expanded) return;
 
         simd<int32_t, 1> enc = block_load<int32_t, 1>(sorted_token_ids + dest_pos);
         int encoded = enc[0];
@@ -419,10 +429,10 @@ inline void moe_scatter_host(
 {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>({(size_t)total_expanded}, {1}),
+            sycl::nd_range<1>({round_up_wg((size_t)total_expanded)}, {MOE_WG}),
             MoE_Scatter_Kernel{hidden, top_values, sorted_ids,
                                scattered_hidden, scattered_weights,
-                               K, topk});
+                               K, topk, total_expanded});
     });
 }
 
@@ -438,15 +448,24 @@ struct MoE_Scatter_Init_Kernel {
     const int32_t* top_indices;         // [T, topk]
     int32_t* experts_token_count;       // [num_experts] — zero-initialized
     int32_t* token_to_scatter_offset;   // [T*topk] output
-    int T, topk;
+    int T, topk, num_experts;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        int t = item.get_group(0);
+        int t = (int)item.get_global_id(0);
         if (t >= T) return;
 
         // Process each top-k slot individually (supports any topk value)
         for (int k = 0; k < topk; k++) {
             int expert_id = *(top_indices + (size_t)t * topk + k);
+            // expert_id comes straight from a caller tensor; cast to uint32_t
+            // a negative wraps far out of range and the atomic_add below
+            // writes there.
+            // `continue`, not `return`: a return abandons this token's
+            // remaining top-k slots. -1 marks the slot for the Copy kernel.
+            if (expert_id < 0 || expert_id >= num_experts) {
+                *(token_to_scatter_offset + (size_t)t * topk + k) = -1;
+                continue;
+            }
 
             simd<uint32_t, 1> byte_off((uint32_t)expert_id * (uint32_t)sizeof(int32_t));
             simd<int32_t, 1> val(1);
@@ -469,10 +488,16 @@ struct MoE_Scatter_Prefix_Kernel {
         int32_t max_count = 0;
 
         for (int base = 0; base < num_experts; base += 32) {
-            simd<int32_t, 32> counts = block_load<int32_t, 32>(
-                experts_token_count + base);
+            // num_experts need not be a multiple of 32.
+            const int valid = (num_experts - base) < 32 ? (num_experts - base) : 32;
+            simd<uint32_t, 32> lane(0, 1);
+            simd_mask<32> m = lane < (uint32_t)valid;
+            simd<int32_t, 32> counts = gather<int32_t, 32>(
+                experts_token_count + base, lane * (uint32_t)sizeof(int32_t), m);
+            counts.merge(0, !m);
             #pragma unroll
             for (int i = 0; i < 32; i++) {
+                if (i >= valid) break;
                 int32_t c = counts[i];
                 if (c > max_count) max_count = c;
                 simd<uint32_t, 1> val = running_sum;
@@ -496,14 +521,26 @@ struct MoE_Scatter_Copy_Kernel {
     fp16* scattered_hidden;             // [T*topk, K]
     fp16* scattered_weights;            // [T*topk]
     int32_t* topk_ids;                  // [T*topk] output — reverse map for Gather
-    int K, topk;
+    int K, topk, T, num_experts;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        int t = item.get_group(0);
+        int t = (int)item.get_global_id(0);
+        if (t >= T) return;
 
         for (int k = 0; k < topk; k++) {
             int expert_id = *(top_indices + (size_t)t * topk + k);
             int offset = *(token_to_scatter_offset + (size_t)t * topk + k);
+
+            // Same unchecked expert_id as the Init kernel, here feeding a
+            // write index into scattered_hidden and scattered_weights.
+            // offset < 0 is the slot Init marked skipped; the reverse map is
+            // marked too, so consumers of topk_ids see the skip.
+            if (expert_id < 0 || expert_id >= num_experts || offset < 0) {
+                simd<int32_t, 1> skip;
+                skip[0] = -1;
+                block_store<int32_t, 1>(topk_ids + (size_t)t * topk + k, skip);
+                continue;
+            }
 
             simd<uint32_t, 1> es = block_load<uint32_t, 1>(expert_start + expert_id);
             int dp = (int)es[0] + offset;
@@ -544,9 +581,10 @@ inline void moe_scatter_fused_host(
     // Kernel 1: Atomic counting — T WGs
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>({(size_t)T}, {1}),
+            sycl::nd_range<1>({round_up_wg((size_t)T)}, {MOE_WG}),
             MoE_Scatter_Init_Kernel{top_indices, experts_token_count,
-                                     token_to_scatter_offset, T, topk});
+                                     token_to_scatter_offset, T, topk,
+                                     num_experts});
     });
 
     // Kernel 2: Prefix-sum — 1 WG, 1 thread
@@ -560,11 +598,12 @@ inline void moe_scatter_fused_host(
     // Kernel 3: Copy + build topk_ids — T WGs
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>({(size_t)T}, {1}),
+            sycl::nd_range<1>({round_up_wg((size_t)T)}, {MOE_WG}),
             MoE_Scatter_Copy_Kernel{hidden, top_values, top_indices,
                                      token_to_scatter_offset, expert_start,
                                      scattered_hidden, scattered_weights,
-                                     topk_ids, K, topk});
+                                     topk_ids, K, topk, T,
+                                     num_experts});
     });
 }
 
@@ -581,7 +620,7 @@ struct MoE_SiLU_Mul_Kernel {
     int total_rows;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        int row = item.get_group(0);
+        int row = (int)item.get_global_id(0);
         if (row >= total_rows) return;
 
         const fp16* row_in = input + (size_t)row * N_gate_up;
@@ -615,7 +654,7 @@ inline void moe_silu_mul_host(
 {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>({(size_t)total_rows}, {1}),
+            sycl::nd_range<1>({round_up_wg((size_t)total_rows)}, {MOE_WG}),
             MoE_SiLU_Mul_Kernel{input, output, N_gate_up, N_half, total_rows});
     });
 }
@@ -629,18 +668,28 @@ struct MoE_Gather_Kernel {
     const int32_t* topk_ids;        // [T, topk] → positions in scattered array
     const fp16* scattered_weights;  // [T*topk]
     fp16* final_hidden;             // [T, K]
-    int K, topk;
+    int K, topk, T;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        int t = item.get_group(0);
+        int t = (int)item.get_global_id(0);
+        if (t >= T) return;
         constexpr int CHUNK = 128;
         constexpr int MAX_TOPK = 32;
 
-        // Load positions and weights (scalar loop, supports any topk)
+        // Load positions and weights; the host bounds topk to MAX_TOPK.
         int ids[MAX_TOPK];
         float wts[MAX_TOPK];
-        for (int k = 0; k < topk; k++) {
+        const int topk_c = topk < MAX_TOPK ? topk : MAX_TOPK;
+        for (int k = 0; k < topk_c; k++) {
             ids[k] = *(topk_ids + (size_t)t * topk + k);
+            // -1 marks a slot the scatter refused; `(size_t)(-1)` is SIZE_MAX,
+            // so it must not reach an offset. Contribute nothing and read
+            // row 0, which is always allocated.
+            if (ids[k] < 0) {
+                ids[k] = 0;
+                wts[k] = 0.0f;
+                continue;
+            }
             simd<fp16, 1> wv = block_load<fp16, 1>(scattered_weights + ids[k]);
             fp16 w_scalar = wv[0];
             wts[k] = (float)w_scalar;
@@ -649,7 +698,7 @@ struct MoE_Gather_Kernel {
         // Iterate K chunks: accumulate topk experts per chunk, store immediately
         for (int off = 0; off < K; off += CHUNK) {
             simd<float, CHUNK> acc = 0.0f;
-            for (int k = 0; k < topk; k++) {
+            for (int k = 0; k < topk_c; k++) {
                 float wk = wts[k];
                 simd<fp16, CHUNK> row = block_load<fp16, CHUNK>(
                     moe_output + (size_t)ids[k] * K + off);
@@ -669,9 +718,9 @@ inline void moe_gather_host(
 {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>({(size_t)T}, {1}),
+            sycl::nd_range<1>({round_up_wg((size_t)T)}, {MOE_WG}),
             MoE_Gather_Kernel{moe_output, topk_ids, scattered_weights,
-                              final_hidden, K, topk});
+                              final_hidden, K, topk, T});
     });
 }
 
@@ -688,7 +737,7 @@ struct MoE_GeluTanh_Mul_Kernel {
     int total_rows;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        int row = item.get_group(0);
+        int row = (int)item.get_global_id(0);
         if (row >= total_rows) return;
 
         const fp16* row_in = input + (size_t)row * N_gate_up;
@@ -735,7 +784,7 @@ inline void moe_gelu_tanh_mul_host(
 {
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
-            sycl::nd_range<1>({(size_t)total_rows}, {1}),
+            sycl::nd_range<1>({round_up_wg((size_t)total_rows)}, {MOE_WG}),
             MoE_GeluTanh_Mul_Kernel{input, output, N_gate_up, N_half, total_rows});
     });
 }

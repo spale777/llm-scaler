@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* resadd_norm_gemv_int4.h — Fused ResidualAdd + RMSNorm + INT4 GEMV.
  *
  * INT4 analogue of resadd_norm_gemv_fused.h (FP8 version).
@@ -7,7 +8,8 @@
  *   3. GEMV: output = normed @ dequant(int4_weight^T) (per-block scale)
  *
  * Optimizations (referenced from IPEX and FP8 kernel patterns):
- *   - VL=512 pass 1 with register array caching (eliminates pass 2 re-read)
+ *   - VL=512 pass 1 streams and re-reads residual from L3 in pass 2 (the
+ *     register cache was 16-32 KB of GRF against an ~8 KB budget)
  *   - Vectorized INT4 dequant: byte-level nibble extraction via bit_cast
  *     to uint8, lo/hi split, stride-2 dot product — no scalar loop
  *   - Hierarchical simd reduction for sum-of-squares and dot product
@@ -24,8 +26,8 @@
  *
  * Grid: N work-groups, 1 thread each.
  * Two-pass architecture (mirrors FP8 kernel):
- *   Pass 1 (VL=512): resadd + sum_sq → register array + residual write-back
- *   Pass 2 (VL=512): normalize from registers + 4×128 INT4 dequant GEMV
+ *   Pass 1 (VL=512): resadd + sum_sq (streamed; no register array)
+ *   Pass 2 (VL=512): re-load residual from L3, normalize, 4×128 INT4 GEMV
  */
 
 #pragma once
@@ -33,6 +35,27 @@
 #include <cstdint>
 
 namespace xesimd = sycl::ext::intel::experimental::esimd;
+
+/* Residual-only pre-pass: settles residual_ptr before the N-work-group grid
+ * reads it. */
+struct ResAddResidualOnly_int4_kernel {
+    const fp16* hidden_ptr;
+    fp16*       residual_ptr;
+    int K;
+
+    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
+        constexpr int VL = 512;
+        int k = 0;
+        for (; k + VL <= K; k += VL) {
+            simd<fp16, VL> h = block_load<fp16, VL>(hidden_ptr + k);
+            simd<fp16, VL> r = block_load<fp16, VL>(residual_ptr + k);
+            block_store<fp16, VL>(residual_ptr + k, h + r);
+        }
+        for (; k < K; ++k) {
+            residual_ptr[k] = (fp16)(hidden_ptr[k] + residual_ptr[k]);
+        }
+    }
+};
 
 struct ResAddNormGEMV_int4_pert_kernel {
     fp16*          hidden_ptr;
@@ -58,9 +81,7 @@ struct ResAddNormGEMV_int4_pert_kernel {
         float sum_sq = 0.0f;
         for (int c = 0; c < n_chunks; c++) {
             int off = c * VL;
-            simd<float, VL> hv = block_load<fp16, VL>(hidden_ptr + off);
-            simd<float, VL> rv = block_load<fp16, VL>(residual_ptr + off);
-            simd<float, VL> added = hv + rv;
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + off);
             simd<float, VL> sq = added * added;
             sq.select<64,1>(0) += sq.select<64,1>(64);
             sq.select<32,1>(0) += sq.select<32,1>(32);
@@ -88,13 +109,10 @@ struct ResAddNormGEMV_int4_pert_kernel {
                     xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
                     gemv_weight + (size_t)n * packed_K + (c + 1) * (VL / PACK));
             }
-            simd<float, VL> hv = block_load<fp16, VL>(hidden_ptr + off);
-            simd<float, VL> rv = block_load<fp16, VL>(residual_ptr + off);
-            simd<float, VL> added = hv + rv;
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + off);
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + off);
             simd<float, VL> normed = added * inv_rms * nw;
             if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + off, simd<fp16, VL>(added));
                 block_store<fp16, VL>(normed_out + off, simd<fp16, VL>(normed));
             }
 
@@ -124,24 +142,18 @@ struct ResAddNormGEMV_int4_pert_kernel {
         constexpr int BLOCKS_PER_VL = VL / BLOCK_SIZE;  // 4
         const int packed_K = K / PACK;
         const int num_blocks_per_row = K / BLOCK_SIZE;
+        // n_chunks is not clamped: clamping would silently drop the K tail.
+        // The host bounds K instead.
         const int n_chunks = K / VL;
 
-        // Pass 1: resadd + sum_sq, store to register array
-        simd<float, VL> res_chunks[MAX_CHUNKS];
+        // No register cache: simd<float,512>[8] is 16 KB against a ~8 KB
+        // per-thread GRF budget, which exhausts Level Zero resources. Pass 2
+        // re-loads residual from L3 instead.
         float sum_sq = 0.0f;
 
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + offset);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
-
-            simd<float, VL> added = h + r;
-            res_chunks[c] = added;
-
-            if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
-            }
-
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + offset);
             simd<float, VL> sq = added * added;
             sq.select<256,1>(0) += sq.select<256,1>(256);
             sq.select<128,1>(0) += sq.select<128,1>(128);
@@ -179,7 +191,8 @@ struct ResAddNormGEMV_int4_pert_kernel {
             }
 
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + offset);
-            simd<float, VL> normed = res_chunks[c] * inv_rms * nw;
+            simd<float, VL> res = block_load<fp16, VL>(residual_ptr + offset);
+            simd<float, VL> normed = res * inv_rms * nw;
 
             if (n == 0) {
                 block_store<fp16, VL>(normed_out + offset, simd<fp16, VL>(normed));
@@ -270,9 +283,7 @@ struct ResAddNormGEMV_int4_ksplit_kernel {
         float partial_sq = 0.0f;
         for (int c = 0; c < n_chunks; c++) {
             int off = k_start + c * VL;
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + off);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + off);
-            simd<float, VL> added = h + r;
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + off);
 
             simd<float, VL> sq = added * added;
             sq.select<64,1>(0) += sq.select<64,1>(64);
@@ -313,15 +324,12 @@ struct ResAddNormGEMV_int4_ksplit_kernel {
                     gemv_weight + (size_t)n * packed_K + (k_start + (c + 1) * VL) / PACK);
             }
 
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + off);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + off);
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + off);
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + off);
-            simd<float, VL> added = h + r;
             simd<float, VL> normed = added * inv_rms * nw;
 
             // WG 0: each thread writes its own K-range
             if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + off, simd<fp16, VL>(added));
                 block_store<fp16, VL>(normed_out + off, simd<fp16, VL>(normed));
             }
 
@@ -362,7 +370,8 @@ struct ResAddNormGEMV_int4_ksplit_kernel {
         constexpr int PACKED_PER_VL = VL / PACK;  // 64
         const int packed_K = K / PACK;
         const int num_blocks = K / BLOCK_SIZE;
-        const int n_chunks = k_per_thread / VL;
+        const int n_chunks = (k_per_thread / VL) < MAX_CHUNKS
+                                 ? (k_per_thread / VL) : MAX_CHUNKS;
 
         // ── Pass 1: resadd + sum_sq, cache to register array ──
         simd<float, VL> res_chunks[MAX_CHUNKS];
@@ -370,15 +379,8 @@ struct ResAddNormGEMV_int4_ksplit_kernel {
 
         for (int c = 0; c < n_chunks; c++) {
             int off = k_start + c * VL;
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + off);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + off);
-
-            simd<float, VL> added = h + r;
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + off);
             res_chunks[c] = added;
-
-            if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + off, simd<fp16, VL>(added));
-            }
 
             simd<float, VL> sq = added * added;
             sq.select<256,1>(0) += sq.select<256,1>(256);
@@ -492,6 +494,11 @@ inline void resadd_norm_gemv_int4_pert_host(
     fp16* output, fp16* normed_out,
     int N, int K, float eps, sycl::queue& q)
 {
+    // Every path needs this: BLOCK_SIZE is 128 and all three kernels index
+    // scales per 128-element block.
+    TORCH_CHECK(K % 128 == 0,
+                "resadd_norm_gemv_int4_pert: K must be a multiple of 128, got ", K);
+
     // K_SPLIT: more threads per WG when N is small and K is large.
     // Mirrors fp8_GEMV_v2.h select_vl_ks() thresholds.
     int ks = 1;
@@ -502,8 +509,28 @@ inline void resadd_norm_gemv_int4_pert_host(
     // Safety: k_per_thread must be a multiple of BLOCK_SIZE=128
     while (ks > 1 && (K % (ks * 128) != 0)) ks /= 2;
 
+    // Scoped to ks <= 1 and K >= 512, which is exactly the arm that walks
+    // VL=512: run_large_k_impl's n_chunks = K / 512 has no tail loop, so a
+    // remainder silently drops the end of the row and poisons inv_rms. The
+    // K_SPLIT arms below and the kernel's own K < 512 path (VL=128) are exact
+    // at their own granularities, so a wider bound would refuse shapes they
+    // serve. Ordered before the residual pre-pass so a throw leaves the
+    // caller's residual unmodified and the op retryable.
+    if (ks <= 1 && K >= 512) {
+        TORCH_CHECK(K % 512 == 0,
+                    "resadd_norm_gemv_int4_pert: the single-thread VL=512 path "
+                    "needs K % 512 == 0, got ", K);
+    }
+
+    // Settle residual_ptr before any grid reads it: every kernel below consumes
+    // residual_ptr as the already-added value.
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(1, 1),
+            ResAddResidualOnly_int4_kernel{hidden_ptr, residual_ptr, K});
+    });
+
     if (ks <= 1) {
-        // Original optimized kernel (VL=512 register-cached path)
         q.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(
                 sycl::nd_range<1>(N, 1),

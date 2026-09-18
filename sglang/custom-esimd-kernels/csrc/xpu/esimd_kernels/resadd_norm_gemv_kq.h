@@ -233,6 +233,11 @@ inline bool resadd_norm_gemv_kq_host(
     const fp16* wf, fp16* of, int ldf, int off,
     float eps, int M, int K, int N4, int N6, int NF, sycl::queue& q) {
     if (K % RNQ_VL != 0) return false;
+    // `nr` must not alias `res`: every work-group reads the whole residual row
+    // but only block 0 writes the updated one, so an in-place buffer lets block
+    // 0's stores race the other blocks' loads, giving a per-work-group rstd.
+    // No barrier can order it -- a SYCL barrier is work-group local.
+    if (nr == res) return false;
 
     const int nb4 = (N4 + RNQ_ROWS - 1) / RNQ_ROWS;
     const int nb6 = (N6 + RNQ_ROWS - 1) / RNQ_ROWS;

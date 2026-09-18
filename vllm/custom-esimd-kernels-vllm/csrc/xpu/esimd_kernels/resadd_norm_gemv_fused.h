@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* resadd_norm_gemv_fused.h — Fused ResidualAdd + RMSNorm + FP8 GEMV.
  *
  * Combines three operations into a single kernel:
@@ -61,9 +62,32 @@ SYCL_ESIMD_FUNCTION inline simd<float, VL> fp8_dequant_rng(
  *   Reduce sum_sq → inv_rms
  *   Loop 2 (K/VL iters): normalize stored residual, load weight, FMA
  * ================================================================ */
+/* Residual-only pre-pass: residual[k] = fp16(hidden[k] + residual[k]).
+ * A single work-item, run before the GEMV grid, so residual_ptr is settled by
+ * the time N work-groups start reading it. */
+struct ResAddResidualOnly_kernel {
+    const fp16* hidden_ptr;
+    fp16*       residual_ptr;
+    int K;
+
+    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
+        constexpr int VL = 512;
+        int k = 0;
+        for (; k + VL <= K; k += VL) {
+            simd<fp16, VL> h = block_load<fp16, VL>(hidden_ptr + k);
+            simd<fp16, VL> r = block_load<fp16, VL>(residual_ptr + k);
+            block_store<fp16, VL>(residual_ptr + k, h + r);
+        }
+        // Scalar remainder: K is not guaranteed to be a multiple of VL.
+        for (; k < K; ++k) {
+            residual_ptr[k] = (fp16)(hidden_ptr[k] + residual_ptr[k]);
+        }
+    }
+};
+
 struct ResAddNormGEMV_fp8_pert_kernel {
     fp16*          hidden_ptr;   // [1, K] — input (read-only for this kernel)
-    fp16*          residual_ptr; // [1, K] — updated in-place
+    fp16*          residual_ptr; // [1, K] — pre-updated by ResAddResidualOnly_kernel
     const fp16*    norm_w_ptr;   // [K] — Gemma norm weight (w+1.0)
     const uint8_t* gemv_weight;  // [N, K] FP8
     const float*   gemv_scale;   // [1]
@@ -76,22 +100,16 @@ struct ResAddNormGEMV_fp8_pert_kernel {
     template<int MAX_CHUNKS>
     void run_impl(int n) const SYCL_ESIMD_FUNCTION {
         constexpr int VL = 512;
-        simd<float, VL> res_chunks[MAX_CHUNKS];
         int n_chunks = K / VL;
 
+        // No register cache: a simd<float,VL>[MAX_CHUNKS] array is 16-32 KB of
+        // GRF against a ~8 KB per-thread budget. Pass 2 re-loads residual from
+        // L3, which the pre-pass has already settled.
         float sum_sq = 0.0f;
 
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + offset);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
-
-            simd<float, VL> added = h + r;
-            res_chunks[c] = added;
-
-            if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
-            }
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + offset);
 
             simd<float, VL> sq = added * added;
             sq.select<256,1>(0) += sq.select<256,1>(256);
@@ -114,7 +132,8 @@ struct ResAddNormGEMV_fp8_pert_kernel {
             int offset = c * VL;
 
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + offset);
-            simd<float, VL> normed = res_chunks[c] * inv_rms * nw;
+            simd<float, VL> res = block_load<fp16, VL>(residual_ptr + offset);
+            simd<float, VL> normed = res * inv_rms * nw;
 
             if (n == 0) {
                 block_store<fp16, VL>(normed_out + offset, simd<fp16, VL>(normed));
@@ -142,6 +161,8 @@ struct ResAddNormGEMV_fp8_pert_kernel {
         int n = item.get_group(0);
         if (n >= N) return;
 
+        // The kernel streams, so MAX_CHUNKS sizes nothing; it only keeps the
+        // two arms as distinct instantiations. K is bounded by the host.
         if (K <= 4096) {
             run_impl<8>(n);
         } else {
@@ -164,6 +185,21 @@ inline void resadd_norm_gemv_fp8_pert_host(
     int fp8_mode,
     sycl::queue& q)
 {
+    // The kernel walks K in whole VL=512 chunks with no tail path. The 8192
+    // bound limits the redundant per-work-group re-read; it is not a capacity.
+    TORCH_CHECK(K % 512 == 0,
+                "resadd_norm_gemv_fp8_pert: K must be a multiple of 512, got K=", K);
+    TORCH_CHECK(K <= 8192,
+                "resadd_norm_gemv_fp8_pert: K must be <= 8192, got K=", K);
+
+    // All N work-groups read residual_ptr, so the residual update runs as its
+    // own pass first; the in-order queue settles it before the grid starts.
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(1, 1),
+            ResAddResidualOnly_kernel{hidden_ptr, residual_ptr, K});
+    });
+
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(N, 1),
@@ -195,21 +231,15 @@ struct ResAddNormGEMV_fp8_pert_v2_kernel {
         if (n >= N) return;
 
         int n_chunks = K / VL;
-        simd<float, VL> res_chunks[MAX_CHUNKS];
 
+        // No register cache: a simd<float,VL>[MAX_CHUNKS] array is VL*4*MC
+        // bytes of GRF against a ~8 KB per-thread budget. Pass 2 re-loads
+        // residual from L3, which the pre-pass has already warmed.
         float sum_sq = 0.0f;
 
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + offset);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
-            simd<float, VL> added = h + r;
-            res_chunks[c] = added;
-
-            if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
-            }
-
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + offset);
             simd<float, VL> sq = added * added;
             sum_sq += reduce<float>(sq, std::plus<>());
         }
@@ -222,7 +252,8 @@ struct ResAddNormGEMV_fp8_pert_v2_kernel {
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + offset);
-            simd<float, VL> normed = res_chunks[c] * inv_rms * nw;
+            simd<float, VL> res = block_load<fp16, VL>(residual_ptr + offset);
+            simd<float, VL> normed = res * inv_rms * nw;
 
             if (n == 0) {
                 block_store<fp16, VL>(normed_out + offset, simd<fp16, VL>(normed));
@@ -255,23 +286,31 @@ inline void resadd_norm_gemv_fp8_pert_v2_host(
         return;
     }
 
-    #define LAUNCH_RNGV2(V, MC)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(N, 1),                 ResAddNormGEMV_fp8_pert_v2_kernel<V, MC>{                     hidden_ptr, residual_ptr, norm_w_ptr,                     gemv_weight, gemv_scale, output, normed_out,                     N, K, eps, fp8_mode});         });
+    TORCH_CHECK(K <= 8192,
+                "resadd_norm_gemv_fp8_pert_v2: K must be <= 8192, got K=", K);
+
+    // The only fallback is the VL=512 no-tail kernel.
+    TORCH_CHECK(K % 256 == 0 || K % 128 == 0,
+                "resadd_norm_gemv_fp8_pert_v2: K must be a multiple of 128, "
+                "got K=", K);
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(1, 1),
+            ResAddResidualOnly_kernel{hidden_ptr, residual_ptr, K});
+    });
+
+    #define LAUNCH_RNGV2(V, MC)        q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(N, 1),                 ResAddNormGEMV_fp8_pert_v2_kernel<V, MC>{                     hidden_ptr, residual_ptr, norm_w_ptr,                     gemv_weight, gemv_scale, output, normed_out,                     N, K, eps, fp8_mode});         });
 
     if (K % 256 == 0) {
         int mc = K / 256;
         if      (mc <= 8)  { LAUNCH_RNGV2(256, 8)  }
         else if (mc <= 16) { LAUNCH_RNGV2(256, 16) }
         else               { LAUNCH_RNGV2(256, 32) }
-    } else if (K % 128 == 0) {
+    } else {
         int mc = K / 128;
         if      (mc <= 16) { LAUNCH_RNGV2(128, 16) }
         else               { LAUNCH_RNGV2(128, 32) }
-    } else {
-        // Fallback: can't fuse, caller should not reach here
-        resadd_norm_gemv_fp8_pert_host(
-            hidden_ptr, residual_ptr, norm_w_ptr,
-            gemv_weight, gemv_scale, output, normed_out,
-            N, K, eps, fp8_mode, q);
     }
 
     #undef LAUNCH_RNGV2

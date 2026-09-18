@@ -1,0 +1,197 @@
+/* Push-model peer-to-peer all-reduce for Intel XPU.
+ *
+ * Each rank owns one slot in every peer's staging buffer: rank r writes its
+ * contribution into slot r of every peer, then reduces all world_size slots of
+ * its own, so push and reduction offsets describe the same locations.
+ *
+ * esimd::atomic_update carries no memory order or scope, so ordering comes from
+ * explicit scoped fences -- stores, fence<global, none, system>, flag store on
+ * release; poll, fence<global, invalidate, system_acquire>, loads on acquire.
+ * The acquire fence is required because an Intel GPU's L1 is not coherent with
+ * incoming peer writes. Flags carry a monotonic sequence rather than 0/1, so the
+ * barrier is reusable across calls and under graph replay.
+ *
+ * The two kernels run on the caller's in-order queue, which supplies the local
+ * ordering. Fusing them around a global spin would deadlock by starvation under
+ * SYCL's weakly-parallel forward-progress guarantee unless the grid were
+ * persistent and occupancy-bounded.
+ */
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+
+#include <cstdint>
+
+using namespace sycl::ext::intel::esimd;
+
+namespace {
+
+constexpr int kVL = 16;  // elements per work-item
+
+template <typename T>
+struct AllReduceTraits;
+
+template <>
+struct AllReduceTraits<float> {
+    using acc_t = float;
+};
+template <>
+struct AllReduceTraits<sycl::half> {
+    using acc_t = float;
+};
+template <>
+struct AllReduceTraits<sycl::ext::oneapi::bfloat16> {
+    using acc_t = float;
+};
+
+/* Phase 1: publish this rank's contribution into slot `rank` of every peer.
+ * Writes are posted on PCIe, so pushing beats having peers pull, which would put
+ * a switch round trip on the critical path. The tail is predicated. */
+template <typename T>
+struct IpcPushKernel {
+    const T* local;
+    void** remote_slots;  // [world_size] base of this rank's slot in each peer
+    size_t elements;
+    int rank;
+    int world_size;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        const size_t blk = it.get_global_id(0);
+        const size_t offset = blk * kVL;
+        if (offset >= elements) return;
+
+        const int n = static_cast<int>(
+            (elements - offset) < kVL ? (elements - offset) : kVL);
+
+        simd<uint32_t, kVL> lane(0, 1);
+        simd_mask<kVL> live = lane < static_cast<uint32_t>(n);
+
+        simd<T, kVL> v = gather<T, kVL>(
+            local + offset, lane * static_cast<uint32_t>(sizeof(T)), live);
+
+        for (int p = 0; p < world_size; ++p) {
+            T* dst = static_cast<T*>(remote_slots[p]) + offset;
+            scatter<T, kVL>(dst, lane * static_cast<uint32_t>(sizeof(T)), v, live);
+        }
+    }
+};
+
+/* Phase 2: wait for every peer's contribution, then reduce all slots.
+ *
+ * One work-item per rank performs the flag handshake; the rest of the grid does
+ * the arithmetic after the acquire fence. */
+template <typename T>
+struct IpcReduceKernel {
+    T* local;                  // rank-local staging buffer, world_size slots
+    T* out;
+    uint32_t* local_flags;     // [world_size], written by peers
+    void** remote_flags;       // [world_size] this rank's flag inside each peer
+    size_t elements;
+    size_t slot_stride;        // elements per slot
+    int rank;
+    int world_size;
+    uint32_t seq;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        const size_t gid = it.get_global_id(0);
+
+        if (gid == 0) {
+            fence<memory_kind::global, fence_flush_op::none,
+                  fence_scope::system>();
+            simd<uint32_t, 1> s = seq;
+            for (int p = 0; p < world_size; ++p) {
+                if (p == rank) continue;
+                scatter<uint32_t, 1>(static_cast<uint32_t*>(remote_flags[p]),
+                                     simd<uint32_t, 1>(0u), s);
+            }
+            for (int p = 0; p < world_size; ++p) {
+                if (p == rank) continue;
+                for (;;) {
+                    simd<uint32_t, 1> got = gather<uint32_t, 1>(
+                        local_flags + p, simd<uint32_t, 1>(0u));
+                    if (got[0] >= seq) break;
+                }
+            }
+            fence<memory_kind::global, fence_flush_op::invalidate,
+                  fence_scope::system_acquire>();
+        }
+
+        it.barrier();
+
+        const size_t offset = gid * kVL;
+        if (offset >= elements) return;
+        const int n = static_cast<int>(
+            (elements - offset) < kVL ? (elements - offset) : kVL);
+
+        simd<uint32_t, kVL> lane(0, 1);
+        simd_mask<kVL> live = lane < static_cast<uint32_t>(n);
+        simd<uint32_t, kVL> byte_off = lane * static_cast<uint32_t>(sizeof(T));
+
+        simd<float, kVL> acc = 0.0f;
+        for (int p = 0; p < world_size; ++p) {
+            simd<T, kVL> v = gather<T, kVL>(
+                local + p * slot_stride + offset, byte_off, live);
+            simd<float, kVL> vf = v;
+            vf.merge(0.0f, !live);
+            acc += vf;
+        }
+
+        simd<T, kVL> res = acc;
+        scatter<T, kVL>(out + offset, byte_off, res, live);
+    }
+};
+
+template <typename T>
+void launch(sycl::queue& q, const void* local_in, void* local_buf, void* out,
+            void** remote_slots, uint32_t* local_flags, void** remote_flags,
+            size_t elements, size_t slot_stride, int rank, int world_size,
+            uint32_t seq) {
+    const size_t blocks = (elements + kVL - 1) / kVL;
+    const sycl::range<1> global(blocks == 0 ? 1 : blocks);
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(global, sycl::range<1>(1)),
+                       IpcPushKernel<T>{static_cast<const T*>(local_in),
+                                        remote_slots, elements, rank,
+                                        world_size});
+    });
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(global, sycl::range<1>(1)),
+                       IpcReduceKernel<T>{static_cast<T*>(local_buf),
+                                          static_cast<T*>(out), local_flags,
+                                          remote_flags, elements, slot_stride,
+                                          rank, world_size, seq});
+    });
+}
+
+}  // namespace
+
+/* dtype: 0 = float32, 1 = float16, 2 = bfloat16. */
+void execute_ipc_allreduce_push_wrapper(void* q_ptr, const void* local_in,
+                                        void* local_buf, void* out,
+                                        void** remote_slots,
+                                        uint32_t* local_flags,
+                                        void** remote_flags, size_t elements,
+                                        size_t slot_stride, int rank,
+                                        int world_size, int dtype,
+                                        uint32_t seq) {
+    auto* q = reinterpret_cast<sycl::queue*>(q_ptr);
+    switch (dtype) {
+        case 0:
+            launch<float>(*q, local_in, local_buf, out, remote_slots,
+                          local_flags, remote_flags, elements, slot_stride,
+                          rank, world_size, seq);
+            break;
+        case 1:
+            launch<sycl::half>(*q, local_in, local_buf, out, remote_slots,
+                               local_flags, remote_flags, elements, slot_stride,
+                               rank, world_size, seq);
+            break;
+        case 2:
+            launch<sycl::ext::oneapi::bfloat16>(
+                *q, local_in, local_buf, out, remote_slots, local_flags,
+                remote_flags, elements, slot_stride, rank, world_size, seq);
+            break;
+        default:
+            break;  // caller validates; nothing sensible to do here
+    }
+}

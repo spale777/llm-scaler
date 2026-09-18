@@ -179,11 +179,14 @@ inline void norm_gemv_int4_host(
 {
     // K_SPLIT: split heads across threads for small N (EU occupancy).
     // Large N (>512) has enough WGs — use K_SPLIT=1 to avoid SLM overhead.
+    // heads_per_thread is HV / K_SPLIT, so K_SPLIT must divide HV: at HV=12
+    // a split of 8 gives 1 head per lane and leaves heads 8..11 out of the
+    // contraction entirely.
     int ks = 1;
     if (N <= 512) {
-        if      (HV >= 8) ks = 8;
-        else if (HV >= 4) ks = 4;
-        else if (HV >= 2) ks = 2;
+        if      (HV % 8 == 0) ks = 8;
+        else if (HV % 4 == 0) ks = 4;
+        else if (HV % 2 == 0) ks = 2;
     }
 
     int global = N * ks;

@@ -29,8 +29,12 @@
 namespace omni_xpu {
 namespace svdq {
 
-// Cache key: (act_dtype_int, M, K, N, group_size)
-using CacheKey = std::tuple<int, int64_t, int64_t, int64_t, int64_t>;
+// Cache key: (device_index, act_dtype_int, M, K, N, group_size)
+//
+// device_index must be part of the key: CachedPrimitive owns a dnnl::engine and
+// dnnl::stream bound to one device, and a hit is used without re-resolving them
+// for the caller, so a shared entry submits every rank's work on one GPU.
+using CacheKey = std::tuple<int, int, int64_t, int64_t, int64_t, int64_t>;
 
 struct CachedPrimitive {
     dnnl::engine eng;
@@ -129,7 +133,8 @@ static void onednn_int4_gemm_kernel(
     int64_t group_size,
     const torch::Device& device
 ) {
-    CacheKey key(static_cast<int>(ActDT), M, K, N, group_size);
+    CacheKey key(static_cast<int>(device.index()), static_cast<int>(ActDT),
+                 M, K, N, group_size);
 
     CachedPrimitive* cached = nullptr;
     {
@@ -164,7 +169,8 @@ static void onednn_int4_gemm_sum_kernel(
     int64_t group_size,
     const torch::Device& device
 ) {
-    CacheKey key(static_cast<int>(ActDT), M, K, N, group_size);
+    CacheKey key(static_cast<int>(device.index()), static_cast<int>(ActDT),
+                 M, K, N, group_size);
 
     CachedPrimitive* cached = nullptr;
     {
@@ -302,7 +308,13 @@ void onednn_int4_gemm_add_to_output(
     TORCH_CHECK(dst.is_contiguous(), "dst must be contiguous");
 
     int64_t num_groups = scales_f16.size(0);
+    // group_size becomes the oneDNN scale group stride, so a K that num_groups
+    // does not divide makes every group past the first read the wrong scale row.
+    TORCH_CHECK(scales_f16.size(1) == N,
+                "scales_f16.size(1)=", scales_f16.size(1), " must equal N=", N);
     int64_t group_size = K / num_groups;
+    TORCH_CHECK(group_size * num_groups == K,
+                "K=", K, " must be divisible by num_groups=", num_groups);
 
     static torch::Tensor zp;
     if (!zp.defined() || zp.device() != act.device()) {

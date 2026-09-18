@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* fused_add_rms_norm.h — Fused residual add + RMSNorm (Gemma-style).
  *
  * For decode (bsz=1): residual[1,K] += hidden[1,K]; output[1,K] = rmsnorm(residual) * weight
@@ -39,8 +40,7 @@ struct FusedAddRmsNorm_kernel {
             // Write residual in-place
             block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
 
-            // VL-generic pairwise tree (the previous hand-rolled version
-            // started at select<256> and so was only valid for VL == 512).
+            // VL-generic pairwise tree.
             sum_sq += sycl::ext::intel::esimd::detail::sum<float, float, VL>(added * added);
         }
 
@@ -70,10 +70,19 @@ inline void fused_add_rms_norm_host(
                     hidden_ptr, residual_ptr, weight_ptr, K, eps});           \
         });
 
+    // No tail path: VL must divide K.
     if      (K % 512 == 0) { LAUNCH_FARN(512) }
     else if (K % 256 == 0) { LAUNCH_FARN(256) }
     else if (K % 128 == 0) { LAUNCH_FARN(128) }
-    else                   { LAUNCH_FARN(64)  }
+    else if (K % 64  == 0) { LAUNCH_FARN(64)  }
+    else if (K % 32  == 0) { LAUNCH_FARN(32)  }
+    else if (K % 16  == 0) { LAUNCH_FARN(16)  }
+    else if (K % 8   == 0) { LAUNCH_FARN(8)   }
+    else {
+        TORCH_CHECK(false,
+                    "esimd_fused_add_rms_norm: hidden size K=", K,
+                    " is not a multiple of 8; this kernel has no tail path.");
+    }
 
     #undef LAUNCH_FARN
 }

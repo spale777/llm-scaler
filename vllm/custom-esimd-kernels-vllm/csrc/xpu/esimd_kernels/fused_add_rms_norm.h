@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* fused_add_rms_norm.h — Fused residual add + RMSNorm (Gemma-style).
  *
  * For decode (bsz=1): residual[1,K] += hidden[1,K]; output[1,K] = rmsnorm(residual) * weight
@@ -59,6 +60,15 @@ struct FusedAddRmsNorm_kernel {
     }
 };
 
+// The tail path reads a full VL window ending at K, so it needs K >= VL. Below
+// that, k_tail = K - VL is negative and the in-kernel K >= VL guard skips the
+// tail, leaving the row unwritten.
+inline void check_min_vector_length(const char* op, int K)
+{
+    TORCH_CHECK(K >= 64, op, ": hidden size K=", K,
+                " is below the minimum vector length of 64.");
+}
+
 inline void fused_add_rms_norm_host(
     fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
     int K, float eps, sycl::queue& q)
@@ -97,14 +107,20 @@ struct FusedAddRmsNorm_v2_kernel {
             sum_sq += reduce<float>(sq, std::plus<>());
         }
         // Tail
-        if (k_aligned < K) {
+        if (k_aligned < K && K >= VL) {
             int k_tail = K - VL;
             simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + k_tail);
             simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k_tail);
             simd<float, VL> added = h + r;
-            block_store<fp16, VL>(residual_ptr + k_tail, simd<fp16, VL>(added));
-            // Only accumulate the tail portion (avoid double-counting overlap)
+            // Store only the lanes the aligned loop did not already write.
             int overlap = k_aligned - k_tail;
+            {
+                simd<uint32_t, VL> lane(0, 1);
+                simd_mask<VL> keep = lane >= (uint32_t)overlap;
+                scatter<fp16, VL>(residual_ptr + k_tail,
+                                  lane * (uint32_t)sizeof(fp16),
+                                  simd<fp16, VL>(added), keep);
+            }
             simd<float, VL> sq = added * added;
             for (int z = 0; z < overlap; z++) sq[z] = 0.0f;
             sum_sq += reduce<float>(sq, std::plus<>());
@@ -120,7 +136,7 @@ struct FusedAddRmsNorm_v2_kernel {
             simd<float, VL> normed = r * inv_rms * w;
             block_store<fp16, VL>(hidden_ptr + k, simd<fp16, VL>(normed));
         }
-        if (k_aligned < K) {
+        if (k_aligned < K && K >= VL) {
             int k_tail = K - VL;
             simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k_tail);
             simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k_tail);
@@ -171,13 +187,20 @@ struct FusedScaledAddRmsNorm_kernel {
             simd<float, VL> sq = added * added;
             sum_sq += reduce<float>(sq, std::plus<>());
         }
-        if (k_aligned < K) {
+        if (k_aligned < K && K >= VL) {
             int k_tail = K - VL;
             simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + k_tail);
             simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k_tail);
             simd<float, VL> added = (h + r) * scalar;
-            block_store<fp16, VL>(residual_ptr + k_tail, simd<fp16, VL>(added));
+            // Store only the lanes the aligned loop did not already write.
             int overlap = k_aligned - k_tail;
+            {
+                simd<uint32_t, VL> lane(0, 1);
+                simd_mask<VL> keep = lane >= (uint32_t)overlap;
+                scatter<fp16, VL>(residual_ptr + k_tail,
+                                  lane * (uint32_t)sizeof(fp16),
+                                  simd<fp16, VL>(added), keep);
+            }
             simd<float, VL> sq = added * added;
             for (int z = 0; z < overlap; z++) sq[z] = 0.0f;
             sum_sq += reduce<float>(sq, std::plus<>());
@@ -193,7 +216,7 @@ struct FusedScaledAddRmsNorm_kernel {
             simd<float, VL> normed = r * inv_rms * w;
             block_store<fp16, VL>(hidden_ptr + k, simd<fp16, VL>(normed));
         }
-        if (k_aligned < K) {
+        if (k_aligned < K && K >= VL) {
             int k_tail = K - VL;
             simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k_tail);
             simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k_tail);
@@ -207,6 +230,8 @@ inline void fused_scaled_add_rms_norm_host(
     fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
     int K, float eps, float scalar, sycl::queue& q)
 {
+    check_min_vector_length("fused_scaled_add_rms_norm", K);
+
     #define LAUNCH_V3(V)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(1, 1),                 FusedScaledAddRmsNorm_kernel<V>{hidden_ptr, residual_ptr, weight_ptr, K, eps, scalar});         });
 
     if      (K % 512 == 0) { LAUNCH_V3(512) }
@@ -231,6 +256,13 @@ inline void fused_add_rms_norm_v2_host(
     // Pick largest VL that gives at least 1 full chunk (VL <= K)
     // VL=256 for K=2816: 2816/256=11 full + 0 tail (2816%256=0!)
     #define LAUNCH_V2(V)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(1, 1),                 FusedAddRmsNorm_v2_kernel<V>{hidden_ptr, residual_ptr, weight_ptr, K, eps});         });
+
+    // The tail path reads a full VL window ending at K, so K >= VL: below that
+    // k_tail = K - VL addresses before the tensor base, and the in-kernel guard
+    // turns it into a skipped tail that leaves the row partly normalised.
+    TORCH_CHECK(K >= 64,
+                "fused_add_rms_norm_v2: hidden size K=", K,
+                " is below the minimum vector length of 64.");
 
     if      (K % 256 == 0) { LAUNCH_V2(256) }
     else if (K % 128 == 0) { LAUNCH_V2(128) }
@@ -263,7 +295,7 @@ struct RmsNorm_kernel {
             simd<float, VL> sq = x * x;
             sum_sq += reduce<float>(sq, std::plus<>());
         }
-        if (k_aligned < K) {
+        if (k_aligned < K && K >= VL) {
             int k_tail = K - VL;
             simd<float, VL> x = block_load<fp16, VL>(input_ptr + k_tail);
             int overlap = k_aligned - k_tail;
@@ -282,7 +314,7 @@ struct RmsNorm_kernel {
             simd<float, VL> normed = x * inv_rms * w;
             block_store<fp16, VL>(output_ptr + k, simd<fp16, VL>(normed));
         }
-        if (k_aligned < K) {
+        if (k_aligned < K && K >= VL) {
             int k_tail = K - VL;
             simd<float, VL> x = block_load<fp16, VL>(input_ptr + k_tail);
             simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k_tail);
@@ -296,6 +328,8 @@ inline void rms_norm_host(
     const fp16* input_ptr, fp16* output_ptr, const fp16* weight_ptr,
     int K, float eps, sycl::queue& q)
 {
+    check_min_vector_length("rms_norm", K);
+
     #define LAUNCH_V4(V)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(1, 1),                 RmsNorm_kernel<V>{input_ptr, output_ptr, weight_ptr, K, eps});         });
 
     if      (K % 512 == 0) { LAUNCH_V4(512) }

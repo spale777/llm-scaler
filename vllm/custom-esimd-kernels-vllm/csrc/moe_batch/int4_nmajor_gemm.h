@@ -45,6 +45,17 @@ sycl::event moe_up_int4_nmajor_kernel(
     IT* intermediate, const int* expert_offsets, const int* expert_tokens,
     int num_experts, int total_seqlen, int hidden_size, int intermediate_size, int top_k)
 {
+    // gather() takes uint32 byte offsets, strided by hidden_size on the input
+    // side and intermediate_size on the output and down-projection sides.
+    {
+        const int64_t stride = hidden_size > intermediate_size
+                                   ? hidden_size : intermediate_size;
+        TORCH_CHECK(((int64_t)total_seqlen + 1) * stride * 2 <= 0xFFFFFFFFLL,
+                    "moe int4 n-major: total_seqlen=", total_seqlen,
+                    " x max(hidden_size=", hidden_size,
+                    ", intermediate_size=", intermediate_size,
+                    ") exceeds the 4 GiB gather offset range");
+    }
     static_assert(MAX_M % 16 == 0);
     static_assert(N == 16);
     static_assert(BS % 16 == 0);
@@ -191,6 +202,17 @@ sycl::event moe_down_int4_nmajor_kernel(
     const fp16* routing_weights,
     int num_experts, int total_seqlen, int hidden_size, int intermediate_size, int top_k)
 {
+    // gather() takes uint32 byte offsets, strided by hidden_size on the input
+    // side and intermediate_size on the output and down-projection sides.
+    {
+        const int64_t stride = hidden_size > intermediate_size
+                                   ? hidden_size : intermediate_size;
+        TORCH_CHECK(((int64_t)total_seqlen + 1) * stride * 2 <= 0xFFFFFFFFLL,
+                    "moe int4 n-major: total_seqlen=", total_seqlen,
+                    " x max(hidden_size=", hidden_size,
+                    ", intermediate_size=", intermediate_size,
+                    ") exceeds the 4 GiB gather offset range");
+    }
     static_assert(MAX_M % 16 == 0);
     static_assert(N == 32);
     static_assert(BS % 16 == 0);
@@ -298,16 +320,28 @@ sycl::event moe_down_int4_nmajor_kernel(
                 simd<uint32_t, MAX_M> out_off_bytes =
                     (pair_idxs / (uint32_t)top_k) * (uint32_t)(hidden_size * sizeof(IT));
 
+                // sorted_idxs is clamped to t1 - 1, so a partial final tile
+                // carries duplicate lanes, and this accumulate is a
+                // read-modify-write rather than an atomic.
+                simd<uint32_t, MAX_M> lane_id(0u, 1u);
+                // const copies read once, immediately before the mask. The
+                // const bindings only fix these two names; the invariant that
+                // matters is that the mask bounds the lane against the row
+                // count.
+                const uint32_t m_row = (uint32_t)m_base;
+                const uint32_t t_end = (uint32_t)t1;
+                simd_mask<MAX_M> lane_live = (lane_id + m_row) < t_end;
+
                 #pragma unroll
                 for (int ms = 0; ms < MS; ms++) {
                     simd<uint32_t, 16> ms_off = out_off_bytes.template select<16, 1>(ms * 16).read();
                     simd<fp16, 16> ms_rw = rw.template select<16, 1>(ms * 16);
+                    simd_mask<16> ms_live = lane_live.template select<16, 1>(ms * 16);
                     #pragma unroll
                     for (int r = 0; r < N; r++) {
                         uint32_t ch = (uint32_t)(n_start + r) * (uint32_t)sizeof(IT);
                         simd<IT, 16> val = acc.template select<16, 1>(ms * N * 16 + r * 16);
                         val *= ms_rw;
-                        // Atomic add for accumulate across experts
                         simd<IT, 16> old;
                         old.template bit_cast_view<uint32_t>() =
                             xesimd::lsc_gather<uint32_t, 1,
@@ -316,7 +350,7 @@ sycl::event moe_down_int4_nmajor_kernel(
                                 16, uint32_t>(
                                 reinterpret_cast<const uint32_t*>(output),
                                 ms_off + ch);
-                        scatter<IT, 16>(output, ms_off + ch, old + val);
+                        scatter<IT, 16>(output, ms_off + ch, old + val, ms_live);
                     }
                 }
             }

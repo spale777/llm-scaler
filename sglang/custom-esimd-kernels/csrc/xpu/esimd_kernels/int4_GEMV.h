@@ -1,4 +1,5 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 #include "utils.h"
 
 // ============================================================================
@@ -137,6 +138,14 @@ inline void select_vl_ks_int4(uint32_t N, uint32_t K, int& vl, int& ks) {
         ks /= 2;
         kp = K / ks;
     }
+
+    // The walk-down stops at ks == 1 whether or not kp divides evenly, and the
+    // kernel loop has no tail path, so an indivisible K drops its residue.
+    // kp % GROUP alone is not enough: K % ks must hold too, or ks*kp visits
+    // fewer than K elements while kp still satisfies the group check.
+    TORCH_CHECK(K % ks == 0 && kp % INT4_GROUP_SIZE == 0,
+                "int4 GEMV: K=", K, " is not a multiple of ",
+                (int)INT4_GROUP_SIZE, " at any supported K-split");
 }
 
 

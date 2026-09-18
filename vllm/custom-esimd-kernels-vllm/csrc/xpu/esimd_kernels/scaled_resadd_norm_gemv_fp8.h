@@ -1,3 +1,4 @@
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* scaled_resadd_norm_gemv_fp8.h — Fused (h+r)*scalar + RMSNorm + FP8 GEMV.
  *
  * Designed for gemma4 cross-layer xfuse + attention qkv_proj entry.
@@ -68,20 +69,14 @@ struct ScaledResAddNormGEMV_fp8_pert_kernel {
         if (n >= N) return;
 
         int n_chunks = K / VL;
-        simd<float, VL> res_chunks[MAX_CHUNKS];
+        // No register cache: a simd<float,VL>[MAX_CHUNKS] array is VL*4*MC
+        // bytes of GRF against a ~8 KB per-thread budget. Pass 2 re-loads
+        // residual from L3, settled by the pre-pass.
 
         float sum_sq = 0.0f;
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + offset);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
-            simd<float, VL> added = (h + r) * scalar;
-            res_chunks[c] = added;
-
-            if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
-            }
-
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + offset);
             simd<float, VL> sq = added * added;
             sum_sq += reduce<float>(sq, std::plus<>());
         }
@@ -93,7 +88,8 @@ struct ScaledResAddNormGEMV_fp8_pert_kernel {
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + offset);
-            simd<float, VL> normed = res_chunks[c] * inv_rms * nw;
+            simd<float, VL> res = block_load<fp16, VL>(residual_ptr + offset);
+            simd<float, VL> normed = res * inv_rms * nw;
 
             simd<uint8_t, VL> w_raw = block_load<uint8_t, VL>(
                 qkv_weight + (size_t)n * K + offset);
@@ -104,6 +100,29 @@ struct ScaledResAddNormGEMV_fp8_pert_kernel {
 
         float dot = reduce<float>(acc, std::plus<>()) * (*qkv_scale);
         qkv_out[n] = fp16(dot);
+    }
+};
+
+/* Residual-only pre-pass: residual[k] = fp16((hidden[k] + residual[k]) * scalar).
+ * A single work-item, run before the K-split grid, so residual_ptr is settled
+ * by the time N work-groups read it. */
+struct ScaledResAddResidualOnly_kernel {
+    const fp16* hidden_ptr;
+    fp16*       residual_ptr;
+    int K;
+    float scalar;
+
+    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
+        constexpr int VL = 512;
+        int k = 0;
+        for (; k + VL <= K; k += VL) {
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + k);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k);
+            block_store<fp16, VL>(residual_ptr + k, simd<fp16, VL>((h + r) * scalar));
+        }
+        for (; k < K; ++k) {
+            residual_ptr[k] = (fp16)(((float)hidden_ptr[k] + (float)residual_ptr[k]) * scalar);
+        }
     }
 };
 
@@ -135,14 +154,7 @@ struct ScaledResAddNormGEMV_fp8_pert_ksplit_kernel {
         // ---- Phase 1: scaled add + sum_sq partial over [ks, ks+kp) ----
         float my_sumsq = 0.0f;
         for (int k = ks; k < ks + kp; k += VL) {
-            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + k);
-            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k);
-            simd<float, VL> added = (h + r) * scalar;
-            // Only WG 0 writes residual; all WGs need to compute `added` but
-            // each thread writes its own chunk. WG0 lid* gets distinct k-range.
-            if (n == 0) {
-                block_store<fp16, VL>(residual_ptr + k, simd<fp16, VL>(added));
-            }
+            simd<float, VL> added = block_load<fp16, VL>(residual_ptr + k);
             simd<float, VL> sq = added * added;
             my_sumsq += reduce<float>(sq, std::plus<>());
         }
@@ -200,6 +212,23 @@ inline void scaled_resadd_norm_gemv_fp8_pert_host(
     if (ks == 1) {
         #define LAUNCH_SRNGV1(V, MC)             q.submit([&](sycl::handler& cgh) {                 cgh.parallel_for(sycl::nd_range<1>(N, 1),                     ScaledResAddNormGEMV_fp8_pert_kernel<V, MC>{                         hidden_ptr, residual_ptr, norm_w_ptr,                         qkv_weight, qkv_scale, qkv_out,                         N, K, eps, scalar, fp8_mode});             });
 
+        // The kernel streams rather than caching chunks, so MAX_CHUNKS only
+        // picks the instantiation. The bound below limits the redundant
+        // per-work-group re-read.
+
+        // The narrowest arm is VL=64 and the kernel walks K in whole chunks.
+        TORCH_CHECK(K % 64 == 0,
+                    "scaled_resadd_norm_gemv_fp8_pert: K must be a multiple "
+                    "of 64, got K=", K);
+
+        // The pre-pass rewrites residual in place, so every check must clear
+        // before it is submitted.
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(1, 1),
+                ScaledResAddResidualOnly_kernel{hidden_ptr, residual_ptr, K, scalar});
+        });
+
         if (K % 512 == 0) {
             int mc = K / 512;
             if      (mc <= 4)  { LAUNCH_SRNGV1(512, 4)  }
@@ -224,6 +253,15 @@ inline void scaled_resadd_norm_gemv_fp8_pert_host(
         #undef LAUNCH_SRNGV1
         return;
     }
+
+    // Every work-group reads residual_ptr in both phases, so the scaled add
+    // runs as its own pass first; the in-order queue settles it before the grid
+    // starts.
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(1, 1),
+            ScaledResAddResidualOnly_kernel{hidden_ptr, residual_ptr, K, scalar});
+    });
 
     // K_SPLIT > 1: each WG runs ks threads. global = N * ks; local = ks.
     uint32_t global = (uint32_t)N * (uint32_t)ks;

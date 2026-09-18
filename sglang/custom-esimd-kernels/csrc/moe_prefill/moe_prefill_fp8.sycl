@@ -206,6 +206,9 @@ sycl::event moe_prefill_gather_forward_kernel_fp8(
                 expert_offsets[i] = slm_offsets[i];
                 rows_for_experts[i] = slm_counters[i];
             }
+            // slm_offsets becomes a cursor below: every lane must finish
+            // copying first, and lanes with lid >= num_experts copy nothing.
+            item.barrier(sycl::access::fence_space::local_space);
 
             for (int i = lid; i < total_seqlen; i += GS) {
                 int eid = selected_experts[i];
@@ -233,6 +236,18 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
     const MpChunk* chunks, int num_chunks,
     int num_experts, int total_seqlen, int hidden_size, int intermediate_size, int top_k)
 {
+    // gather() takes uint32 byte offsets. Offsets stride by hidden_size on the
+    // input side and by intermediate_size on the output and down-projection
+    // sides, and the inner gathers add one more row on top of the base.
+    {
+        const int64_t stride = hidden_size > intermediate_size
+                                   ? hidden_size : intermediate_size;
+        TORCH_CHECK(((int64_t)total_seqlen + 1) * stride * 2 <= 0xFFFFFFFFLL,
+                    "moe prefill: total_seqlen=", total_seqlen,
+                    " x max(hidden_size=", hidden_size,
+                    ", intermediate_size=", intermediate_size,
+                    ") exceeds the 4 GiB gather offset range");
+    }
     static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
     static_assert(N % 8 == 0,      "N must be multiple of 8 (DPAS N-tile)");
     constexpr int MS     = MAX_M / 16;
@@ -706,7 +721,11 @@ static torch::Tensor moe_prefill_down_core(
 
     TORCH_CHECK(intermediate.size(1) == intermediate_size,
                 "intermediate dim must equal w2 last dim");
-    TORCH_CHECK(hidden_size % 32 == 0, "hidden_size must be multiple of 32 (N-tile)");
+    // The grid is hidden_size / MP_DOWN_N tiles, so the N-tile width is what
+    // must divide hidden_size -- %32 leaves the trailing columns unwritten.
+    TORCH_CHECK(hidden_size % MP_DOWN_N == 0,
+                "hidden_size must be a multiple of the down N-tile ",
+                (int)MP_DOWN_N, ", got ", hidden_size);
     TORCH_CHECK(intermediate_size % 16 == 0, "intermediate_size (K) must be multiple of 16");
     TORCH_CHECK(down_scale.numel() >= num_experts, "down_scale must have >= E entries");
 

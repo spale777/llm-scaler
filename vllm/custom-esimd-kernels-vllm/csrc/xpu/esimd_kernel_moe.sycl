@@ -1,6 +1,9 @@
-/* esimd_kernel_moe.sycl — MoE ESIMD kernels compiled WITHOUT doubleGRF.
- * Standard GRF (256 regs) → 8 threads/XVE → 2× occupancy vs doubleGRF.
- * MoE kernels use ~42 GRFs — well within 256 limit.
+/* MoE ESIMD kernels.
+ *
+ * Built with -doubleGRF for the FP8 block-scale DPAS path, whose accumulators
+ * alone are 4 KB. The flag is module-wide, so every kernel here runs at 4
+ * threads per XVE rather than 8, including the light scatter/gather/top-k ops
+ * that need none of it.
  */
 
 #include <sycl/sycl.hpp>
@@ -165,6 +168,10 @@ at::Tensor esimd_moe_gather(
     at::Tensor final_hidden,
     int64_t K, int64_t topk, int64_t T)
 {
+    // The kernel stages positions and weights in 32-slot arrays and clamps to
+    // them, so a larger topk would sum only the first 32 experts.
+    TORCH_CHECK(topk <= 32,
+                "esimd_moe_gather: topk=", topk, " exceeds the 32-expert limit");
     auto& q = get_device_queue(moe_output);
     moe_gather_host(
         reinterpret_cast<const fp16*>(moe_output.data_ptr()),
@@ -212,10 +219,32 @@ at::Tensor esimd_moe_gemm_fp8_blockscale(
                 "esimd_moe_gemm_fp8_blockscale: weight_scale must be float32");
     TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
                 "esimd_moe_gemm_fp8_blockscale: output must be fp16");
-    TORCH_CHECK(block_n == 128 && block_k == 128,
-                "esimd_moe_gemm_fp8_blockscale: only 128x128 weight blocks supported");
+    // The prefill path tiles N 16 wide and applies one scale per tile, so an
+    // N-block must be a whole number of tiles. block_k stays 128: the kernels
+    // take it as a compile-time constant.
+    TORCH_CHECK(block_n == 128 || block_n == 32,
+                "esimd_moe_gemm_fp8_blockscale: block_n must be 32 or 128, got ",
+                block_n);
+    TORCH_CHECK(block_k == 128,
+                "esimd_moe_gemm_fp8_blockscale: block_k must be 128, got ", block_k);
     TORCH_CHECK(K % block_k == 0,
-                "esimd_moe_gemm_fp8_blockscale: K must be a multiple of block_k(128)");
+                "esimd_moe_gemm_fp8_blockscale: K must be a multiple of block_k");
+    // The kernel indexes weight_scale as [E, Nb, Kb].
+    {
+        const int64_t Nb = (N + block_n - 1) / block_n;
+        const int64_t Kb = (K + block_k - 1) / block_k;
+        TORCH_CHECK(weight_scale.dim() == 3,
+                    "esimd_moe_gemm_fp8_blockscale: weight_scale must be 3-D "
+                    "[num_experts, Nb, Kb], got dim=", weight_scale.dim());
+        TORCH_CHECK(weight_scale.size(0) == num_experts &&
+                        weight_scale.size(1) == Nb &&
+                        weight_scale.size(2) == Kb,
+                    "esimd_moe_gemm_fp8_blockscale: weight_scale shape mismatch; "
+                    "expected [", num_experts, ", ", Nb, ", ", Kb, "], got [",
+                    weight_scale.size(0), ", ", weight_scale.size(1), ", ",
+                    weight_scale.size(2), "]");
+    }
+
     auto& q = get_device_queue(input);
 
     const int64_t total_tokens = input.size(0);

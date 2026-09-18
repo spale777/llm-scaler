@@ -1,4 +1,5 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
@@ -1383,8 +1384,10 @@ inline void dpas_v7_auto_dispatch(
     // but K_THREADS=2 better for large N (N>2560) to avoid SLM reduction overhead.
     // K_THREADS=8 tested and was worse (too much SLM reduction cost).
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     #define V7_DISPATCH(KT, MT) dpas_v7_gemm_fp8_pert_host<KT, MT>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q)
     if (k_threads >= 4) {
@@ -1671,8 +1674,10 @@ inline void dpas_v11_auto_dispatch(
     int n_wgs = (n_16 + n_threads - 1) / n_threads;
 
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs * n_threads, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     // Limit total WG size
     while (k_threads * n_threads > 16) {
@@ -3371,8 +3376,10 @@ inline void dpas_v13_auto_dispatch(
     int m_tiles = ((int)M + 7) / 8;
     int n_wgs = ((int)N + 15) / 16;
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     #define V13_DISPATCH(KT, MT) dpas_v13_gemm_fp8_pert_host<KT, MT>(input, weight, scale_ptr, output, M, N, K, q)
     if (k_threads >= 4) {
@@ -3625,8 +3632,10 @@ inline void dpas_v10_auto_dispatch(
     }
 
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     #define V10_DISPATCH(KT, MT, NT) dpas_v10_gemm_fp8_pert_host<KT, MT, NT>(input, weight, scale_ptr, output, M, N, K, q)
 
@@ -3711,8 +3720,10 @@ inline void dpas_v9_auto_dispatch(
     int m_tiles = ((int)M + 7) / 8;
     int n_wgs = ((int)N + 15) / 16;
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads--;
+    // Fixup must precede the walk, and the walk halves: k_threads stays in
+    // {4,2,1}, so K % (k_threads*64) == 0 still holds at launch.
     if (k_threads == 3) k_threads = 2;
+    while (k_threads > 1 && (K % (k_threads * 64) != 0)) k_threads /= 2;
 
     #define V9_DISPATCH(KT, MT) dpas_v9_gemm_fp8_pert_host<KT, MT>(input, weight, scale_ptr, output, M, N, K, q)
     if (k_threads >= 4) {
@@ -3814,20 +3825,36 @@ inline void batched_gemv_fp8_pert_host(
                     (int)M, (int)N, (int)K, fp8_mode}); \
         });
 
+    // The grid is sized N*ks, but the kernel derives kp = K / K_SPLIT from its
+    // TEMPLATE argument, so a catch-all with a different K_SPLIT mis-strides
+    // every lane and, via `if constexpr (K_SPLIT == 1)`, drops slm_init and the
+    // barrier. Every pair select_vl_ks can emit needs its own arm.
     if      (vl == 512 && ks == 1) { LAUNCH_BATCHED(512, 1) }
     else if (vl == 512 && ks == 2) { LAUNCH_BATCHED(512, 2) }
+    else if (vl == 512 && ks == 4) { LAUNCH_BATCHED(512, 4) }
+    else if (vl == 512 && ks == 8) { LAUNCH_BATCHED(512, 8) }
     else if (vl == 256 && ks == 1) { LAUNCH_BATCHED(256, 1) }
     else if (vl == 256 && ks == 2) { LAUNCH_BATCHED(256, 2) }
     else if (vl == 256 && ks == 4) { LAUNCH_BATCHED(256, 4) }
+    else if (vl == 256 && ks == 8) { LAUNCH_BATCHED(256, 8) }
     else if (vl == 128 && ks == 1) { LAUNCH_BATCHED(128, 1) }
     else if (vl == 128 && ks == 2) { LAUNCH_BATCHED(128, 2) }
     else if (vl == 128 && ks == 4) { LAUNCH_BATCHED(128, 4) }
     else if (vl == 128 && ks == 8) { LAUNCH_BATCHED(128, 8) }
-    else if (vl == 64 && ks == 1) { LAUNCH_BATCHED(64, 1) }
-    else if (vl == 64 && ks == 2) { LAUNCH_BATCHED(64, 2) }
-    else if (vl == 32 && ks == 1) { LAUNCH_BATCHED(32, 1) }
-    else if (vl == 32 && ks == 2) { LAUNCH_BATCHED(32, 2) }
-    else                           { LAUNCH_BATCHED(32, 1) }
+    else if (vl ==  64 && ks == 1) { LAUNCH_BATCHED(64, 1) }
+    else if (vl ==  64 && ks == 2) { LAUNCH_BATCHED(64, 2) }
+    else if (vl ==  64 && ks == 4) { LAUNCH_BATCHED(64, 4) }
+    else if (vl ==  64 && ks == 8) { LAUNCH_BATCHED(64, 8) }
+    else if (vl ==  32 && ks == 1) { LAUNCH_BATCHED(32, 1) }
+    else if (vl ==  32 && ks == 2) { LAUNCH_BATCHED(32, 2) }
+    else if (vl ==  32 && ks == 4) { LAUNCH_BATCHED(32, 4) }
+    else if (vl ==  32 && ks == 8) { LAUNCH_BATCHED(32, 8) }
+    else {
+        TORCH_CHECK(false,
+                    "batched fp8 GEMV: no kernel for vl=", vl, " ks=", ks,
+                    " at N=", N, " K=", K, "; the catch-all would have run "
+                    "VL=32/K_SPLIT=1 against a grid sized for ks lanes");
+    }
 
     #undef LAUNCH_BATCHED
 }
@@ -3846,6 +3873,14 @@ inline void ws_gemm_fp8_pert_host(
     uint32_t M, uint32_t N, uint32_t K,
     int fp8_mode,
     sycl::queue& q) {
+
+    // K >= VL: the tail block_loads at offset K - VL, and the overlap zeroing
+    // would hide a negative offset from the result. Checked here so every
+    // dispatch arm inherits it; the kernel is VL-generic (simd<float,VL>, no
+    // DPAS), so callers pick a narrower VL rather than refuse.
+    TORCH_CHECK(K >= (uint32_t)VL,
+                "ws_gemm_fp8_pert: K=", K, " is below the vector length ", VL,
+                "; the tail offset K - VL would be negative");
 
     int m_tiles = ((int)M + TILE_M - 1) / TILE_M;
 
@@ -4050,6 +4085,10 @@ inline void GEMM_fp8_pert_dispatch(
             mpar_gemm_fp8_pert_host<128, 4, 16>(
                 input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
         } else {
+            // The mpar kernel walks K in whole VL=128 steps with no tail.
+            TORCH_CHECK(K % 128 == 0,
+                        "esimd_gemm_fp8_pert: K must be a multiple of 128 on "
+                        "the narrow-N path, got K=", K);
             mpar_gemm_fp8_pert_host<128, 1, 16>(
                 input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
         }
@@ -4058,7 +4097,11 @@ inline void GEMM_fp8_pert_dispatch(
         // only compute rows [0..63] and leave rows [64..M-1] uninitialized,
         // which propagates NaN through subsequent layers. Fall back to WS
         // which has a real 2D grid and per-row bounds check.
-        ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        // VL must not exceed K: the kernel's tail offset is K - VL.
+        if      (K % 128 == 0) ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 64)      ws_gemm_fp8_pert_host<64,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 32)      ws_gemm_fp8_pert_host<32,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else                   ws_gemm_fp8_pert_host<16,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else if (K % 64 == 0 && fp8_mode == 0) {
         // V9: Transposed load + fused dequant-VNNI (E4M3 only, best for M>=2)
         dpas_v9_auto_dispatch(input, weight, scale_ptr, output, M, N, K, q);
@@ -4068,8 +4111,14 @@ inline void GEMM_fp8_pert_dispatch(
     } else if (M <= 3) {
         batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else if (M <= 8) {
-        ws_gemm_fp8_pert_host<128, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        if      (K % 128 == 0) ws_gemm_fp8_pert_host<128, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 64)      ws_gemm_fp8_pert_host<64,  8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 32)      ws_gemm_fp8_pert_host<32,  8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else                   ws_gemm_fp8_pert_host<16,  8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else {
-        ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        if      (K % 128 == 0) ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 64)      ws_gemm_fp8_pert_host<64,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else if (K >= 32)      ws_gemm_fp8_pert_host<32,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        else                   ws_gemm_fp8_pert_host<16,  16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     }
 }

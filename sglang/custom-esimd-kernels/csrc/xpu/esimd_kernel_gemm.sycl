@@ -64,6 +64,10 @@ at::Tensor esimd_gemm_int4_pgrp(
                 "esimd_gemm_int4_pgrp: weight_scale must be fp16");
     TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
                 "esimd_gemm_int4_pgrp: output must be fp16");
+    // The grid has no M dimension: the kernel covers M_TILES tiles of 8 rows
+    // and the dispatcher caps M_TILES at 8, so rows past 64 are never written.
+    TORCH_CHECK(M <= 64,
+                "esimd_gemm_int4_pgrp: M must be <= 64, got M=", M);
     TORCH_CHECK(N % 16 == 0,
                 "esimd_gemm_int4_pgrp: N must be a multiple of 16 (DPAS N tile), got N=", N);
     TORCH_CHECK(K % INT4_GEMM_GROUP_SIZE == 0,

@@ -3,6 +3,7 @@
  */
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/all.h>
+#include <torch/extension.h>
 #include <torch/library.h>
 #include <Python.h>
 
@@ -37,19 +38,22 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_sglang, m) {
   m.impl("esimd_moe_gather", torch::kXPU, &esimd_moe_gather);
 
   m.def("esimd_moe_gemm_fp8(Tensor input, Tensor weight, Tensor scale, "
-        "Tensor output, Tensor expert_idx, "
-        "int N, int K, int num_experts, int max_tokens_per_expert) -> Tensor");
+        "Tensor(a!) output, Tensor expert_idx, "
+        "int N, int K, int num_experts, int max_tokens_per_expert) -> Tensor(a!)");
   m.impl("esimd_moe_gemm_fp8", torch::kXPU, &esimd_moe_gemm_fp8);
 
   m.def("esimd_moe_gemm_fp8_pert(Tensor input, Tensor weight, Tensor scale, "
-        "Tensor output, Tensor expert_idx, "
-        "int N, int K, int num_experts, int max_tokens_per_expert) -> Tensor");
+        "Tensor(a!) output, Tensor expert_idx, "
+        "int N, int K, int num_experts, int max_tokens_per_expert) -> Tensor(a!)");
   m.impl("esimd_moe_gemm_fp8_pert", torch::kXPU, &esimd_moe_gemm_fp8_pert);
+
+  m.def("esimd_moe_gemm_fp8_blockscale(Tensor input, Tensor weight, Tensor scale, "
+        "Tensor(a!) output, Tensor expert_idx, "
+        "int N, int K, int num_experts, int block_n, int block_k) -> Tensor(a!)");
+  m.impl("esimd_moe_gemm_fp8_blockscale", torch::kXPU, &esimd_moe_gemm_fp8_blockscale);
 }
 
-PyMODINIT_FUNC PyInit_custom_esimd_kernels_moe() {
-    static struct PyModuleDef module = {
-        PyModuleDef_HEAD_INIT, "custom_esimd_kernels_moe", nullptr, 0, nullptr
-    };
-    return PyModule_Create(&module);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // Operations are registered globally via TORCH_LIBRARY_FRAGMENT
 }

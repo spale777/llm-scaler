@@ -593,19 +593,24 @@ index d0a8ff7a9..391da7cff 100644
          # Move back to GPU
          return (
              track_ssm_h_src.to(self.device, non_blocking=True),
-@@ -533,7 +570,14 @@ class MambaAttnBackendBase(AttentionBackend):
+@@ -533,7 +570,20 @@ class MambaAttnBackendBase(AttentionBackend):
          # Make sure forward metadata is correctly handled for padding reqs
          req_pool_indices[bs - num_padding :] = 0
          mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
--        mamba_indices[bs - num_padding :] = -1
-+        # Padding reqs point at mamba slot 0, which MambaSlotAllocator reserves
-+        # as a dummy write target (free_slots start at 1, so 0 is never given to
-+        # a real req). The triton GDN kernels treat -1 as a skip sentinel, but
-+        # the XPU ESIMD GDN kernels (gdn_conv_fused_seq etc.) index the state
-+        # pool by this value with no negative guard, so -1 → conv_state[-1] →
-+        # GPU index OOB → SIGABRT on every batch>1 graph replay. Slot 0 is a
-+        # valid, harmless address for both paths (padding output is discarded).
-+        mamba_indices[bs - num_padding :] = 0
++        # Padding reqs keep the -1 skip sentinel. An earlier revision mapped
++        # them to slot 0 because the ESIMD GDN kernels indexed the state pool
++        # with no negative guard; a0965ae added those guards
++        # (gdn_conv_fused_seq.h:157 have_conv_slot, :322 ssm_idx >= 0, :548
++        # early return, and the same set in gdn_conv_fused.h), so -1 now skips
++        # cleanly on both the triton and the XPU paths.
++        #
++        # Do not map these to 0 again. Slot 0 is a real, writable slot: with 0
++        # every padded request writes garbage conv/ssm state into it on every
++        # graph replay whose batch is below the captured size. The claim that
++        # MambaSlotAllocator reserves slot 0 cannot be checked from this repo --
++        # upstream sglang is not vendored here, and the name appears nowhere
++        # outside the comment that asserted it. -1 needs no such premise.
+         mamba_indices[bs - num_padding :] = -1
          self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
          if forward_mode.is_decode_or_idle():
              if num_padding == 0:
@@ -1890,7 +1895,7 @@ index ea02e001f..1ecad5d71 100644
              ):
                  extend_seq_lens = forward_batch.extend_seq_lens
                  metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
-@@ -590,24 +1129,52 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -590,24 +1129,61 @@ class XPUAttentionBackend(AttentionBackend):
                  cu_seqlens_k = metadata.encoder_cu_seqlens_k
                  window_size = (-1, -1)
  
@@ -1920,6 +1925,15 @@ index ea02e001f..1ecad5d71 100644
 +                if (
 +                    os.environ.get("SGL_XPU_PREFILL_DPAS") == "1"
 +                    and q.dtype == torch.float16
++                    # The kernel additionally requires both caches to MATCH q
++                    # (esimd_kernel_prefill_dpas.sycl:60-61). Without these two
++                    # terms, --kv-cache-dtype fp8_e4m3 leaves q fp16 and the
++                    # caches fp8, and the forward pass aborts on its first
++                    # prefill. SGL_XPU_PREFILL_DPAS=1 ships enabled in
++                    # scripts/start_qwen3_6_service.sh (:113, :204), so this
++                    # needs only a cache-dtype flag, not an opt-in.
++                    and key_cache.dtype == torch.float16
++                    and value_cache.dtype == torch.float16
 +                    and layer.head_dim == 256
 +                    and not layer.is_cross_attention
 +                    and not use_cascade_attn
@@ -2086,7 +2100,7 @@ index ea02e001f..1ecad5d71 100644
              else:
                  is_swa_layer = (
                      layer.sliding_window_size is not None
-@@ -929,25 +1594,221 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -929,25 +1594,256 @@ class XPUAttentionBackend(AttentionBackend):
                      -1, layer.tp_q_head_num, layer.head_dim
                  )
  
@@ -2191,15 +2205,36 @@ index ea02e001f..1ecad5d71 100644
 +                # the kernel via the `window` param (see the SWA branch below):
 +                # positions outside the last `window` tokens are masked to -inf,
 +                # matching FA3's window_size semantics.
-+                # The kernel's GQA tiling requires q_heads/kv_heads to be a
-+                # multiple of 4 (it raises "gqaRatio must be a multiple of 4"
-+                # otherwise, which used to crash the scheduler at decode time
-+                # instead of falling back -- e.g. Qwen3.6-27B has ratio 6).
++                # The kernel accepts ratio 2 OR a multiple of 4
++                # (eagle.sycl:473), and dispatches ratio 2 to a dedicated
++                # 21 KB page.attn.gqa2.h added for gemma4-31B (93a00a1). This
++                # gate previously demanded % 4 == 0, quoting an error string the
++                # kernel no longer emits, so ratio 2 could never reach that
++                # kernel: gemma4-31B at --tp 2 (as run_gemma4_31b.sh launches it)
++                # gives per-rank ratio 2 and fell to split-K's scalar per-token
++                # loop instead of gqa2's 16-wide gather. A too-strict gate fails
++                # nothing, which is why three review rounds missed it.
++                # Ratios like 6 are still excluded, which is the real constraint.
 +                _pa_kv_heads = getattr(layer, "tp_k_head_num", 0) or 0
++                # The kernel requires a power-of-two page_size with
++                # 6 <= log2(page_size) <= 10, i.e. 64..1024
++                # (eagle.sycl:493-494, :2254). Nothing here tested it, so a
++                # --page-size below 64 aborted decode. Every shipped script
++                # passes exactly 64, the minimum, so a user lowering it to 32
++                # was one flag away from a hard failure.
++                _pa_page = int(getattr(self, "page_size", 0) or 0)
++                _pa_page_ok = (
++                    64 <= _pa_page <= 1024
++                    and (_pa_page & (_pa_page - 1)) == 0
++                )
 +                _pa_gqa_ok = (
 +                    _pa_kv_heads > 0
 +                    and layer.tp_q_head_num % _pa_kv_heads == 0
-+                    and (layer.tp_q_head_num // _pa_kv_heads) % 4 == 0
++                    and _pa_page_ok
++                    and (
++                        (layer.tp_q_head_num // _pa_kv_heads) == 2
++                        or (layer.tp_q_head_num // _pa_kv_heads) % 4 == 0
++                    )
 +                )
 +                _use_esimd_pa = (
 +                    not _DISABLE_ESIMD_DECODE
@@ -2210,6 +2245,13 @@ index ea02e001f..1ecad5d71 100644
 +                    and not use_cascade_attn
 +                    and layer.logit_cap == 0.0
 +                    and q_reshaped.dtype == torch.float16
++                    # The kernel requires both caches to MATCH q
++                    # (eagle.sycl:450-453). Without these two terms
++                    # --kv-cache-dtype fp8_e4m3 leaves q fp16 and the caches
++                    # fp8, and decode aborts on its first token. The prefill
++                    # DPAS gate above already carries the same pair.
++                    and key_cache.dtype == q_reshaped.dtype
++                    and value_cache.dtype == q_reshaped.dtype
 +                    and _pa_gqa_ok
                  )
 +                if _use_esimd_pa:
@@ -2228,7 +2270,7 @@ index ea02e001f..1ecad5d71 100644
 +                        page_table_pa = page_table
 +                        pa_seqlens = cache_seqlens
 +                        max_seq = page_table.shape[1] * self.page_size
-+                    # ESIMD kernel hardcodes matMulQuantCoeff=0.0625 (1/sqrt(256)).
++                    # ESIMD kernel hardcodes matMulQuantCoeff=getattr(runner_config, "sm_scale", 0.0625) (1/sqrt(256)).
 +                    # Compensate for the model's actual scaling factor.
 +                    if layer.scaling != 0.0625:
 +                        q_scaled = self._decode_buf(
@@ -2260,6 +2302,13 @@ index ea02e001f..1ecad5d71 100644
 +                        and not use_cascade_attn
 +                        and layer.logit_cap == 0.0
 +                        and q_reshaped.dtype == torch.float16
++                        # splitk_decode_attention TORCH_CHECKs q, both caches
++                        # and out are all kHalf (eagle.sycl:2243-2248); there is
++                        # no bf16 or fp8 instantiation to fall back to. The
++                        # gemma4 global (head_dim 512) layers reach this branch
++                        # unconditionally, every token, at every TP.
++                        and key_cache.dtype == torch.float16
++                        and value_cache.dtype == torch.float16
 +                        and layer.head_dim in (256, 512)
 +                    ):
 +                        bs = forward_batch.batch_size
@@ -4124,7 +4173,7 @@ index 5c1e7a63e..46ab6bb8e 100644
              return GGUFMoEMethod(self)
          return None
  
-@@ -456,6 +543,1807 @@ class GGUFLinearMethod(LinearMethodBase):
+@@ -456,6 +543,1819 @@ class GGUFLinearMethod(LinearMethodBase):
          return out
  
  
@@ -4675,11 +4724,14 @@ index 5c1e7a63e..46ab6bb8e 100644
 +def _q5q6_tile(K: int) -> int:
 +    """K-tile length the q5_K/q6_K ESIMD kernels will use for this shard.
 +
-+    The kernels are instantiated at VL=512 and VL=256 and pick by ``K % 512``;
-+    the host pre-shuffle must use the same tile, since the shuffled qh layout is
-+    per-tile. K % 256 == 0 always holds (256 is the GGUF K-quant super-block).
++    Only VL=512 exists. The VL=256 instantiation was removed when the qh
++    pre-shuffle was pinned to a fixed 512-element tile -- the narrow arm
++    de-shuffled the wrong elements -- and both hosts now
++    ``TORCH_CHECK(K % Q5_K_VL == 0)``. The shuffled qh layout is per-tile, so
++    the host must use the same 512 unconditionally; returning 256 here produced
++    a resident shard no shipped kernel can read.
 +    """
-+    return _Q5Q6_VL if K % _Q5Q6_VL == 0 else _Q5Q6_VL // 2
++    return _Q5Q6_VL
 +
 +
 +def _q5q6_col_perm_elems(t, perm):
@@ -5173,15 +5225,21 @@ index 5c1e7a63e..46ab6bb8e 100644
 +    """True when a q5_K/q6_K shard's K tiles evenly for the ESIMD kernels.
 +
 +    Both reps pre-shuffle the high bits into fixed-length tiles matching the
-+    kernel's vector length. The kernels are instantiated at VL=512 and VL=256
-+    and select on ``K % 512``, so any K that is a multiple of 256 is served;
-+    256 is the GGUF K-quant super-block, so this holds for every real shard.
++    kernel's vector length, and the only instantiation is VL=512 -- the VL=256
++    arm was removed with the qh shuffle pinning, and both hosts TORCH_CHECK
++    ``K % 512``. So K must be a multiple of 512, not of the 256-byte GGUF
++    super-block: half of all super-block-aligned K (5376, 2816, 1280, 768, ...)
++    is NOT served and must fall back.
 +    """
 +    bytes_per_sb = _Q5_K_BYTES if qweight_type == _Q5_K_TYPE else _Q6_K_BYTES
 +    if qweight.ndim != 2 or qweight.shape[1] % bytes_per_sb:
 +        return False
 +    k = (qweight.shape[1] // bytes_per_sb) * _Q4_K_SB
-+    return k % (_Q5Q6_VL // 2) == 0
++    # K % 512, not % 256: the kernels' only instantiation is VL=512 and both
++    # hosts TORCH_CHECK it. Admitting K % 256 let exactly half of all
++    # super-block-aligned K through to a hard throw -- 5376 (Gemma-3/4), 2816,
++    # 1280, 768 among them.
++    return k % _Q5Q6_VL == 0
 +
 +
 +def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
@@ -5222,10 +5280,13 @@ index 5c1e7a63e..46ab6bb8e 100644
 +    _no_q5 = os.environ.get("SGLANG_GGUF_XPU_NO_Q5K") == "1"
 +    _no_q6 = os.environ.get("SGLANG_GGUF_XPU_NO_Q6K") == "1"
 +    # The q5_K/q6_K ESIMD reps pre-shuffle qh into per-tile chunks matching the
-+    # kernel's vector length, so K must be a whole number of tiles. The kernels
-+    # are instantiated at VL=512 and VL=256 and select on K % 512, so K only has
-+    # to be a multiple of 256 -- the GGUF K-quant super-block. gemma-4's
-+    # hidden_size 5376 (= 21 * 256) is served by the VL=256 instantiation.
++    # kernel's vector length, so K must be a whole number of tiles. Only VL=512
++    # exists: the VL=256 instantiation was removed when the qh pre-shuffle was
++    # pinned to a fixed 512 tile, and both hosts now TORCH_CHECK K % 512. So K
++    # must be a multiple of 512, NOT of the 256-byte GGUF super-block. gemma-4's
++    # hidden_size 5376 is 21 * 256 but not a multiple of 512, so it is NOT
++    # served by this path and must fall back -- this comment previously said the
++    # opposite, which is why the gate admitted it straight into a hard throw.
 +    _k_tiles_ok = _xpu_kquant_k_tiles_ok(qweight, qweight_type)
 +    if (qweight_type == _Q5_K_TYPE and esimd_gemv_q5_k is not None
 +            and not _force_dq and not _no_q5 and _k_tiles_ok):
@@ -5402,7 +5463,7 @@ index 5c1e7a63e..46ab6bb8e 100644
 +            not _NO_KQUANT_M
 +            and esimd_gemv_q5_k_m is not None
 +            and 2 <= M <= 16
-+            and (ql.shape[1] * 2) % (_Q5Q6_VL // 2) == 0
++            and (ql.shape[1] * 2) % _Q5Q6_VL == 0
 +        ):
 +            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
 +            esimd_gemv_q5_k_m(xf, ql, qh, scale, minv, out)
@@ -5423,7 +5484,7 @@ index 5c1e7a63e..46ab6bb8e 100644
 +            not _NO_KQUANT_M
 +            and esimd_gemv_q6_k_m is not None
 +            and 2 <= M <= 16
-+            and (ql.shape[1] * 2) % (_Q5Q6_VL // 2) == 0
++            and (ql.shape[1] * 2) % _Q5Q6_VL == 0
 +        ):
 +            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
 +            esimd_gemv_q6_k_m(xf, ql, qh, scale, out)
@@ -5689,7 +5750,7 @@ index 5c1e7a63e..46ab6bb8e 100644
 +                return False
 +        elif kind in ("q5_k", "q6_k"):
 +            op = esimd_gemv_q5_k_m if kind == "q5_k" else esimd_gemv_q6_k_m
-+            if op is None or (rep[1].shape[1] * 2) % (_Q5Q6_VL // 2):
++            if op is None or (rep[1].shape[1] * 2) % _Q5Q6_VL:
 +                return False
 +        else:
 +            return False
@@ -5733,11 +5794,11 @@ index 5c1e7a63e..46ab6bb8e 100644
 +            return False
 +        esimd_gemv_q4_k_m(x, rep[1], rep[2], rep[3], out)
 +    elif kind == "q5_k":
-+        if esimd_gemv_q5_k_m is None or (rep[1].shape[1] * 2) % (_Q5Q6_VL // 2):
++        if esimd_gemv_q5_k_m is None or (rep[1].shape[1] * 2) % _Q5Q6_VL:
 +            return False
 +        esimd_gemv_q5_k_m(x, rep[1], rep[2], rep[3], rep[4], out)
 +    elif kind == "q6_k":
-+        if esimd_gemv_q6_k_m is None or (rep[1].shape[1] * 2) % (_Q5Q6_VL // 2):
++        if esimd_gemv_q6_k_m is None or (rep[1].shape[1] * 2) % _Q5Q6_VL:
 +            return False
 +        esimd_gemv_q6_k_m(x, rep[1], rep[2], rep[3], out)
 +    else:
@@ -6645,7 +6706,7 @@ index 8efe9aae9..8a33403ef 100644
  
  
  def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
-@@ -129,6 +141,28 @@ def _set_kv_buffer_impl(
+@@ -129,6 +141,33 @@ def _set_kv_buffer_impl(
              row_dim,
          )
  
@@ -6657,7 +6718,12 @@ index 8efe9aae9..8a33403ef 100644
 +        _is_xpu
 +        and same_kv_dim
 +        and _esimd_kv_scatter is not None
-+        and store_dtype.itemsize == 2
++        # store_dtype == float16, NOT itemsize == 2: bfloat16 is also 2 bytes and
++        # the kernel hard-requires Half on all four tensors
++        # (esimd_kernel.sycl:1979-1983), so an itemsize proxy admitted every bf16
++        # model straight into a TORCH_CHECK abort on its first KV write --
++        # Llama-3-8B TP=8 bf16 has row_dim 128, which passes every other clause.
++        and store_dtype == torch.float16
 +        and row_dim % 32 == 0
 +        and k.numel() > 0
 +    ):
@@ -7087,7 +7153,7 @@ index 000000000..7bbbd2d5b
 +        )
 +
 +
-+@eager_on_xpu_graph(True)
++# @eager_on_xpu_graph(True) # Disabled to allow XPU Graph for extend
 +def xpu_break_graph() -> None:
 +    """Insert an XPU graph break. The decorator performs the segment split; the
 +    body is intentionally empty. Call this right BEFORE an op that must run eager
@@ -7095,7 +7161,7 @@ index 000000000..7bbbd2d5b
 +    pass
 +
 +
-+@eager_on_xpu_graph(True)
++# @eager_on_xpu_graph(True) # Disabled to allow XPU Graph for extend
 +def run_eager_between_segments(fn: Callable, *args, **kwargs):
 +    """Run ``fn(*args, **kwargs)`` as an EAGER break point between graph segments.
 +

@@ -3,6 +3,7 @@
  */
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/all.h>
+#include <torch/extension.h>
 #include <torch/library.h>
 #include <Python.h>
 
@@ -44,9 +45,8 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
          &esimd_gdn_conv_fused_seq_spec);
 }
 
-PyMODINIT_FUNC PyInit_custom_esimd_kernels_lgrf() {
-    static struct PyModuleDef module = {
-        PyModuleDef_HEAD_INIT, "custom_esimd_kernels_lgrf", nullptr, 0, nullptr
-    };
-    return PyModule_Create(&module);
-}
+// Ops are registered globally via TORCH_LIBRARY_FRAGMENT; this only supplies the
+// module init symbol CPython requires to import the .so.
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
+
+

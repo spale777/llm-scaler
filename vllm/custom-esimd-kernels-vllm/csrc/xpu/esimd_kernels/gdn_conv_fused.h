@@ -103,7 +103,7 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     fp16* __restrict__ output_ptr,
     fp16* __restrict__ z_out_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
-    float attn_scale, int64_t conv_stride0, int64_t ssm_stride0,
+    float attn_scale, int64_t conv_stride0, int64_t conv_rows, int64_t ssm_stride0, int64_t ssm_rows,
     nd_item<3>& ndi)
 {
     slm_init<2048>();
@@ -181,7 +181,9 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     // -- lo chunk (only useful_threads load; dead threads keep zero) --
     simd<fp16, 64> x_fp16(0);
     simd<float, 64> s0(0.0f), s1(0.0f), s2(0.0f), conv_result(0.0f);
-    if (is_valid) {
+    // conv_idx is -1 for a padding slot, which makes cstate_base point before
+    // the allocation.
+    if (is_valid && conv_idx >= 0 && conv_idx < conv_rows) {
         x_fp16 = block_load<fp16, 64>(qkvz_row + qkvz_offset);
         simd<float, 64> x_f32 = x_fp16;
 
@@ -204,7 +206,8 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     simd<fp16, 64> x_fp16_hi;
     simd<float, 64> s0_hi, s1_hi, s2_hi, conv_result_hi;
 
-    if (double_v && tid >= 4 * H && is_valid) {
+    if (double_v && tid >= 4 * H && is_valid && conv_idx >= 0
+            && conv_idx < conv_rows) {
         x_fp16_hi = block_load<fp16, 64>(qkvz_row + qkvz_offset_hi);
         simd<float, 64> x_f32_hi = x_fp16_hi;
 
@@ -251,7 +254,7 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     barrier();
 
     // ---- Phase 2: GDN (V/4 threads, V_PER_THREAD=4) ----
-    if (ssm_idx >= 0 && tid * 4 < gdn_V) {
+    if (ssm_idx >= 0 && ssm_idx < ssm_rows && tid * 4 < gdn_V) {
         // Load q, k from SLM
         simd<float, 64> q_lo = slm_block_load<float, 64>(SLM_Q_LO);
         simd<float, 64> q_hi = slm_block_load<float, 64>(SLM_Q_HI);
@@ -347,7 +350,8 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
             xmem::cache_hint::streaming, xmem::cache_hint::write_back>(
             out, simd<fp16, 4>(o_acc));
     } else {
-        // ssm_idx < 0: write zeros (eliminates need for caller .zero_())
+        // No usable ssm slot (negative, or past ssm_rows): write zeros, which
+        // the caller relies on instead of its own .zero_().
         int vi0_z = tid * 4;
         fp16* out = output_ptr + (int64_t)seq_idx * HV * gdn_V + (int64_t)hv * gdn_V + vi0_z;
         xmem::lsc_block_store<fp16, 4,
@@ -412,14 +416,14 @@ ESIMD_INLINE void conv_state_shift_kernel(
     fp16* __restrict__ conv_state_ptr,
     const int* __restrict__ conv_state_indices_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
-    int64_t conv_stride0,
+    int64_t conv_stride0, int64_t conv_rows,
     nd_item<3>& ndi)
 {
     const int seq_idx = ndi.get_group(0);
     const int tid = ndi.get_local_id(2);
 
     const int conv_idx = conv_state_indices_ptr[seq_idx];
-    if (conv_idx < 0) return;
+    if (conv_idx < 0 || conv_idx >= conv_rows) return;
 
     const int heads_per_group = HV / H;
     const int dim = 2 * H * gdn_K + HV * gdn_V;
@@ -512,8 +516,8 @@ inline void gdn_conv_fused_host(
     fp16* z_out_ptr,
     int N, int H, int HV, int K, int V,
     float scale,
-    int64_t conv_stride0,
-    int64_t ssm_stride0,
+    int64_t conv_stride0, int64_t conv_rows,
+    int64_t ssm_stride0, int64_t ssm_rows,
     sycl::queue& q)
 {
     constexpr int WG_SIZE = 32;
@@ -530,7 +534,8 @@ inline void gdn_conv_fused_host(
                 A_log_ptr, dt_bias_ptr, ba_ptr, ba_stride0,
                 ssm_state_ptr, ssm_state_indices_ptr,
                 output_ptr, z_out_ptr,
-                N, H, HV, K, V, scale, conv_stride0, ssm_stride0,
+                N, H, HV, K, V, scale, conv_stride0, conv_rows,
+                ssm_stride0, ssm_rows,
                 ndi);
         });
     });
@@ -547,7 +552,7 @@ inline void gdn_conv_fused_host(
                 qkvz_ptr, qkvz_stride0, conv_state_ptr,
                 conv_state_indices_ptr,
                 N, H, HV, K, V,
-                conv_stride0, ndi);
+                conv_stride0, conv_rows, ndi);
         });
     });
 }

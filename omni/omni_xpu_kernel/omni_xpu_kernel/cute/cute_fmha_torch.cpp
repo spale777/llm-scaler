@@ -315,12 +315,14 @@ void run_d128_tile(
 
 // ---- public op --------------------------------------------------------------
 at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  const at::DeviceGuard device_guard(q.device());
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "cute_fmha: expect [B,L,H,D]");
   // All three operands must be on XPU and share q's dtype — the kernel takes raw
   // data_ptr()s and reinterprets them as q's element type, so a CPU tensor or a
   // dtype mismatch would feed invalid pointers / misread data.
-  TORCH_CHECK(q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
-              "cute_fmha: q, k, v must all be XPU tensors (got ",
+  TORCH_CHECK(q.device().is_xpu() && k.device() == q.device() &&
+                  v.device() == q.device(),
+              "cute_fmha: q, k, v must be XPU tensors on one device (got ",
               q.device(), ", ", k.device(), ", ", v.device(), ")");
   TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
               "cute_fmha: q, k, v must share dtype (got ",
@@ -390,9 +392,11 @@ at::Tensor sdp_wan22_cross(
   TORCH_CHECK(
       q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
       "cute_fmha: Wan 2.2 cross attention expects [B,L,H,D]");
+  const at::DeviceGuard device_guard(q.device());
   TORCH_CHECK(
-      q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
-      "cute_fmha: Wan 2.2 cross attention requires XPU tensors");
+      q.device().is_xpu() && k.device() == q.device() &&
+          v.device() == q.device(),
+      "cute_fmha: Wan 2.2 cross attention requires XPU tensors on one device");
   TORCH_CHECK(
       q.scalar_type() == at::kHalf &&
           k.scalar_type() == at::kHalf &&
@@ -473,6 +477,7 @@ bool use_minimax_h3_h56_mmak16(
 
 at::Tensor sdp_bhld_d128(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  const at::DeviceGuard device_guard(q.device());
   TORCH_CHECK(
       q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
       "cute_fmha: D128 attention expects BHLD tensors");
@@ -546,6 +551,7 @@ at::Tensor sdp_bhld_d128(
 
 at::Tensor sdp_minimax_h3_vae_d64(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  const at::DeviceGuard device_guard(q.device());
   TORCH_CHECK(
       q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
       "cute_fmha: MiniMax H3 VAE attention expects BHLD tensors");
@@ -656,10 +662,12 @@ at::Tensor sdp_minimax_h3_vae_d64(
 
 at::Tensor sdp_bhld_d120(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  const at::DeviceGuard device_guard(q.device());
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
               "cute_fmha: expect BHLD tensors");
-  TORCH_CHECK(q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
-              "cute_fmha: q, k, v must all be XPU tensors");
+  TORCH_CHECK(q.device().is_xpu() && k.device() == q.device() &&
+                  v.device() == q.device(),
+              "cute_fmha: q, k, v must be XPU tensors on one device");
   TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
               "cute_fmha: q, k, v must share dtype");
 
