@@ -141,3 +141,80 @@ def test_patch_does_not_advertise_an_unbuilt_allreduce():
         "the flag advertises a custom all-reduce that is not wired up; "
         "torch.ops.vllm.all_reduce routes to oneCCL regardless"
     )
+
+
+def test_peer_memory_is_opened_against_the_queues_context():
+    """A pointer opened against a different context faults inside a kernel.
+
+    Every rank must map through the context its own queue runs on, which is
+    the one PyTorch's XPU runtime owns. Creating a fresh context here is the
+    natural shortcut and yields peer pointers that are accepted at map time
+    and fail at first use.
+    """
+    src = _code(_AR_CC)
+    i = src.find("void register_buffer_ctx")
+    assert i >= 0, "register_buffer_ctx not found; re-derive this test"
+    body = src[i:src.find("std::string export_buffer_handle", i)]
+    assert "getCurrentXPUStream" in body and "get_context()" in body, (
+        "peer buffers must be opened against the current stream's context"
+    )
+    assert "sycl::context(" not in body, (
+        "a freshly constructed context gives peer pointers that fault in a kernel"
+    )
+
+
+def test_peer_probe_checks_atomics_over_ordered_pairs():
+    """The flag handshake does atomics on peer memory.
+
+    access_supported is not enough: concurrent atomic modify is undefined when
+    the device denies atomics for that pair. Peer access is one-directional,
+    so a world of N needs N*(N-1) checks and a loop that skips the reverse
+    direction passes on a topology that only works one way.
+    """
+    src = _code(_AR_CC)
+    i = src.find("bool peer_access_supported")
+    assert i >= 0, "the peer probe is missing"
+    body = src[i:i + 1200]
+    assert "atomics_supported" in body, (
+        "the probe accepts access without atomics, which the flag protocol needs"
+    )
+    # Two nested loops over the device list, not a triangular single pass.
+    assert body.count("for (") >= 2, (
+        "the probe must cover ordered pairs in both directions"
+    )
+
+
+def test_registration_cannot_silently_succeed():
+    """ctx->ready gates the collective; a no-op registration must not set it.
+
+    The schema-compatible register_buffer overload cannot reach the context,
+    so it refuses rather than returning while leaving the caller believing the
+    peers were mapped.
+    """
+    src = _code(_AR_CC)
+    i = src.find("void register_buffer(")
+    assert i >= 0, "register_buffer not found"
+    body = src[i:src.find("void register_buffer_ctx", i)]
+    assert re.search(r"TORCH_CHECK\(\s*false\s*,", body), (
+        "the context-free overload must refuse, not return silently"
+    )
+    ctx_i = src.find("void register_buffer_ctx")
+    ctx_body = src[ctx_i:src.find("std::string export_buffer_handle", ctx_i)]
+    assert "ctx->ready = true;" in ctx_body, (
+        "the real registration must mark the context ready"
+    )
+    assert ctx_body.index("ctx->ready = true;") > ctx_body.rindex("ipc::open("), (
+        "ready is set before every peer is mapped"
+    )
+
+
+def test_mapped_peers_are_released():
+    """IPC handles are file descriptors and leak one per peer per process."""
+    src = _code(_AR_CC)
+    i = src.find("void dispose_ctx")
+    assert i >= 0, "dispose_ctx not found; mapped peers are never released"
+    body = src[i:i + 900]
+    assert "ipc::close(" in body, "dispose_ctx does not close the peer mappings"
+    assert "ctx->ready = false;" in body, (
+        "a disposed context must not still admit collectives"
+    )
