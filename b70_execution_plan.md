@@ -234,9 +234,18 @@ every launch in the repo is `-pp=1`, so the path has never run.
 - Set `FI_PROVIDER` explicitly and identically across ranks (mismatch causes OFI init to
   hang rather than error) — `shm` intra-node, `tcp`/`verbs` inter-node. **Never `sockets`.**
 
-**Remaining work is validation, not construction:** run `-pp=2 -tp=8` on 16 cards and
-confirm the parity harness passes and no rank deadlocks. Until that runs, PP is
-*untested*, which is a weaker claim than *unbuilt* but still not *working*.
+The launch path is built: `vllm/tools/platform/topology_affinity.py` derives the rank
+order from the real PCIe hierarchy (sysfs, or a saved `lspci -tvnn` capture so a layout
+can be planned off-box) and `launch_tp_pp.sh` consumes it. On the 16-card target it
+places TP group 0 entirely on switch A, TP group 1 entirely on switch B, and eight PP
+pairs each crossing the boundary — one per TP rank position, exactly the layout §9
+specifies. It warns and exits non-zero when no switch can hold a TP group intact, so a
+topology that would force the all-reduce over the uplinks is refused rather than run
+slowly. Verified for tp/pp of 1x1, 2x1, 4x1, 8x1, 4x2, 2x4 and 8x2.
+
+**Remaining work is one run, not construction:** execute `-pp=2 -tp=8` on 16 physical
+cards and confirm the parity harness passes and no rank deadlocks. Until that runs, PP
+is *untested*, which is weaker than *unbuilt* but still not *working*.
 
 ### 3.6 Integration contract
 
