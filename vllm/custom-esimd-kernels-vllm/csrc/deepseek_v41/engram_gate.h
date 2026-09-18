@@ -47,6 +47,22 @@ namespace dsv41_engram {
 using namespace sycl;
 using namespace sycl::ext::intel::esimd;
 
+// The scalar sycl:: math functions are rejected inside an ESIMD kernel, and
+// the rejection only appears at device codegen -- a syntax-only check passes.
+// ESIMD's own overloads take vectors, so a one-wide simd is the scalar form.
+ESIMD_INLINE float ds_rsqrt(float x) {
+  simd<float, 1> v = x;
+  return rsqrt(v)[0];
+}
+ESIMD_INLINE float ds_sqrt(float x) {
+  simd<float, 1> v = x;
+  return sqrt(v)[0];
+}
+ESIMD_INLINE float ds_exp(float x) {
+  simd<float, 1> v = x;
+  return exp(v)[0];
+}
+
 // One work-item per (token, hc copy): that is exactly the granularity the
 // normalisation is defined at, so no cross-item reduction is needed.
 template <int D>
@@ -85,17 +101,20 @@ struct EngramGateKernel {
     // which casts to float before the reduction.
     const float h_ms = reduce<float>(hv * hv, std::plus<>()) / (float)D;
     const float k_ms = reduce<float>(kv * kv, std::plus<>()) / (float)D;
-    const float rstd = sycl::rsqrt(h_ms + eps) * sycl::rsqrt(k_ms + eps);
+    // The scalar sycl math functions are not callable from an ESIMD kernel, so
+    // every one of these goes through a one-wide simd. This is invisible to
+    // -fsyntax-only and only fails at device codegen.
+    const float rstd = ds_rsqrt(h_ms + eps) * ds_rsqrt(k_ms + eps);
 
     const float dot =
-        reduce<float>(hv * wv * kv, std::plus<>()) * rstd * sycl::rsqrt((float)D);
+        reduce<float>(hv * wv * kv, std::plus<>()) * rstd * ds_rsqrt((float)D);
 
     // Floor the magnitude, take the root, restore the sign.
     float a = dot < 0.0f ? -dot : dot;
     if (a < clamp_value) a = clamp_value;
-    float g = sycl::sqrt(a);
+    float g = ds_sqrt(a);
     if (dot < 0.0f) g = -g;
-    float gate = 1.0f / (1.0f + sycl::exp(-g));
+    float gate = 1.0f / (1.0f + ds_exp(-g));
 
     if (mask != nullptr && mask[t] == 0) gate = 0.0f;
 

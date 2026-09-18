@@ -847,7 +847,7 @@ def test_engram_gate_restores_the_sign_after_the_root():
     assert "if (dot < 0.0f) g = -g;" in src, (
         "the sign is not restored after the square root"
     )
-    i = src.find("sycl::sqrt(a)")
+    i = src.find("ds_sqrt(a)")
     assert i >= 0, "the root is no longer applied to the clamped magnitude"
     assert "a < clamp_value" in src, (
         "the clamp must floor the magnitude before the root"
@@ -1202,3 +1202,22 @@ def test_rotary_inverse_undoes_the_rotation():
     for s in range(S):
         for d in range(D):
             assert abs(back[s][d] - x[s][d]) < 1e-12
+
+
+def test_esimd_kernels_avoid_scalar_sycl_math():
+    """sycl::rsqrt and friends are rejected inside an ESIMD kernel.
+
+    The rejection appears only at device codegen: compile_check.sh is
+    -fsyntax-only and passes a translation unit that cannot be AOT compiled.
+    ESIMD's own overloads take vectors, so the scalar form is a one-wide simd.
+    """
+    offenders = []
+    for path in sorted(_DS.glob("*.h")):
+        src = code(path.read_text())
+        for m in re.finditer(r"sycl::(rsqrt|sqrt|exp|log|tanh|pow)\s*\(", src):
+            line = src[:m.start()].count("\n") + 1
+            offenders.append(f"{path.name}:{line} sycl::{m.group(1)}")
+    assert not offenders, (
+        "scalar sycl:: math in an ESIMD kernel fails at device codegen, which "
+        "a syntax-only check does not reach:\n  " + "\n  ".join(offenders)
+    )
