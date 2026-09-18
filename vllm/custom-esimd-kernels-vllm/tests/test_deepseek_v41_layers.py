@@ -38,6 +38,42 @@ def plans():
         CANDIDATE_SOURCE)
 
 
+def test_constants_here_match_the_transcribed_config():
+    """These are the numbers the plan is derived from.
+
+    dsv41_config.py is the transcription of config.json the kernel tests check
+    against; drifting from it here would make this module agree with itself
+    about a model that does not exist.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import dsv41_config as cfg
+
+    assert NUM_LAYERS == cfg.NUM_HIDDEN_LAYERS
+    assert COMPRESS_RATIOS == cfg.COMPRESS_RATIOS
+    assert KV_SOURCES == cfg.KV_SOURCE_LAYER_IDS
+    assert INDEX_SOURCES == cfg.INDEX_SOURCE_LAYER_IDS
+    assert CANDIDATE_SOURCE == cfg.CANDIDATE_SOURCE_LAYER_ID
+
+
+def test_the_plan_indexes_compress_ratios_rather_than_zipping_it():
+    """The published list is longer than the layer count.
+
+    `zip(range(layers), compress_ratios)` reads correctly today and silently
+    truncates the moment the list is shorter, shifting no layer but dropping
+    the tail; indexing with an explicit length check fails instead.
+    """
+    src = _MOD.read_text()
+    assert "compress_ratios[lid]" in src, (
+        "the plan must index compress_ratios by layer id"
+    )
+    assert "len(compress_ratios) < num_hidden_layers" in src, (
+        "a list shorter than the layer count must be refused, not truncated"
+    )
+    assert "zip(" not in src, (
+        "zipping compress_ratios against the layers truncates silently"
+    )
+
+
 def test_compress_ratios_is_longer_than_the_layer_count():
     """The published list carries three entries past the last layer.
 
