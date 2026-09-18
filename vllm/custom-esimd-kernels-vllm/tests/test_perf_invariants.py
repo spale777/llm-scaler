@@ -426,3 +426,28 @@ def test_nmajor_scale_reads_are_not_scalar_strided(path):
         f"{path.name}: expected the gate, up and down scale streams to gather; "
         f"found {len(gathers)}"
     )
+
+
+_PREFILL_DPAS = _SGL / "xpu/esimd_kernels/prefill_dpas.h"
+
+
+def test_prefill_dpas_checks_the_device_slm_budget():
+    """104 KB per work-group is a request, not a guarantee.
+
+    The static_assert covers the 128 KB architectural per-core budget, but the
+    amount a driver exposes to a single work-group is a device property and is
+    not the same number on every Battlemage part. Without the runtime check the
+    kernel fails to launch and says nothing about which resource was short.
+    """
+    if not _PREFILL_DPAS.exists():
+        pytest.skip(f"{_PREFILL_DPAS} not present")
+    src = code(_PREFILL_DPAS.read_text())
+    i = src.find("sdp_paged_prefill_dpas_host")
+    assert i >= 0, "host launcher not found -- re-derive this test"
+    body = src[i:]
+    assert "local_mem_size" in body, (
+        "the host launcher must query the device SLM size before launching"
+    )
+    assert "PF_TOTAL_SLM" in body, (
+        "the check must compare against the kernel's own SLM request"
+    )

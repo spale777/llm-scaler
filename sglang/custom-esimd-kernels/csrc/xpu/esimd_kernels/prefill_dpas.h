@@ -1,4 +1,5 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
 /* prefill_dpas.h — DPAS-based prefill SDPA kernel for HD=256 on Xe2/Xe3.
  *
  * Ported from frameworks.ai.client-ai.esimd-kernels Windows tree
@@ -892,6 +893,18 @@ inline void sdp_paged_prefill_dpas_host(
     int num_tokens, int batch, int num_kv_blocks,
     sycl::queue& dpcpp_queue)
 {
+    // PF_TOTAL_SLM is a per-work-group request. The architectural per-core
+    // budget is 128 KB, but the limit a driver exposes to one work-group is a
+    // device property and can be lower on a smaller Battlemage part, in which
+    // case the launch fails with no indication of which resource was short.
+    {
+        const uint64_t have =
+            dpcpp_queue.get_device().get_info<sycl::info::device::local_mem_size>();
+        TORCH_CHECK(have >= (uint64_t)PF_TOTAL_SLM,
+                    "sdp_paged_prefill_dpas: kernel needs ", (uint32_t)PF_TOTAL_SLM,
+                    " bytes of SLM per work-group, device exposes ", have);
+    }
+
     // Each WG handles up to PF_WG_Q_ROWS query rows.
     int max_q_tiles_per_req = (num_tokens + (int)PF_WG_Q_ROWS - 1) / (int)PF_WG_Q_ROWS;
     int64_t total_wgs = (int64_t)batch * max_q_tiles_per_req * num_heads;
