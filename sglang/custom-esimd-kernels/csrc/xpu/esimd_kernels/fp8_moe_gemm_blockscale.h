@@ -344,14 +344,13 @@ inline void moe_gemm_fp8_blockscale_prefill_host(
   });
 }
 
-template <int VL, int MAX_M>
+template <int VL, int BK, int MAX_M>
 inline void launch_moe_gemv_block(const fp16* input, const uint8_t* weight,
                                   const float* wscale, fp16* output,
                                   const uint32_t* expert_idx,
                                   const int32_t* active_experts, int n_active,
                                   int N, int K, int Nb, int Kb, int num_experts,
                                   int block_n, sycl::queue& q) {
-  constexpr int BK = 128;
   moe_gemv_block_kernel<VL, BK, MAX_M> kern{
       input,      weight, wscale, output,      expert_idx,
       active_experts, N,  K,      Nb,          Kb,         num_experts,
@@ -377,15 +376,21 @@ inline void moe_gemm_fp8_blockscale_host(
   const int Nb = (N + block_n - 1) / block_n;
   const int Kb = (K + block_k - 1) / block_k;
   constexpr int MAX_M = 8;
-  const int VL = (K % 256 == 0) ? 256 : 128;
-  if (VL == 256)
-    launch_moe_gemv_block<256, MAX_M>(input, weight, weight_scale, output,
-                                      expert_idx, active_experts, n_active, N, K,
-                                      Nb, Kb, num_experts, block_n, q);
-  else
-    launch_moe_gemv_block<128, MAX_M>(input, weight, weight_scale, output,
-                                      expert_idx, active_experts, n_active, N, K,
-                                      Nb, Kb, num_experts, block_n, q);
+  // VL must be a whole number of scale blocks: the kernel folds one scale per
+  // BK-wide slice of the VL it just loaded.
+  const int VL = (block_k <= 128 && K % 256 == 0) ? 256 : 128;
+#define MOE_BS_LAUNCH(V, BKV)                                                  \
+  launch_moe_gemv_block<V, BKV, MAX_M>(input, weight, weight_scale, output,    \
+                                       expert_idx, active_experts, n_active,   \
+                                       N, K, Nb, Kb, num_experts, block_n, q)
+  if (block_k == 32) {
+    if (VL == 256) MOE_BS_LAUNCH(256, 32); else MOE_BS_LAUNCH(128, 32);
+  } else if (block_k == 64) {
+    if (VL == 256) MOE_BS_LAUNCH(256, 64); else MOE_BS_LAUNCH(128, 64);
+  } else {
+    if (VL == 256) MOE_BS_LAUNCH(256, 128); else MOE_BS_LAUNCH(128, 128);
+  }
+#undef MOE_BS_LAUNCH
 }
 
 }  // namespace fp8_moe_blockscale

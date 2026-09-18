@@ -520,3 +520,39 @@ def test_mixed_moe_module_does_not_force_large_grf_on_every_kernel():
         f"only {checked} setup file(s) declared the MoE module; this test "
         "would pass without examining the flag it exists to pin"
     )
+
+
+_MOE_BLOCKSCALE = [
+    _VLLM / "xpu/esimd_kernels/fp8_moe_gemm_blockscale.h",
+    _SGL / "xpu/esimd_kernels/fp8_moe_gemm_blockscale.h",
+]
+
+
+@pytest.mark.parametrize("path", _MOE_BLOCKSCALE, ids=_ids)
+def test_moe_blockscale_uses_the_requested_k_block(path):
+    """block_k reaches the kernel instead of being accepted and ignored.
+
+    The decode launcher pinned `constexpr int BK = 128` while its host took
+    block_k as a parameter, so a 32- or 64-wide K block was silently scaled as
+    though it were 128: every weight past the first block gets the wrong scale
+    and the output is plausible but wrong. DeepSeek V4.1 uses 32.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    c = code(path.read_text())
+    i = c.find("inline void launch_moe_gemv_block")
+    assert i >= 0, "the decode launcher was renamed; re-derive this test"
+    body = c[i:c.find("inline void moe_gemm_fp8_blockscale_host", i)]
+    assert not re.search(r"constexpr\s+int\s+BK\s*=\s*\d+", body), (
+        "the decode launcher pins BK; block_k would be ignored"
+    )
+    assert "int BK," in c[c.find("template", i - 200):i + 80] or \
+           "int VL, int BK, int MAX_M" in c, (
+        "BK must be a template parameter of the decode launcher"
+    )
+    # The host must actually branch on the runtime value.
+    host = c[c.find("inline void moe_gemm_fp8_blockscale_host"):]
+    assert "block_k == 32" in host and "block_k == 64" in host, (
+        "the host does not dispatch the narrower K blocks, so requesting one "
+        "silently falls back to 128"
+    )

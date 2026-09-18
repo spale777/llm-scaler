@@ -176,13 +176,15 @@ at::Tensor esimd_moe_gemm_fp8_blockscale(
     TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
                 "esimd_moe_gemm_fp8_blockscale: output must be fp16");
     // The prefill path tiles N 16 wide and applies one scale per tile, so an
-    // N-block must be a whole number of tiles. block_k stays 128: the kernels
-    // take it as a compile-time constant.
+    // N-block must be a whole number of tiles. The decode kernel folds one
+    // scale per BK-wide slice of the vector it loaded, so a K-block must
+    // divide that vector: 32, 64 and 128 are instantiated.
     TORCH_CHECK(block_n == 128 || block_n == 32,
                 "esimd_moe_gemm_fp8_blockscale: block_n must be 32 or 128, got ",
                 block_n);
-    TORCH_CHECK(block_k == 128,
-                "esimd_moe_gemm_fp8_blockscale: block_k must be 128, got ", block_k);
+    TORCH_CHECK(block_k == 128 || block_k == 64 || block_k == 32,
+                "esimd_moe_gemm_fp8_blockscale: block_k must be 32, 64 or 128, got ",
+                block_k);
     TORCH_CHECK(K % block_k == 0,
                 "esimd_moe_gemm_fp8_blockscale: K must be a multiple of block_k");
     // The kernel indexes weight_scale as [E, Nb, Kb].
