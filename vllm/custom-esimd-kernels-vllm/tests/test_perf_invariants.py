@@ -451,3 +451,72 @@ def test_prefill_dpas_checks_the_device_slm_budget():
     assert "PF_TOTAL_SLM" in body, (
         "the check must compare against the kernel's own SLM request"
     )
+
+
+_BLOCKSCALE = [
+    _VLLM / "xpu/esimd_kernels/fp8_moe_gemm_blockscale.h",
+    _SGL / "xpu/esimd_kernels/fp8_moe_gemm_blockscale.h",
+]
+
+
+@pytest.mark.parametrize("path", _BLOCKSCALE, ids=_ids)
+def test_dpas_prefill_requests_large_grf_per_kernel(path):
+    """The register file is picked per kernel, not per translation unit.
+
+    moe_gemm_block_prefill_kernel holds acc[8] of simd<float,128> -- 4 KB
+    before its operands -- so it needs the 256-register file. The kernels it
+    shares a module with (topk, scatter, silu, gather) hold under 300 B, and a
+    module-wide -doubleGRF halves their threads per vector engine from 8 to 4
+    to buy them nothing. grf_size<256> on the one kernel that needs it keeps
+    both correct.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    src = path.read_text()
+    i = src.find("struct moe_gemm_block_prefill_kernel")
+    assert i >= 0, "prefill kernel not found -- re-derive this test"
+    j = src.find("\nstruct ", i + 10)
+    body = src[i:] if j < 0 else src[i:j]
+    assert "grf_size<256>" in body, (
+        "the DPAS prefill kernel must request the large register file itself; "
+        "otherwise it depends on a module-wide flag that penalises its "
+        "translation-unit siblings"
+    )
+
+
+def test_mixed_moe_module_does_not_force_large_grf_on_every_kernel():
+    """-doubleGRF is module-wide; the MoE module is not single-purpose.
+
+    esimd_kernel_moe.sycl pulls in both moe_ops.h (light, row-parallel) and
+    fp8_moe_gemm_blockscale.h (heavy DPAS). Building the whole module large-GRF
+    halves occupancy for the light majority. The genuinely single-purpose
+    modules (GDN conv, grouped GGUF, prefill DPAS) keep the flag.
+    """
+    setups = [
+        Path(__file__).resolve().parents[1] / "setup.py",
+        Path(__file__).resolve().parents[1] / "setup_sycl.py",
+        _ROOT / "sglang/custom-esimd-kernels/setup.py",
+    ]
+    checked = 0
+    for setup in setups:
+        if not setup.exists():
+            continue
+        src = setup.read_text()
+        i = src.find("esimd_kernel_moe.sycl")
+        if i < 0:
+            continue
+        checked += 1
+        # The compile args for the module that owns this source.
+        seg = src[i:i + 1200]
+        end = seg.find("ext_modules.append")
+        if end > 0:
+            seg = seg[:end]
+        assert "doubleGRF" not in seg, (
+            f"{setup.name}: the module containing esimd_kernel_moe.sycl is "
+            "built -doubleGRF, which halves occupancy for its light kernels; "
+            "the DPAS kernel requests grf_size<256> for itself instead"
+        )
+    assert checked >= 2, (
+        f"only {checked} setup file(s) declared the MoE module; this test "
+        "would pass without examining the flag it exists to pin"
+    )

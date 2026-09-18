@@ -64,8 +64,11 @@ ext_modules.append(
 )
 ### for lgrf esimd kernels
 
-### The FP8 block-scale prefill kernel holds ~5.5 KB of live DPAS state, which
-### is why this module alone is built with -doubleGRF.
+### The FP8 block-scale prefill kernel holds ~5.5 KB of live DPAS state and
+### requests the large register file itself, via grf_size<256> on the kernel.
+### The module also carries the light topk/scatter/silu/gather kernels, whose
+### live state is under 300 B, so a module-wide -doubleGRF would halve their
+### occupancy to buy nothing. per_kernel code split keeps the two apart.
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_sglang.custom_esimd_kernels_moe",
@@ -79,7 +82,7 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", "-device bmg -options -doubleGRF -cl-intel-enable-auto-fma", f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", "-device bmg -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,

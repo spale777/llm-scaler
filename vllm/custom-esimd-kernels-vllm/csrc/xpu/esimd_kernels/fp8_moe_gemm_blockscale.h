@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 namespace fp8_moe_blockscale {
 
@@ -196,6 +197,16 @@ struct moe_gemm_block_prefill_kernel {
   int tile_capacity;
   int N, K, Nb, Kb, num_experts, block_n, block_k;
   int n_wg_count, n_per_wg;
+
+  // acc[8] of simd<float,128> is 4 KB on its own, and the VNNI staging plus
+  // the fp16 B tile carry it past the 8 KB a thread gets in small-GRF mode.
+  // Requesting the large file per kernel keeps the choice attached to the
+  // kernel that needs it, rather than halving occupancy for every other
+  // kernel that happens to share the translation unit.
+  auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+    return sycl::ext::oneapi::experimental::properties{
+        sycl::ext::intel::experimental::grf_size<256>};
+  }
 
   void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
     namespace mem = sycl::ext::intel::experimental::esimd;
