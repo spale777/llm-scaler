@@ -763,3 +763,127 @@ def test_sparse_attn_sink_enters_only_the_denominator():
     assert "acc" not in stmt, (
         "the sink touches the accumulator; the reference leaves it alone"
     )
+
+
+# --- engram gate ------------------------------------------------------------
+
+_ENGRAM = _DS / "engram_gate.h"
+
+
+def _kernel_engram(h, key, w, val, mask, T, HC, D, eps, clamp):
+    """Mirror of EngramGateKernel."""
+    out = [[[0.0] * D for _ in range(HC)] for _ in range(T)]
+    for t in range(T):
+        for c in range(HC):
+            hv, kv, wv = h[t][c], key[t][c], w[c]
+            h_ms = sum(x * x for x in hv) / D
+            k_ms = sum(x * x for x in kv) / D
+            rstd = (1 / math.sqrt(h_ms + eps)) * (1 / math.sqrt(k_ms + eps))
+            dot = (sum(hv[i] * wv[i] * kv[i] for i in range(D))
+                   * rstd * (1 / math.sqrt(D)))
+            a = max(abs(dot), clamp)
+            g = math.sqrt(a)
+            if dot < 0:
+                g = -g
+            gate = 1 / (1 + math.exp(-g))
+            if mask is not None and mask[t] == 0:
+                gate = 0.0
+            out[t][c] = [hv[i] + val[t][i] * gate for i in range(D)]
+    return out
+
+
+def _engram_fixture(seed=4, T=4, HC=4, D=16):
+    import random
+    random.seed(seed)
+    h = [[[random.uniform(-2, 2) for _ in range(D)] for _ in range(HC)]
+         for _ in range(T)]
+    key = [[[random.uniform(-2, 2) for _ in range(D)] for _ in range(HC)]
+           for _ in range(T)]
+    w = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(HC)]
+    val = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(T)]
+    return h, key, w, val, T, HC, D
+
+
+def test_engram_gate_matches_the_reference():
+    h, key, w, val, T, HC, D = _engram_fixture()
+    eps, clamp = 1e-6, 1e-6
+    mask = [1, 0, 1, 1]
+    got = _kernel_engram(h, key, w, val, mask, T, HC, D, eps, clamp)
+    for t in range(T):
+        for c in range(HC):
+            hv, kv, wv = h[t][c], key[t][c], w[c]
+            rstd = ((sum(x * x for x in hv) / D + eps) ** -0.5
+                    * (sum(x * x for x in kv) / D + eps) ** -0.5)
+            dot = sum(hv[i] * wv[i] * kv[i] for i in range(D)) * rstd * D ** -0.5
+            gate = 1 / (1 + math.exp(
+                -math.copysign(math.sqrt(max(abs(dot), clamp)), dot)))
+            if not mask[t]:
+                gate = 0.0
+            for i in range(D):
+                want = hv[i] + gate * val[t][i]
+                assert abs(got[t][c][i] - want) < 1e-12
+
+
+def test_engram_gate_restores_the_sign_after_the_root():
+    """copysign(sqrt(|dot|), dot), not sqrt(dot) and not sqrt(|dot|).
+
+    sqrt of a raw negative dot is NaN, and dropping the sign turns every
+    negative gate into its positive twin.
+    """
+    h, key, w, val, T, HC, D = _engram_fixture()
+    eps = clamp = 1e-6
+    negatives = 0
+    for t in range(T):
+        for c in range(HC):
+            hv, kv, wv = h[t][c], key[t][c], w[c]
+            rstd = ((sum(x * x for x in hv) / D + eps) ** -0.5
+                    * (sum(x * x for x in kv) / D + eps) ** -0.5)
+            dot = sum(hv[i] * wv[i] * kv[i] for i in range(D)) * rstd * D ** -0.5
+            if dot < 0:
+                negatives += 1
+    assert negatives > 0, "fixture has no negative dots; not exercising the sign"
+
+    src = code(_ENGRAM.read_text())
+    assert "if (dot < 0.0f) g = -g;" in src, (
+        "the sign is not restored after the square root"
+    )
+    i = src.find("sycl::sqrt(a)")
+    assert i >= 0, "the root is no longer applied to the clamped magnitude"
+    assert "a < clamp_value" in src, (
+        "the clamp must floor the magnitude before the root"
+    )
+
+
+def test_engram_gate_normalises_per_copy_not_jointly():
+    """rstd is per (token, hc copy) over dim.
+
+    Reducing across the copies couples them and changes every gate.
+    """
+    h, key, w, val, T, HC, D = _engram_fixture()
+    differs = 0
+    for t in range(T):
+        joint = sum(sum(x * x for x in h[t][c]) for c in range(HC)) / (HC * D)
+        for c in range(HC):
+            per = sum(x * x for x in h[t][c]) / D
+            if abs(joint - per) > 1e-9:
+                differs += 1
+    assert differs == T * HC, (
+        "per-copy and joint normalisation agree here, so this test is not "
+        "exercising the distinction"
+    )
+    src = code(_ENGRAM.read_text())
+    assert "/ (float)D" in src, "the mean must be over dim alone"
+    assert "HC *" not in src.split("void operator()")[1].split("gate")[0], (
+        "the reduction spans the hc copies"
+    )
+
+
+def test_engram_masked_token_passes_through():
+    h, key, w, val, T, HC, D = _engram_fixture()
+    mask = [1, 0, 1, 1]
+    got = _kernel_engram(h, key, w, val, mask, T, HC, D, 1e-6, 1e-6)
+    for c in range(HC):
+        for i in range(D):
+            assert abs(got[1][c][i] - h[1][c][i]) < 1e-15, (
+                "a masked token must pass through untouched"
+            )

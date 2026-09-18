@@ -11,6 +11,7 @@
 #include "../deepseek_v41/topk_noaux_tc.h"
 #include "../deepseek_v41/lightning_indexer.h"
 #include "../deepseek_v41/sparse_attn.h"
+#include "../deepseek_v41/engram_gate.h"
 
 using namespace sycl::ext::intel::esimd;
 using fp16 = sycl::half;
@@ -207,5 +208,43 @@ void launch_sparse_attn(torch::Tensor& q, torch::Tensor& kv,
             TORCH_CHECK(false,
                         "deepseek_v41_sparse_attn: head_dim must be 128, 256 "
                         "or 512, got ", D);
+    }
+}
+
+
+void launch_engram_gate(torch::Tensor& h, torch::Tensor& key,
+                        torch::Tensor& weight, torch::Tensor& value,
+                        torch::Tensor& mask, torch::Tensor& out, double eps,
+                        double clamp_value) {
+    const int T = (int)h.size(0);
+    const int HC = (int)h.size(1);
+    const int D = (int)h.size(2);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(h.device().index()).queue();
+
+    const float* hp = reinterpret_cast<const float*>(h.data_ptr());
+    const float* kp = reinterpret_cast<const float*>(key.data_ptr());
+    const float* wp = reinterpret_cast<const float*>(weight.data_ptr());
+    const float* vp = reinterpret_cast<const float*>(value.data_ptr());
+    const uint8_t* mp = mask.defined() && mask.numel() > 0
+                            ? reinterpret_cast<const uint8_t*>(mask.data_ptr())
+                            : nullptr;
+    float* op = reinterpret_cast<float*>(out.data_ptr());
+
+    switch (D) {
+        case 5120:
+            dsv41_engram::launch_engram_gate<5120>(
+                sq, hp, kp, wp, vp, mp, op, T, HC, (float)eps, (float)clamp_value);
+            break;
+        case 2048:
+            dsv41_engram::launch_engram_gate<2048>(
+                sq, hp, kp, wp, vp, mp, op, T, HC, (float)eps, (float)clamp_value);
+            break;
+        case 1024:
+            dsv41_engram::launch_engram_gate<1024>(
+                sq, hp, kp, wp, vp, mp, op, T, HC, (float)eps, (float)clamp_value);
+            break;
+        default:
+            TORCH_CHECK(false, "deepseek_v41_engram_gate: dim must be 1024, "
+                               "2048 or 5120, got ", D);
     }
 }

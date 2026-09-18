@@ -33,6 +33,16 @@ void launch_sparse_attn(
     torch::Tensor& out,
     double scale);
 
+void launch_engram_gate(
+    torch::Tensor& h,
+    torch::Tensor& key,
+    torch::Tensor& weight,
+    torch::Tensor& value,
+    torch::Tensor& mask,
+    torch::Tensor& out,
+    double eps,
+    double clamp_value);
+
 void launch_noaux_tc_topk(
     torch::Tensor& logits, 
     torch::Tensor& bias, 
@@ -203,12 +213,53 @@ torch::Tensor deepseek_v41_sparse_attn(
     return out;
 }
 
+torch::Tensor deepseek_v41_engram_gate(
+    torch::Tensor h,
+    torch::Tensor key,
+    torch::Tensor weight,
+    torch::Tensor value,
+    torch::Tensor mask,
+    double eps,
+    double clamp_value)
+{
+    CHECK_INPUT(h);
+    CHECK_INPUT(key);
+    CHECK_INPUT(weight);
+    CHECK_INPUT(value);
+    TORCH_CHECK(h.scalar_type() == torch::kFloat32 &&
+                key.scalar_type() == torch::kFloat32 &&
+                weight.scalar_type() == torch::kFloat32 &&
+                value.scalar_type() == torch::kFloat32,
+                "deepseek_v41_engram_gate: h, key, weight and value must be Float32");
+    TORCH_CHECK(h.dim() == 3, "expected h [T, HC, D], got ", h.dim(), "D");
+    TORCH_CHECK(key.sizes() == h.sizes(), "key must match h");
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == h.size(1) &&
+                weight.size(1) == h.size(2),
+                "weight must be [HC, D]; it is q_weight * k_weight");
+    // One lookup written into every hc copy, each scaled by its own gate.
+    TORCH_CHECK(value.dim() == 2 && value.size(0) == h.size(0) &&
+                value.size(1) == h.size(2),
+                "value must be [T, D], shared across the hc copies");
+    if (mask.defined() && mask.numel() > 0) {
+        CHECK_INPUT(mask);
+        TORCH_CHECK(mask.scalar_type() == torch::kUInt8,
+                    "deepseek_v41_engram_gate: mask must be UInt8");
+        TORCH_CHECK(mask.numel() == h.size(0),
+                    "mask has ", mask.numel(), " entries for ", h.size(0), " tokens");
+    }
+
+    auto out = torch::empty_like(h);
+    launch_engram_gate(h, key, weight, value, mask, out, eps, clamp_value);
+    return out;
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
     m.def("deepseek_v41_fp4_gemm", &deepseek_v41_fp4_gemm);
     m.def("deepseek_v41_noaux_tc_topk", &deepseek_v41_noaux_tc_topk);
     m.def("deepseek_v41_lightning_indexer", &deepseek_v41_lightning_indexer);
     m.def("deepseek_v41_candidate_blocks", &deepseek_v41_candidate_blocks);
     m.def("deepseek_v41_sparse_attn", &deepseek_v41_sparse_attn);
+    m.def("deepseek_v41_engram_gate", &deepseek_v41_engram_gate);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
