@@ -25,6 +25,14 @@ void launch_candidate_blocks(
     int64_t topk_blocks,
     int64_t compress_len);
 
+void launch_sparse_attn(
+    torch::Tensor& q,
+    torch::Tensor& kv,
+    torch::Tensor& attn_sink,
+    torch::Tensor& topk_idxs,
+    torch::Tensor& out,
+    double scale);
+
 void launch_noaux_tc_topk(
     torch::Tensor& logits, 
     torch::Tensor& bias, 
@@ -159,11 +167,48 @@ torch::Tensor deepseek_v41_candidate_blocks(
     return keep;
 }
 
+torch::Tensor deepseek_v41_sparse_attn(
+    torch::Tensor q,
+    torch::Tensor kv,
+    torch::Tensor attn_sink,
+    torch::Tensor topk_idxs,
+    double scale)
+{
+    CHECK_INPUT(q);
+    CHECK_INPUT(kv);
+    CHECK_INPUT(topk_idxs);
+    TORCH_CHECK(q.scalar_type() == torch::kFloat16 &&
+                kv.scalar_type() == torch::kFloat16,
+                "deepseek_v41_sparse_attn: q and kv must be Float16");
+    TORCH_CHECK(topk_idxs.scalar_type() == torch::kInt32,
+                "deepseek_v41_sparse_attn: topk_idxs must be Int32");
+    TORCH_CHECK(q.dim() == 3, "expected q [S, H, D], got ", q.dim(), "D");
+    // One KV row per position, shared by every head: num_key_value_heads is 1.
+    TORCH_CHECK(kv.dim() == 2, "expected kv [N, D] shared across heads");
+    TORCH_CHECK(kv.size(1) == q.size(2),
+                "kv head dim ", kv.size(1), " != q head dim ", q.size(2));
+    TORCH_CHECK(topk_idxs.dim() == 2 && topk_idxs.size(0) == q.size(0),
+                "expected topk_idxs [S, TOPK] matching q");
+    if (attn_sink.defined() && attn_sink.numel() > 0) {
+        CHECK_INPUT(attn_sink);
+        TORCH_CHECK(attn_sink.scalar_type() == torch::kFloat32,
+                    "deepseek_v41_sparse_attn: attn_sink must be Float32");
+        TORCH_CHECK(attn_sink.numel() == q.size(1),
+                    "attn_sink has ", attn_sink.numel(), " entries for ",
+                    q.size(1), " heads");
+    }
+
+    auto out = torch::empty_like(q);
+    launch_sparse_attn(q, kv, attn_sink, topk_idxs, out, scale);
+    return out;
+}
+
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
     m.def("deepseek_v41_fp4_gemm", &deepseek_v41_fp4_gemm);
     m.def("deepseek_v41_noaux_tc_topk", &deepseek_v41_noaux_tc_topk);
     m.def("deepseek_v41_lightning_indexer", &deepseek_v41_lightning_indexer);
     m.def("deepseek_v41_candidate_blocks", &deepseek_v41_candidate_blocks);
+    m.def("deepseek_v41_sparse_attn", &deepseek_v41_sparse_attn);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

@@ -1,29 +1,34 @@
 // DeepSeek V4.1 sparse attention: gather-by-index + online softmax + sink.
 //
-// Each query head attends to a per-head candidate list produced by the indexer,
-// not to a contiguous KV range. The list holds TOPN token positions into the
-// paged KV cache; positions are gathered, scored, and reduced with the same
-// flash/online-softmax recurrence a dense decode uses. Two differences carry
-// all the risk:
+// Follows inference/kernel.py::sparse_attn_kernel. Each query attends to a
+// per-query list of KV positions produced by the indexer, not to a contiguous
+// range. The KV is shared across heads -- kv is [n, d], one row per position,
+// which is what num_key_value_heads=1 means -- so every head reads the same
+// gathered row and only the query differs.
 //
-//   1. The KV index is read from `indices` rather than derived from the loop
-//      counter, so a slot can repeat or be out of range. A negative entry is
-//      the "unused slot" sentinel and must contribute nothing -- masking it to
-//      -inf before the max, not skipping it after, keeps the running max from
-//      seeing a value that never enters the sum.
+// Three details decide correctness:
 //
-//   2. The attention sink is a per-head learned logit that joins the softmax
-//      denominator while contributing no value vector. It is folded in once,
-//      after the candidate loop, using the same rescale the loop uses; adding
-//      it to `l` without rescaling `acc` by the same factor silently biases
-//      every output toward the sink.
+//   1. The running max starts at a finite -1e30, not -inf. A query whose whole
+//      index list is -1 would otherwise evaluate exp(-inf - -inf) = NaN; with a
+//      finite bound it yields an all-zero output, which is the convention the
+//      training kernel uses.
+//
+//   2. A -1 index contributes a score of -inf for that lane, so it is excluded
+//      from both the max and the sum, and its gathered KV row is zeroed so it
+//      cannot reach the accumulator either.
+//
+//   3. The attention sink is a per-head learned logit folded into the
+//      denominator ONCE, after the loop, against the FINAL running max:
+//      sum_exp += exp(attn_sink[h] - scores_max[h]). It never joins the
+//      running max and never rescales the accumulator. Treating it as an extra
+//      score would rescale acc by a factor the reference does not apply.
 //
 // Layouts:
-//   query    [B, HQ, HEAD_DIM]                fp16/bf16
-//   k/vCache [pages, PAGE, HKV, HEAD_DIM]     fp16/bf16, paged
-//   indices  [B, HQ, TOPN]                    int32, -1 = unused slot
-//   sinks    [HQ]                             float, one logit per query head
-//   out      [B, HQ, HEAD_DIM]                fp16/bf16
+//   q          [S, H, D]     fp16
+//   kv         [N, D]        fp16, shared across heads
+//   attn_sink  [H]           float
+//   topk_idxs  [S, TOPK]     int32, -1 marks an unused slot
+//   out        [S, H, D]     fp16
 
 #pragma once
 #include <sycl/sycl.hpp>
@@ -36,13 +41,14 @@ using namespace sycl;
 using namespace sycl::ext::intel::esimd;
 namespace xesimd = sycl::ext::intel::experimental::esimd;
 
-#define DS_FP32_MIN (-1e30f)
+// Finite, matching the reference: an all-invalid row must give zeros, not NaN.
+#define DS_SCORE_FLOOR (-1e30f)
 
-template <typename T, uint32_t N, uint32_t CHUNK = 128>
-ESIMD_INLINE simd<T, N> dsLoadVec(const T* p) {
-  simd<T, N> v;
+template <typename T, int N, int CHUNK = 64>
+ESIMD_INLINE simd<float, N> dsLoadVec(const T* p) {
+  simd<float, N> v;
 #pragma unroll
-  for (uint32_t i = 0; i < N; i += CHUNK)
+  for (int i = 0; i < N; i += CHUNK)
     v.template select<CHUNK, 1>(i) = block_load<T, CHUNK>(p + i);
   return v;
 }
@@ -53,142 +59,94 @@ ESIMD_INLINE float dsExp(float x) {
   return r[0];
 }
 
-template <uint32_t N>
-ESIMD_INLINE float dsReduceSum(simd<float, N> v) {
-  if constexpr (N == 1) return v[0];
-  else {
-    simd<float, N / 2> h =
-        v.template select<N / 2, 1>(0) + v.template select<N / 2, 1>(N / 2);
-    return dsReduceSum<N / 2>(h);
-  }
+template <int D>
+ESIMD_INLINE float dsDot(const simd<float, D>& a, const simd<float, D>& b) {
+  return reduce<float>(a * b, std::plus<>());
 }
 
-// One work-item per (batch, query head). The candidate list is short (TOPN is
-// 2048 at most in V4.1), so the head's whole reduction stays in registers and
-// no cross-thread combine is needed.
-template <typename T, uint32_t HEAD_DIM>
+// One work-item per (query token, head). The KV row is shared across heads, so
+// a head-major grid would reload it H times; the loop is short enough that the
+// per-head accumulator stays in registers at D=512 only for modest D, hence
+// the template.
+template <typename T, int D>
 struct SparseAttnKernel {
-  const T* query;
-  const T* kCache;
-  const T* vCache;
-  const int32_t* indices;   // [B, HQ, TOPN]
-  const uint32_t* pageTable;
-  const uint32_t* seqLens;
-  const float* sinks;       // [HQ], may be null
-  T* out;
-  uint32_t B, HQ, HKV, TOPN;
-  uint32_t pageSize, pageSizeLog2, pageTableStride;
+  const T* q;               // [S, H, D]
+  const T* kv;              // [N, D] shared across heads
+  const float* attn_sink;   // [H]
+  const int32_t* topk_idxs; // [S, TOPK]
+  T* out;                   // [S, H, D]
+  int S, H, N, TOPK;
   float scale;
 
-  void operator()(nd_item<1> ndi) const SYCL_ESIMD_KERNEL {
-    const uint32_t t = (uint32_t)ndi.get_global_id(0);
-    if (t >= B * HQ) return;
-    const uint32_t h = t % HQ;
-    const uint32_t b = t / HQ;
+  void operator()(nd_item<1> item) const SYCL_ESIMD_KERNEL {
+    const int gid = (int)item.get_global_id(0);
+    if (gid >= S * H) return;
+    const int h = gid % H;
+    const int s = gid / H;
 
-    const uint32_t gqaRatio = HQ / HKV;
-    const uint32_t kvHead = h / gqaRatio;
-    const uint32_t kvSeqLen = seqLens[b];
-    const uint32_t pageMask = pageSize - 1;
+    simd<float, D> qv = dsLoadVec<T, D>(q + (size_t)(s * H + h) * D);
 
-    simd<float, HEAD_DIM> qF =
-        dsLoadVec<T, HEAD_DIM>(query + (uint64_t)t * HEAD_DIM);
+    simd<float, D> acc = 0.0f;
+    float m = DS_SCORE_FLOOR;
+    float sum_exp = 0.0f;
 
-    simd<float, HEAD_DIM> acc = 0.0f;
-    float m = DS_FP32_MIN, l = 0.0f;
+    const int32_t* idx_row = topk_idxs + (size_t)s * TOPK;
 
-    const int32_t* idx_row = indices + (uint64_t)t * TOPN;
-
-    for (uint32_t c = 0; c < TOPN; c++) {
+    for (int c = 0; c < TOPK; c++) {
       const int32_t j = idx_row[c];
-      // The sentinel and any position past this sequence contribute nothing.
-      // Skipping before the max is what keeps them out of the running max as
-      // well as the sum; masking to -inf afterwards would already have moved m.
-      if (j < 0 || (uint32_t)j >= kvSeqLen) continue;
+      // An unused slot scores -inf, so it leaves both the max and the sum
+      // untouched; skipping it outright is the same thing and avoids the load.
+      if (j < 0 || j >= N) continue;
 
-      const uint32_t jj = (uint32_t)j;
-      const uint32_t physPage =
-          pageTable[b * pageTableStride + (jj >> pageSizeLog2)];
-      const uint64_t kvIdx =
-          ((uint64_t)physPage * pageSize + (jj & pageMask)) * HKV + kvHead;
-
-      const T* kptr = kCache + kvIdx * HEAD_DIM;
-      const T* vptr = vCache + kvIdx * HEAD_DIM;
-      // The next candidate is an unpredictable address, so the prefetch is
-      // issued as soon as its index is known rather than one iteration late.
-      if (c + 1 < TOPN) {
-        const int32_t jn = idx_row[c + 1];
-        if (jn >= 0 && (uint32_t)jn < kvSeqLen) {
-          const uint32_t jnu = (uint32_t)jn;
-          const uint32_t pn =
-              pageTable[b * pageTableStride + (jnu >> pageSizeLog2)];
-          const uint64_t kn =
-              ((uint64_t)pn * pageSize + (jnu & pageMask)) * HKV + kvHead;
-          xesimd::lsc_prefetch<T, 32, xesimd::lsc_data_size::default_size,
-                               xesimd::cache_hint::cached,
-                               xesimd::cache_hint::cached>(
-              kCache + kn * HEAD_DIM);
-        }
-      }
-
-      simd<float, HEAD_DIM> kF = dsLoadVec<T, HEAD_DIM>(kptr);
-      const float score = dsReduceSum<HEAD_DIM>(qF * kF) * scale;
+      simd<float, D> kvv = dsLoadVec<T, D>(kv + (size_t)j * D);
+      const float score = dsDot<D>(qv, kvv) * scale;
 
       const float mNew = m > score ? m : score;
-      const float corr = dsExp(m - mNew), p = dsExp(score - mNew);
-      l = l * corr + p;
-      acc = acc * corr + dsLoadVec<T, HEAD_DIM>(vptr) * p;
-      m = mNew;
-    }
-
-    // The sink is a logit with no value vector: it enters the denominator and
-    // rescales the accumulator, which is what makes it able to pull the whole
-    // output toward zero when every real score is small.
-    if (sinks != nullptr) {
-      const float s = sinks[h];
-      const float mNew = m > s ? m : s;
       const float corr = dsExp(m - mNew);
-      l = l * corr + dsExp(s - mNew);
-      acc = acc * corr;
+      const float p = dsExp(score - mNew);
+      sum_exp = sum_exp * corr + p;
+      acc = acc * corr + kvv * p;
       m = mNew;
     }
 
-    simd<T, HEAD_DIM> outT;
-    if (l > 0.0f) {
-      simd<float, HEAD_DIM> o = acc * (1.0f / l);
+    // The sink joins the denominator once, against the final max, and carries
+    // no value vector. Rescaling the accumulator by exp(m - max(m, sink)) as
+    // well would be algebraically identical -- the factor cancels in the ratio
+    // -- but it is not what the reference does, and the two forms part company
+    // exactly at the floor below.
+    //
+    // When no index was valid, m is still the floor and exp(sink - floor)
+    // overflows to +inf. That is harmless here and only because acc is written
+    // on valid indices alone: m == floor implies acc == 0, so the epilogue
+    // computes 0 * (1/inf) == 0 rather than 0 * inf == NaN. Any future change
+    // that seeds acc before the loop breaks that.
+    if (attn_sink != nullptr) sum_exp += dsExp(attn_sink[h] - m);
+
+    simd<T, D> outT;
+    if (sum_exp > 0.0f) {
+      simd<float, D> o = acc * (1.0f / sum_exp);
       outT = o;
     } else {
-      // No candidate survived and no sink: an all-masked row is zero rather
-      // than a division by zero.
-      outT = simd<T, HEAD_DIM>(T(0));
+      outT = simd<T, D>(T(0));
     }
 #pragma unroll
-    for (uint32_t i = 0; i < HEAD_DIM; i += 128)
-      block_store<T, 128>(out + (uint64_t)t * HEAD_DIM + i,
-                          outT.template select<128, 1>(i));
+    for (int i = 0; i < D; i += 64)
+      block_store<T, 64>(out + (size_t)(s * H + h) * D + i,
+                         outT.template select<64, 1>(i));
   }
 };
 
-template <typename T, uint32_t HEAD_DIM>
-inline void launch_sparse_attn(queue& q, const T* query, const T* kCache,
-                               const T* vCache, const int32_t* indices,
-                               const uint32_t* pageTable,
-                               const uint32_t* seqLens, const float* sinks,
-                               T* out, uint32_t B, uint32_t HQ, uint32_t HKV,
-                               uint32_t TOPN, uint32_t pageSize,
-                               uint32_t pageSizeLog2, uint32_t pageTableStride,
-                               float scale) {
-  // Row-parallel with no SLM and no barrier, so the group width is free.
-  constexpr uint32_t WG = 16;
-  const size_t rows = (size_t)B * HQ;
+template <typename T, int D>
+inline void launch_sparse_attn(queue& q_, const T* q, const T* kv,
+                               const float* attn_sink,
+                               const int32_t* topk_idxs, T* out, int S, int H,
+                               int N, int TOPK, float scale) {
+  constexpr int WG = 16;
+  const size_t rows = (size_t)S * H;
   const size_t global = ((rows + WG - 1) / WG) * WG;
-  SparseAttnKernel<T, HEAD_DIM> kern{query,   kCache,       vCache,
-                                     indices, pageTable,    seqLens,
-                                     sinks,   out,          B,
-                                     HQ,      HKV,          TOPN,
-                                     pageSize, pageSizeLog2, pageTableStride,
-                                     scale};
-  q.submit([&](handler& h) {
+  SparseAttnKernel<T, D> kern{q, kv, attn_sink, topk_idxs, out,
+                              S, H,  N,         TOPK,      scale};
+  q_.submit([&](handler& h) {
     h.parallel_for(nd_range<1>(range<1>(global), range<1>(WG)), kern);
   });
 }

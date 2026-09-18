@@ -628,3 +628,138 @@ def test_candidate_blocks_match_the_reference(topk):
         assert got[s][(reach[s] - 1) // bs] == 1, (
             "the block holding the newest position must be kept"
         )
+
+
+# --- sparse attention -------------------------------------------------------
+
+_SPARSE = _DS / "sparse_attn.h"
+SCORE_FLOOR = -1e30
+
+
+def _kernel_sparse(q, kv, sink, idxs, S, H, N, TOPK, D, scale):
+    """Mirror of SparseAttnKernel."""
+    out = [[[0.0] * D for _ in range(H)] for _ in range(S)]
+    for s in range(S):
+        for h in range(H):
+            qv = q[s][h]
+            acc = [0.0] * D
+            m = SCORE_FLOOR
+            se = 0.0
+            for c in range(TOPK):
+                j = idxs[s][c]
+                if j < 0 or j >= N:
+                    continue
+                kvv = kv[j]
+                score = sum(qv[d] * kvv[d] for d in range(D)) * scale
+                mN = max(m, score)
+                corr = math.exp(m - mN)
+                p = math.exp(score - mN)
+                se = se * corr + p
+                acc = [acc[d] * corr + kvv[d] * p for d in range(D)]
+                m = mN
+            if sink is not None:
+                se += math.exp(sink[h] - m) if sink[h] - m > -700 else 0.0
+            out[s][h] = [a / se for a in acc] if se > 0 else [0.0] * D
+    return out
+
+
+def test_sparse_attn_matches_the_blocked_reference():
+    """kernel.py processes the index list in blocks of 64; this walks it one
+    position at a time. The online-softmax recurrence must agree either way."""
+    import random
+    random.seed(9)
+    S, H, N, TOPK, D = 3, 4, 50, 80, 8
+    scale = (1.0 / D) ** 0.5
+    q = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(H)]
+         for _ in range(S)]
+    kv = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(N)]
+    sink = [random.uniform(-2, 2) for _ in range(H)]
+    idxs = []
+    for _ in range(S):
+        row = ([random.randrange(N) for _ in range(TOPK // 2)]
+               + [-1] * (TOPK - TOPK // 2))
+        random.shuffle(row)
+        idxs.append(row)
+
+    got = _kernel_sparse(q, kv, sink, idxs, S, H, N, TOPK, D, scale)
+
+    BLOCK = 64
+    for s in range(S):
+        for h in range(H):
+            qv = q[s][h]
+            acc = [0.0] * D
+            m = SCORE_FLOOR
+            se = 0.0
+            for t in range(0, TOPK, BLOCK):
+                blk = idxs[s][t:t + BLOCK]
+                rows = [(kv[j] if 0 <= j < N else [0.0] * D) for j in blk]
+                sc = [(sum(qv[d] * rows[i][d] for d in range(D)) * scale
+                       if 0 <= blk[i] < N else -math.inf)
+                      for i in range(len(blk))]
+                mprev = m
+                live = [x for x in sc if x != -math.inf]
+                m = max([m] + live)
+                ss = math.exp(mprev - m)
+                ex = [(math.exp(x - m) if x != -math.inf else 0.0) for x in sc]
+                se = se * ss + sum(ex)
+                acc = [acc[d] * ss for d in range(D)]
+                for i in range(len(blk)):
+                    for d in range(D):
+                        acc[d] += ex[i] * rows[i][d]
+            se += math.exp(sink[h] - m)
+            want = [a / se for a in acc] if se > 0 else [0.0] * D
+            for d in range(D):
+                assert abs(got[s][h][d] - want[d]) < 1e-12
+
+
+def test_sparse_attn_all_invalid_row_is_zero_not_nan():
+    """The running max starts finite so an empty index list cannot make NaN.
+
+    -inf would give exp(-inf - -inf) on the first valid position and poison the
+    row; the reference uses -1e30 for exactly this.
+    """
+    import random
+    random.seed(3)
+    S, H, N, TOPK, D = 2, 3, 20, 16, 8
+    q = [[[random.uniform(-1, 1) for _ in range(D)] for _ in range(H)]
+         for _ in range(S)]
+    kv = [[random.uniform(-1, 1) for _ in range(D)] for _ in range(N)]
+    idxs = [[-1] * TOPK for _ in range(S)]
+    out = _kernel_sparse(q, kv, None, idxs, S, H, N, TOPK, D, (1.0 / D) ** 0.5)
+    for s in range(S):
+        for h in range(H):
+            for d in range(D):
+                v = out[s][h][d]
+                assert v == 0.0 and v == v, "an all-masked row must be zeros"
+
+    src = code(_SPARSE.read_text())
+    m = re.search(r"DS_SCORE_FLOOR\s*\(?(-?[0-9.e+]+)f?\)?", src)
+    assert m, "the score floor is no longer a named constant"
+    assert float(m.group(1)) <= -1e29, (
+        f"the floor is {m.group(1)}; it must be finite and very negative"
+    )
+    assert "-INFINITY" not in src and "-std::numeric_limits<float>::infinity" \
+        not in src.replace("DSI_NEG_INF", ""), (
+        "an infinite floor makes an all-masked row NaN"
+    )
+
+
+def test_sparse_attn_sink_enters_only_the_denominator():
+    """attn_sink has no value vector.
+
+    kernel.py adds exp(attn_sink[h] - scores_max[h]) to sum_exp once, after the
+    loop. The accumulator is not touched. Folding the sink in as an extra score
+    is algebraically the same ratio, but it is not the reference's form and the
+    two part company at the floor, where exp(sink - floor) overflows.
+    """
+    src = code(_SPARSE.read_text())
+    i = src.find("attn_sink != nullptr")
+    assert i >= 0, "the sink fold is no longer recognisable"
+    # Exactly the statement, not the surrounding lines: a window wide enough to
+    # catch neighbouring code also catches the epilogue that legitimately
+    # scales acc by 1/sum_exp.
+    stmt = src[i:src.index(";", i) + 1]
+    assert "sum_exp +=" in stmt, "the sink must be added to the denominator"
+    assert "acc" not in stmt, (
+        "the sink touches the accumulator; the reference leaves it alone"
+    )

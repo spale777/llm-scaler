@@ -10,6 +10,7 @@
 #include "../deepseek_v41/fp4_gemm.h"
 #include "../deepseek_v41/topk_noaux_tc.h"
 #include "../deepseek_v41/lightning_indexer.h"
+#include "../deepseek_v41/sparse_attn.h"
 
 using namespace sycl::ext::intel::esimd;
 using fp16 = sycl::half;
@@ -168,4 +169,43 @@ void launch_candidate_blocks(torch::Tensor& scores, torch::Tensor& keep,
         sq, reinterpret_cast<const float*>(scores.data_ptr()),
         reinterpret_cast<uint8_t*>(keep.data_ptr()), S, T, (int)block_size,
         (int)topk_blocks, nullptr, (int)compress_len);
+}
+
+
+void launch_sparse_attn(torch::Tensor& q, torch::Tensor& kv,
+                        torch::Tensor& attn_sink, torch::Tensor& topk_idxs,
+                        torch::Tensor& out, double scale) {
+    const int S = (int)q.size(0);
+    const int H = (int)q.size(1);
+    const int D = (int)q.size(2);
+    const int N = (int)kv.size(0);
+    const int TOPK = (int)topk_idxs.size(1);
+    sycl::queue& sq = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+
+    const fp16* qp = reinterpret_cast<const fp16*>(q.data_ptr());
+    const fp16* kvp = reinterpret_cast<const fp16*>(kv.data_ptr());
+    const float* sp = attn_sink.defined() && attn_sink.numel() > 0
+                          ? reinterpret_cast<const float*>(attn_sink.data_ptr())
+                          : nullptr;
+    const int32_t* ip = reinterpret_cast<const int32_t*>(topk_idxs.data_ptr());
+    fp16* op = reinterpret_cast<fp16*>(out.data_ptr());
+
+    switch (D) {
+        case 512:
+            dsv41_sparse::launch_sparse_attn<fp16, 512>(
+                sq, qp, kvp, sp, ip, op, S, H, N, TOPK, (float)scale);
+            break;
+        case 256:
+            dsv41_sparse::launch_sparse_attn<fp16, 256>(
+                sq, qp, kvp, sp, ip, op, S, H, N, TOPK, (float)scale);
+            break;
+        case 128:
+            dsv41_sparse::launch_sparse_attn<fp16, 128>(
+                sq, qp, kvp, sp, ip, op, S, H, N, TOPK, (float)scale);
+            break;
+        default:
+            TORCH_CHECK(false,
+                        "deepseek_v41_sparse_attn: head_dim must be 128, 256 "
+                        "or 512, got ", D);
+    }
 }
