@@ -1400,6 +1400,10 @@ static thread_local int s_int4_cached_ntokens = -1;
 // Every dimension the buffers are sized by must be part of the key, or a
 // second shape in the same thread reuses buffers sized for the first.
 static thread_local int s_int4_cached_shape[5] = {-1, -1, -1, -1, -1};
+// Index 2 is the intermediates row width. Callers must stride by this rather
+// than by their own intermediate_size: routed and shared rows share one row
+// space, and the row is sized by max(routed, shared).
+static constexpr int S_INT4_CACHED_ROW_W = 2;
 
 static void ensure_int4_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
                                      int hidden_size, int intermediate_size,
@@ -2643,8 +2647,12 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
                             intermediate_size, shared_intermediate_size,
                             x.device());
 
+    // Stride by the width ensure_* allocated, not by this shape's own: the
+    // routed and shared rows share one row space sized by max(routed, shared).
+    const int row_w = s_int4_cached_shape[S_INT4_CACHED_ROW_W];
+
     fp16* routed_intermediates_ptr = (fp16*)s_int4_intermediates.data_ptr();
-    fp16* shared_intermediates_ptr = routed_intermediates_ptr + (size_t)n_tokens * top_k * intermediate_size;
+    fp16* shared_intermediates_ptr = routed_intermediates_ptr + (size_t)n_tokens * top_k * row_w;
     float* shared_gate_values_ptr = (float*)s_int4_gate_values.data_ptr();
     auto final_output = s_int4_final_output;
 

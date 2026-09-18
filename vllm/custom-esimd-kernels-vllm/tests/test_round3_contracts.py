@@ -61,6 +61,36 @@ def test_shift_kernel_retires_dead_threads(path):
                 "dead threads store past the conv_state slot into the next entry")
 
 
+@pytest.mark.parametrize("path", _GDN, ids=_ids)
+def test_conv_state_shift_has_no_inline_path(path):
+    """The shift must not run inside the compute kernel, at any work-group count.
+
+    Every one of the HV work-groups reads this sequence's conv_state in Phase 1,
+    and an inline shift stores to it from hv == 0. A SYCL barrier orders only
+    the work-group that executes it, so nothing stops that store from landing
+    before another group's read of the same seq_idx.
+
+    The removed form gated itself on `total_wgs <= WG_SIZE`, reasoning that a
+    grid that fits one scheduling wave runs concurrently. Concurrent is not
+    ordered: the race is between two work-groups that are both resident, which
+    is exactly when they overlap. The condition selected for the hazard rather
+    than against it. vllm's twin never had the parameter.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    c = code(path.read_text())
+    assert "inline_conv_shift" not in c and "inline_shift" not in c, (
+        "an inline conv_state shift path is back; hv == 0 stores to conv_state "
+        "while the other HV work-groups are still reading it, and no "
+        "work-group barrier can order that"
+    )
+    # The separate kernel must still be submitted, or nothing shifts at all and
+    # the convolution window never advances.
+    assert "conv_state_shift_kernel(" in c, (
+        "the ordered shift kernel is gone; conv_state would never advance"
+    )
+
+
 _GDN_SEQ = [_VLLM / "xpu/esimd_kernels/gdn_conv_fused_seq.h",
             _SGL / "xpu/esimd_kernels/gdn_conv_fused_seq.h"]
 

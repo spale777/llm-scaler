@@ -964,6 +964,54 @@ def test_int4_intermediates_has_one_stride(tree):
     )
 
 
+# The HOST splits s_int4_intermediates into a routed region and a shared one by
+# pointer arithmetic. That offset is a third stride over the same buffer, and it
+# is not covered by the in-kernel scan above: the kernels take the width as a
+# parameter, while this is computed at the call site.
+
+@pytest.mark.parametrize("tree", [_VLLM, _SGL], ids=["vllm", "sglang"])
+def test_shared_region_offset_uses_the_allocated_row_width(tree):
+    """`+ n_tokens * top_k * <width>` must use what was allocated.
+
+    Striding by this shape's own intermediate_size lands the shared region
+    inside the routed rows whenever the allocated row is wider -- which is the
+    normal case for the Qwen shared-expert family (S > I) and, in the vllm tree,
+    for any grow-only reuse. Both entries share one thread_local buffer, so the
+    two strides must agree.
+
+    Only a TORCH_CHECK(shared_inter_size == intermediate_size) on this
+    particular entry made the mismatched form survive; that check is about the
+    shared WEIGHTS, not the buffer, so it is not the invariant to lean on.
+    """
+    path = tree / "moe_batch/moe_int4.sycl"
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    src = code(path.read_text())
+
+    offsets = re.findall(
+        r"routed_intermediates_ptr\s*\+\s*\(size_t\)n_tokens\s*\*\s*top_k\s*\*\s*(\w+)",
+        src)
+    assert offsets, (
+        "no shared-region offset found -- the anchor moved and this test "
+        "stopped checking the split"
+    )
+    # Either spelling of "the width that was allocated" is fine; the routed
+    # size alone is not.
+    bad = [w for w in offsets
+           if w not in ("row_w", "inter_row_width", "s_int4_cached_row_w")]
+    assert not bad, (
+        f"{tree.name}: the shared region is offset by {bad}, not by the "
+        "allocated row width; when max(routed, shared) exceeds the routed "
+        "size the shared rows land inside the routed ones"
+    )
+    # ...and the width must be read from the allocator's own state, not
+    # recomputed locally, or it drifts from what torch::empty actually got.
+    assert re.search(r"row_w\s*=\s*s_int4_cached(?:_row_w|_shape\[)", src), (
+        f"{tree.name}: the offset width is not read back from the allocator's "
+        "cached state, so it can disagree with the allocation"
+    )
+
+
 # A buffer cache must key on every dimension it sizes by. ensure_int4_moe_buffers
 # sizes by rows_per_token, hidden_size, row width, top_k and num_shared_experts,
 # so keying on batch size alone lets a second shape reuse the first's buffers.

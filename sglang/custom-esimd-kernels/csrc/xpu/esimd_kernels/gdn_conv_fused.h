@@ -104,7 +104,6 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     fp16* __restrict__ z_out_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
     float attn_scale, int64_t conv_stride0, int64_t conv_rows, int64_t ssm_stride0, int64_t ssm_rows,
-    int inline_conv_shift,   // 1 = do conv_state shift inline (safe when N*HV<=32)
     nd_item<3>& ndi)
 {
     slm_init<2048>();
@@ -361,23 +360,11 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
             out, simd<fp16, 4>(0.0f));
     }
 
-    // ---- Phase 3: conv_state shift (inline path, only when N*HV <= 32) ----
-    // When N*HV > 32, the shift is done by a separate kernel to avoid a
-    // cross-WG race: hv==0's writes could land before a later-scheduled WG's
-    // Phase 1 reads for the same seq_idx.
-    if (inline_conv_shift && conv_idx >= 0 && conv_idx < conv_rows
-            && hv == 0 && is_valid) {
-        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
-        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
-        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_fp16);
-
-        // hi chunk (v-threads only, when double_v)
-        if (double_v && tid >= 4 * H) {
-            block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
-            block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
-            block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_fp16_hi);
-        }
-    }
+    // The conv_state shift belongs to conv_state_shift_kernel, which the host
+    // submits after this one. It cannot run here: every HV work-group reads
+    // this sequence's conv_state in Phase 1, and a work-group barrier orders
+    // only its own group, so an hv==0 store can land before another group's
+    // read of the same seq_idx.
 
     // ---- z extraction: v-threads copy z from qkvz to z_out ----
     if (tid >= 4 * H && is_valid) {
@@ -541,13 +528,6 @@ inline void gdn_conv_fused_host(
     sycl::queue& q)
 {
     constexpr int WG_SIZE = 32;
-    const int total_wgs = N * HV;
-
-    // All HV workgroups must finish reading convolution state before it is
-    // shifted. A workgroup barrier cannot order other workgroups, even when
-    // their total count fits in WG_SIZE; use the existing ordered shift kernel.
-    const int inline_shift = 0;
-    (void)total_wgs;
 
     sycl::nd_range<3> Range(
         sycl::range<3>(N, HV, WG_SIZE),
@@ -562,26 +542,23 @@ inline void gdn_conv_fused_host(
                 ssm_state_ptr, ssm_state_indices_ptr,
                 output_ptr, z_out_ptr,
                 N, H, HV, K, V, scale, conv_stride0, conv_rows,
-                ssm_stride0, ssm_rows,
-                inline_shift, ndi);
+                ssm_stride0, ssm_rows, ndi);
         });
     });
 
-    if (!inline_shift) {
-        // Separate kernel for conv_state shift — runs after kernel 1
-        // completes (in-order queue guarantees ordering).
-        sycl::nd_range<3> ShiftRange(
-            sycl::range<3>(N, 1, WG_SIZE),
-            sycl::range<3>(1, 1, WG_SIZE));
+    // The shift runs as its own kernel: the in-order queue orders it after
+    // every work-group above has read conv_state.
+    sycl::nd_range<3> ShiftRange(
+        sycl::range<3>(N, 1, WG_SIZE),
+        sycl::range<3>(1, 1, WG_SIZE));
 
-        q.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(ShiftRange, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
-                conv_state_shift_kernel(
-                    qkvz_ptr, qkvz_stride0, conv_state_ptr,
-                    conv_state_indices_ptr,
-                    N, H, HV, K, V,
-                    conv_stride0, conv_rows, ndi);
-            });
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(ShiftRange, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+            conv_state_shift_kernel(
+                qkvz_ptr, qkvz_stride0, conv_state_ptr,
+                conv_state_indices_ptr,
+                N, H, HV, K, V,
+                conv_stride0, conv_rows, ndi);
         });
-    }
+    });
 }
