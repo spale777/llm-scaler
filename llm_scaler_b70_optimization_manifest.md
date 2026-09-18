@@ -35,7 +35,8 @@ prediction.
 | Q4_K 2D load width 8→16 | ✅ | ✅ | ✅ | Reverted to width 8. See K1 |
 | `lsc_prefetch` injection | ✅ | ✅ | ❌ | Three sites per tree on the decode GEMV weight streams. Unmeasured |
 | Wide-router O(N) rewrite | ✅ | ✅ | ❌ | `range<1>(num_experts)` with `WIDE_TOK=8` token blocking. Coverage verified by exhaustive simulation; throughput unmeasured |
-| PP=2 across switches | ❌ | ❌ | — | No `send`/`recv` code in any patch; every launch is `-pp=1` |
+| PP=2 across switches | ✅ | ❌ | — | Transport verified in the shipped binary: `libtorch_xpu.so` exports `ProcessGroupXCCL::{send,recv}`, XCCL is available, all five P2P entry points exist. vLLM's base communicator already routes `send`/`recv` to the device group, so `XpuCommunicator` needs no override — which is why no PP code appears in the patch. Never exercised: every launch is `-pp=1`. Pinned by `test_pp_transport.py` |
+| n-gram speculative decode | ✅ | ✅ | ✅ | **Already CPU-side.** `NgramProposer` is gated on `numba` ("Required for N-gram speculative decoding" in every requirements file) and does suffix matching over token ids. No n-gram kernel exists in either ESIMD tree; the GPU spec-decode path is EAGLE/MTP. There is nothing to offload from GPU to CPU |
 | oneCCL env tuning | ✅ | ❌ | ⚠️ | Set in one benchmark script; **no Dockerfile sets any of it** |
 
 ## 2. Defect register

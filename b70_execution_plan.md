@@ -213,18 +213,30 @@ Fixes A1–A9. Key points:
 - **Hierarchical reduce for >8:** IPC intra-switch → oneCCL inter-switch → IPC broadcast back.
 - Fall back to pure oneCCL whenever the probe says P2P is unavailable.
 
-### 3.5 Pipeline parallel — entirely unbuilt
+### 3.5 Pipeline parallel — transport confirmed, path unexercised
 
-XCCL **does** support point-to-point (`ProcessGroupXCCL.cpp:913,1062,1105`); the rendered
-PyTorch docs table showing ✗ is stale. But no `send`/`recv` or PP code exists in any patch,
-and every launch is `-pp=1`.
+The transport exists and is verified against the shipped binary, not inferred from a
+document: `nm -D libtorch_xpu.so` exports `c10d::ProcessGroupXCCL::send` and `::recv`,
+`torch.distributed.is_xccl_available()` is true, and all five P2P entry points
+(`send`, `recv`, `isend`, `irecv`, `batch_isend_irecv`) are present on torch 2.12+xpu.
+The rendered PyTorch docs table showing ✗ for XCCL P2P is stale.
+`test_pp_transport.py` pins all three facts so a torch bump cannot silently remove them.
 
-- Build the PP path on `dist.send`/`recv` over 2-rank groups, one per TP rank position.
+vLLM's `DeviceCommunicatorBase` already routes `send`/`recv` to the device group, so
+`XpuCommunicator` inherits a working implementation — **no override is required**, which
+is why no PP code appears in the multi-arc patch. What is genuinely absent is exercise:
+every launch in the repo is `-pp=1`, so the path has never run.
+
+- PP groups are 2-rank, one per TP rank position; TP stays intra-switch.
 - **No collectives cross the PP boundary** — this makes cross-switch collective hangs
   structurally impossible.
 - Strict odd/even ordering or `batch_isend_irecv` to avoid the classic rank-order deadlock.
 - Set `FI_PROVIDER` explicitly and identically across ranks (mismatch causes OFI init to
   hang rather than error) — `shm` intra-node, `tcp`/`verbs` inter-node. **Never `sockets`.**
+
+**Remaining work is validation, not construction:** run `-pp=2 -tp=8` on 16 cards and
+confirm the parity harness passes and no rank deadlocks. Until that runs, PP is
+*untested*, which is a weaker claim than *unbuilt* but still not *working*.
 
 ### 3.6 Integration contract
 
