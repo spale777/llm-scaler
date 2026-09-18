@@ -297,6 +297,34 @@ Ordered by expected value.
 
 ## Phase 6 — DeepSeek V4.1 (gated on 16 cards)
 
+**The item list below predates reading the reference.** `inference/model.py`,
+`kernel.py` and `config.json` from deepseek-ai/DeepSeek-V4.1-Flash correct several
+of its premises, and the corrected constants now live in
+`vllm/custom-esimd-kernels-vllm/tests/dsv41_config.py`, checked against the shipped
+kernels:
+
+- **noaux_tc here is ungrouped.** config.json carries no `n_group` and no
+  `topk_group`; `Gate.forward` is a plain `topk`. An earlier revision of this
+  branch instantiated 8 groups keeping 4, carried over from V3, which masks
+  experts this model never masks.
+- **Weight blocks are 32x32**, not 128x128, and `expert_dtype` is fp4 with
+  ue8m0 scales.
+- **head_dim is 512** with `num_key_value_heads: 1` — MQA, one KV row per
+  position shared across all 64 query heads.
+- **CSA2**: `compress_ratios` assigns each layer a mode, `kv_source_layer_ids`
+  [2,8,14,20] produce main KV for the rest, and `index_source_layer_ids` adds
+  [24,28,32,36]. Layers between sources reuse the published result.
+- **Two-level indexing**: `candidate_source_layer_id` 20 builds a pool of
+  `candidate_topk_blocks` 2048 blocks of `candidate_block_size` 8; later
+  indexers score only inside it. `index_topk` 512, `index_n_heads` 32,
+  `index_head_dim` 128.
+- The main KV cache is **FP4 E2M1 with one E4M3 scale per 16 channels**; the
+  indexer's own cache uses groups of 32 with E8M0.
+
+Implemented and checked against the reference on CPU: FP4 GEMM, noaux_tc
+router, lightning indexer, candidate-block selection, sparse attention.
+
+
 **~551B params / ~298 GB.** B70 carries 32 GB, so 8 cards give 256 GB aggregate and need
 ~37 GB/card at TP=8. That exceeds the card, leaving no room for KV cache or activations,
 so 8 cards remain out of reach. 16 cards (PP=2 × TP=8, ~18.6 GB/card) is the floor — the
