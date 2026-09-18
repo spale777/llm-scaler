@@ -281,11 +281,18 @@ struct Moe_topk_gguf_kernel {
         }
 
         const float mx_l = top_l[0];  // global max logit
+        // Held across both loops: the store below needs the same exp() the
+        // denominator summed, and top_k is bounded by the staging array.
+        float top_e[32];
         float denom;
         if (norm) {
             denom = 0.f;
-            for (int k = 0; k < top_k; ++k) denom += sycl::exp(top_l[k] - mx_l);
+            for (int k = 0; k < top_k; ++k) {
+                top_e[k] = sycl::exp(top_l[k] - mx_l);
+                denom += top_e[k];
+            }
         } else {
+            for (int k = 0; k < top_k; ++k) top_e[k] = sycl::exp(top_l[k] - mx_l);
             simd<float, PAD> e = exp(convert<float>(scores) - mx_l);
             denom = reduce<float>(e, std::plus<>());
         }
@@ -295,7 +302,7 @@ struct Moe_topk_gguf_kernel {
         fp16* w_base   = tw  + (size_t)nid * top_k;
         for (int k = 0; k < top_k; ++k) {
             idx_base[k] = top_i[k];
-            w_base[k]   = fp16(sycl::exp(top_l[k] - mx_l) * inv);
+            w_base[k]   = fp16(top_e[k] * inv);
         }
     }
 };
@@ -303,6 +310,9 @@ struct Moe_topk_gguf_kernel {
 inline void moe_topk_gguf_host(
     const fp16* logits, int* sel, fp16* tw,
     int M, int n_experts, int top_k, bool norm, sycl::queue& q) {
+    // The kernel stages winners in 32-slot arrays indexed by this loop bound.
+    TORCH_CHECK(top_k > 0 && top_k <= 32,
+                "moe_topk_gguf: top_k must be in [1, 32], got ", top_k);
     q.submit([&](sycl::handler& h) {
         if (n_experts <= 256)
             h.parallel_for(sycl::range<1>((size_t)M),
