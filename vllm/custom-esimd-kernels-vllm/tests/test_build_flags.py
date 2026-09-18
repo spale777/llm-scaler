@@ -52,6 +52,28 @@ _SETUP_FILES = [
 ]
 
 
+def _arg_text(elt):
+    """The text of one compile-arg element, or None if it is not a string.
+
+    Args are not all plain literals: the device list and the include path are
+    f-strings. Rendering the interpolations as their placeholder name keeps
+    every flag visible to the audits below -- a helper that skipped f-strings
+    would quietly stop examining exactly the args that carry the AOT target.
+    """
+    if isinstance(elt, ast.Constant):
+        return elt.value if isinstance(elt.value, str) else None
+    if isinstance(elt, ast.JoinedStr):
+        out = []
+        for part in elt.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                out.append(part.value)
+            elif isinstance(part, ast.FormattedValue):
+                v = part.value
+                out.append(v.id if isinstance(v, ast.Name) else "{...}")
+        return "".join(out)
+    return None
+
+
 def _sycl_arg_lists(path):
     """Yield every extra_compile_args["sycl"] list literal in a setup file."""
     tree = ast.parse(path.read_text())
@@ -61,10 +83,8 @@ def _sycl_arg_lists(path):
         for key, value in zip(node.keys, node.values):
             if (isinstance(key, ast.Constant) and key.value == "sycl"
                     and isinstance(value, ast.List)):
-                yield [
-                    elt.value for elt in value.elts
-                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
-                ]
+                yield [a for a in (_arg_text(elt) for elt in value.elts)
+                       if a is not None]
 
 
 @pytest.mark.parametrize("path", _SETUP_FILES, ids=lambda p: f"{p.parent.name}/{p.name}")
@@ -91,8 +111,9 @@ def test_no_duplicate_aot_target(path):
     if not path.exists():
         pytest.skip(f"{path} not present")
     for args in _sycl_arg_lists(path):
-        assert args.count("-device bmg") <= 1, (
-            f"{path.name}: -device bmg repeated in one arg list: {args}"
+        n = sum(a.count("-device ") for a in args)
+        assert n <= 1, (
+            f"{path.name}: -device repeated in one arg list: {args}"
         )
 
 
@@ -105,10 +126,10 @@ def test_every_module_names_an_aot_target(path):
     (4151 lines) and eagle.sycl, both of which run per decoded token. The
     first call to each then pays a full device compile.
 
-    `-device bmg` is the family target and covers G21 and G31 alike, so one
-    binary serves B60 and B70; only a per-die target could mismatch. Note the
-    AOT step needs `ocloc`, which the devel base image provides and a bare
-    build host may not.
+    The target names both dies: B60 is BMG-G21 and B70 is BMG-G31. ocloc
+    accepts the pair and emits an image per die, so each part gets code built
+    for it rather than one family binary. Note the AOT step needs `ocloc`,
+    which the devel base image provides and a bare build host may not.
     """
     if not path.exists():
         pytest.skip(f"{path} not present")
@@ -157,10 +178,56 @@ def test_one_env_var_has_one_default(path):
     if not path.exists():
         pytest.skip(f"{path} not present")
     import re as _re
+    src = path.read_text()
+    # The default is either a quoted literal or a named constant; matching only
+    # the quoted form would stop examining the file the moment it is factored
+    # into a constant, which is exactly when a drift could reappear unseen.
     defaults = _re.findall(
-        r'os\.environ\.get\(\s*"OMNI_XPU_DEVICE"\s*,\s*"([^"]+)"\s*\)',
-        path.read_text())
+        r'os\.environ\.get\(\s*"OMNI_XPU_DEVICE"\s*,\s*(?:"([^"]+)"|([A-Za-z_]\w*))\s*\)',
+        src)
+    defaults = [a or b for a, b in defaults]
+    if _re.search(r'os\.environ\.get\(\s*"OMNI_XPU_DEVICE"', src):
+        assert defaults, (
+            f"{path.name}: OMNI_XPU_DEVICE is read but no default was matched; "
+            "the anchor moved and this test stopped checking it"
+        )
     assert len(set(defaults)) <= 1, (
         f"{path.name}: OMNI_XPU_DEVICE has conflicting defaults {sorted(set(defaults))}; "
         "one variable cannot select two architectures"
+    )
+
+
+@pytest.mark.parametrize("path", _SETUP_FILES, ids=lambda p: f"{p.parent.name}/{p.name}")
+def test_aot_target_names_both_battlemage_dies(path):
+    """B60 and B70 are different dies, so name both.
+
+    `bmg` is the family target: it builds one image that runs on either part,
+    which is correct but forgoes per-die specialization, and any tuning keyed
+    on `intel_gpu_bmg_g31` would silently not match. ocloc takes a comma list
+    and emits an image per die -- verified by building the MoE translation
+    unit for `bmg-g21,bmg-g31`, which reports a build per die and produces an
+    object 2.3x the single-die size.
+
+    The list is defined once per setup file so the modules cannot drift apart.
+    """
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    src = path.read_text()
+    assert 'BMG_DEVICES = "bmg-g21,bmg-g31"' in src, (
+        f"{path.name}: the AOT device list must be a single named constant "
+        "covering both dies"
+    )
+    checked = 0
+    for args in _sycl_arg_lists(path):
+        for a in args:
+            if "-device " not in a:
+                continue
+            checked += 1
+            assert "BMG_DEVICES" in a or "_DEV" in a, (
+                f"{path.name}: `{a}` names a device literally instead of "
+                "using BMG_DEVICES, so it will not track the die list"
+            )
+    assert checked >= 3, (
+        f"{path.name}: examined {checked} device flag(s); the anchor moved "
+        "and this test stopped checking them"
     )

@@ -9,6 +9,13 @@ from esimd_build_extention import BuildExtension
 root = Path(__file__).parent.resolve()
 
 import torch
+
+# Both Battlemage dies get their own device binary: B60 is BMG-G21 and B70 is
+# BMG-G31. The family target `bmg` builds one binary that runs on both, so a
+# G31-specific specialization would silently not be selected. ocloc accepts the
+# pair and emits an archive holding both IP versions.
+BMG_DEVICES = "bmg-g21,bmg-g31"
+
 torch_include = str(Path(torch.__file__).parent / "include")
 dnnl_component_root = Path(
     os.environ.get("DNNLROOT", "/opt/intel/oneapi/dnnl/2025.3")
@@ -33,7 +40,7 @@ ext_modules = [
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", "-device bmg -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", f"-device {BMG_DEVICES} -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
@@ -55,7 +62,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES}",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -82,7 +89,7 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", "-device bmg -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", f"-device {BMG_DEVICES} -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
@@ -128,7 +135,7 @@ ext_modules.append(
 # [skip-ptl-topk-v2]         extra_compile_args={
 # [skip-ptl-topk-v2]             "cxx": ["-O3", "-std=c++17"],
 # [skip-ptl-topk-v2]             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-# [skip-ptl-topk-v2]                      "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+# [skip-ptl-topk-v2]                      "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES}",
 # [skip-ptl-topk-v2]                      f"-I{torch_include}"],
 # [skip-ptl-topk-v2]         },
 # [skip-ptl-topk-v2]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -149,7 +156,7 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", "-device bmg -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", f"-device {BMG_DEVICES} -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
@@ -180,7 +187,7 @@ ext_modules.append(
                 "-fsycl-device-code-split=per_kernel",
                 "-fsycl-targets=spir64_gen",
                 "-Xs",
-                "-device bmg",
+                f"-device {BMG_DEVICES}",
                 f"-I{torch_include}",
             ],
         },
@@ -204,7 +211,7 @@ ext_modules.append(
 # The default is bmg, matching _PREFILL_DPAS_DEV below: both read this one
 # variable, so a different default here builds one of them for an architecture
 # the other is not targeting, and this repo ships B60/B70.
-_MOE_GROUPED_DEV = os.environ.get("OMNI_XPU_DEVICE", "bmg")
+_MOE_GROUPED_DEV = os.environ.get("OMNI_XPU_DEVICE", BMG_DEVICES)
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_sglang.moe_grouped_gguf_xpu",
@@ -232,7 +239,7 @@ ext_modules.append(
 # fp16 prefill path on Xe. DPAS/XMX kernel -> AOT for the actual GPU (JIT DPAS
 # is unreliable) with -doubleGRF (heavy per-thread register state). Op namespace
 # stays custom_esimd_kernels_vllm (matches the ported op + xpu_backend call).
-_PREFILL_DPAS_DEV = os.environ.get("OMNI_XPU_DEVICE", "bmg")
+_PREFILL_DPAS_DEV = os.environ.get("OMNI_XPU_DEVICE", BMG_DEVICES)
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_sglang.custom_esimd_kernels_prefill_dpas",
@@ -316,7 +323,7 @@ ext_modules.append(
 # [skip-ptl-moe-int4-prefill]         extra_compile_args={
 # [skip-ptl-moe-int4-prefill]             "cxx": ["-O3", "-std=c++20"],
 # [skip-ptl-moe-int4-prefill]             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-# [skip-ptl-moe-int4-prefill]                      "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+# [skip-ptl-moe-int4-prefill]                      "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES}",
 # [skip-ptl-moe-int4-prefill]                      f"-I{torch_include}"],
 # [skip-ptl-moe-int4-prefill]         },
 # [skip-ptl-moe-int4-prefill]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -355,7 +362,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES}",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -380,7 +387,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES}",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -405,7 +412,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg -options -doubleGRF",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES} -options -doubleGRF",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
@@ -428,7 +435,7 @@ ext_modules.append(
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES}",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
