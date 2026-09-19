@@ -60,6 +60,9 @@ ARG no_proxy
 ARG VLLM_VERSION=v0.26.0
 # vllm-xpu-kernels pinned base commit (aligned with Dockerfile.dev).
 ARG VLLM_XPU_KERNELS_COMMIT=a6929869587fa6c40dbe393eedc96eeab076bfbb
+# oneAPI DPC++ providing sycl_ext_oneapi_inter_process_communication, which the
+# custom all-reduce binds. Installed over the base toolchain in the builder.
+ARG ONEAPI_COMPILER_VERSION=2026.1.1-325
 # Build parallelism. SYCL AOT compilation peaks at 2-4 GB per translation unit,
 # so this is bounded by builder RAM rather than core count: budget ~4 GB per job.
 # Override with --build-arg MAX_JOBS=<n>.
@@ -82,14 +85,35 @@ SHELL ["bash", "-c"]
 COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
 COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 
-# --- build tooling (the oneAPI DPC++ compiler is already in the OMIX devel base) ---
+# --- build tooling (the OMIX devel base carries a DPC++ compiler already) ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
-        git curl ca-certificates \
+        git curl ca-certificates gpg wget \
         python3-dev python3-venv python3-pip \
         ninja-build cmake pkg-config numactl
+
+# --- oneAPI ${ONEAPI_COMPILER_VERSION} from the Intel APT repo, the toolchain
+#     setup_system.sh provisions on a development host.
+#
+#     The custom all-reduce binds sycl_ext_oneapi_inter_process_communication
+#     (sycl/ext/oneapi/experimental/ipc_memory.hpp). Its APIs are __SYCL_EXPORT,
+#     so both the header and the matching libsycl exports are required; the
+#     compiler the OMIX base ships predates the extension and has neither.
+#
+#     setvars.sh resolves `latest` per component, so installing beside the base
+#     toolchain is what selects this compiler for every SYCL build step below. ---
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+        | gpg --dearmor > /usr/share/keyrings/intel-oneapi-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/intel-oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+        > /etc/apt/sources.list.d/intel-oneapi.list && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends --fix-missing \
+        intel-oneapi-compiler-dpcpp-cpp=${ONEAPI_COMPILER_VERSION} && \
+    test -f /opt/intel/oneapi/compiler/latest/include/sycl/ext/oneapi/experimental/ipc_memory.hpp
 
 # --- isolated build venv (avoid OMIX system-python PEP 668 block; clean resolution) ---
 RUN python3 -m venv ${VIRTUAL_ENV}
@@ -172,6 +196,10 @@ ARG https_proxy
 ARG no_proxy
 ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
 ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
+# Redistributable half of ONEAPI_COMPILER_VERSION: ships libsycl without the
+# toolchain. The package name carries the release, so both move together.
+ARG ONEAPI_RUNTIME_PACKAGE=intel-oneapi-compiler-dpcpp-cpp-runtime-2026.1
+ARG ONEAPI_RUNTIME_VERSION=2026.1.1-325
 
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
@@ -184,12 +212,25 @@ ENV VIRTUAL_ENV=/opt/venv \
 
 WORKDIR /llm-scaler/vllm
 
+# The oneAPI runtime here must be the one the builder compiled against: the
+# all-reduce module resolves libsycl.so.9, which the base toolchain does not
+# provide. Installing the same pinned compiler repoints `latest`, so setvars.sh
+# in the ENTRYPOINT puts that libsycl on the loader path.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl \
+        ca-certificates gpg wget \
         python3-dev python3-venv python3-pip && \
+    wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+        | gpg --dearmor > /usr/share/keyrings/intel-oneapi-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/intel-oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+        > /etc/apt/sources.list.d/intel-oneapi.list && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends --fix-missing \
+        ${ONEAPI_RUNTIME_PACKAGE}=${ONEAPI_RUNTIME_VERSION} && \
+    test -e /opt/intel/oneapi/compiler/latest/lib/libsycl.so.9 && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m venv ${VIRTUAL_ENV} && \
     pip install --upgrade pip wheel setuptools && \

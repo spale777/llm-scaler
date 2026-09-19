@@ -26,8 +26,12 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics-archive-keyri
 sudo apt-get update
 
 echo "=== Step 2/4: Intel oneAPI toolkit (DPC++, MKL, CCL, PTI) ==="
+# The custom all-reduce binds sycl_ext_oneapi_inter_process_communication, which
+# no compiler before 2026.1 provides. Pinned so a host built here and the
+# container image (vllm/docker/Dockerfile, ONEAPI_COMPILER_VERSION) agree.
+ONEAPI_COMPILER_VERSION="${ONEAPI_COMPILER_VERSION:-2026.1.1-325}"
 sudo apt-get install -y --no-install-recommends \
-    intel-oneapi-compiler-dpcpp-cpp \
+    "intel-oneapi-compiler-dpcpp-cpp=${ONEAPI_COMPILER_VERSION}" \
     intel-oneapi-mkl-devel \
     intel-oneapi-ccl-devel \
     intel-pti
@@ -57,6 +61,14 @@ set +u
 source /opt/intel/oneapi/setvars.sh --force
 set -u
 icpx --version
+
+# The all-reduce binding fails to compile without this header, well after setup.
+if [[ ! -f /opt/intel/oneapi/compiler/latest/include/sycl/ext/oneapi/experimental/ipc_memory.hpp ]]; then
+    echo "  ERROR: sycl_ext_oneapi_inter_process_communication is missing from" >&2
+    echo "  $(readlink -f /opt/intel/oneapi/compiler/latest) — the custom all-reduce cannot build." >&2
+    exit 1
+fi
+echo "  sycl_ext_oneapi_inter_process_communication: present"
 
 echo ""
 echo "=== Checking for Intel GPUs ==="

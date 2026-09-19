@@ -319,10 +319,21 @@ def _get_sycl_dlink_flags(compile_flags):
     ]
     if target_flag is not None:
         dlink_flags.append(target_flag)
+
+    # The backend options an extension sets belong to the device image, which
+    # this step produces: -doubleGRF and -vc-codegen decide how the kernels are
+    # compiled, so a link that substitutes a bare -device builds something the
+    # module did not ask for. The arch list is the fallback for an extension
+    # that names no target of its own.
+    backend_flag = next(
+        (flag for flag in reversed(compile_flags)
+         if flag.startswith('-device ')),
+        None,
+    )
     dlink_flags.extend([
         '-fsycl-link',
         '--offload-compress',
-        f'-Xs "-device {_get_sycl_arch_list()}"',
+        f'-Xs "{backend_flag or f"-device {_get_sycl_arch_list()}"}"',
     ])
     return dlink_flags
 
@@ -718,6 +729,23 @@ class BuildExtension(build_ext):
                     if not os.path.isabs(paths[i]):
                         paths[i] = os.path.abspath(paths[i])
 
+        def drop_prefix_include_inplace(paths):
+            """Remove the environment's own include dir from the search path.
+
+            torch's intel-sycl-rt dependency installs a second, older SYCL
+            header tree under sys.prefix/include. distutils puts that directory
+            on every extension's command line, so a kernel can compile against
+            a mix of two toolchain releases -- the wrapper headers from one, the
+            macros they rely on from the other. The compiler owns these headers.
+            Python.h is reached through the interpreter's own include dir, which
+            distutils passes separately, so nothing here needs this one.
+            """
+            if paths is None:
+                return
+            prefix_include = os.path.join(sys.prefix, 'include')
+            paths[:] = [p for p in paths
+                        if os.path.normpath(p) != os.path.normpath(prefix_include)]
+
         def unix_wrap_single_compile(obj, src, ext, cc_args, extra_postargs, pp_opts) -> None:
             # Copy before we make any modifications.
             cflags = copy.deepcopy(extra_postargs)
@@ -767,6 +795,7 @@ class BuildExtension(build_ext):
 
             # See Note [Absolute include_dirs]
             convert_to_absolute_paths_inplace(self.compiler.include_dirs)
+            drop_prefix_include_inplace(self.compiler.include_dirs)
 
             _, objects, extra_postargs, pp_opts, _ = \
                 self.compiler._setup_compile(output_dir, macros,
@@ -955,6 +984,7 @@ class BuildExtension(build_ext):
             # To be consistent with jit extension, we allow user to enter relative include_dirs
             # in setuptools.setup, and we convert the relative path to absolute path here.
             convert_to_absolute_paths_inplace(self.compiler.include_dirs)
+            drop_prefix_include_inplace(self.compiler.include_dirs)
 
             _, objects, extra_postargs, pp_opts, _ = \
                 self.compiler._setup_compile(output_dir, macros,
@@ -1037,6 +1067,15 @@ class BuildExtension(build_ext):
                 self.compiler.compile = unix_wrap_ninja_compile
             else:
                 self.compiler._compile = unix_wrap_single_compile
+
+        # Each extension is a three-node graph -- two compiles and a device
+        # link -- so ninja's own -j cannot fill a machine no matter how high
+        # MAX_JOBS goes; the width is across extensions, not within one. Each
+        # AOT module also runs ocloc once per target die, which is the bulk of
+        # the wall clock. MAX_JOBS bounds both, since the two nest: it caps the
+        # extensions in flight here and the jobs ninja runs inside each.
+        if self.parallel is None:
+            self.parallel = _get_num_workers(verbose=False) or os.cpu_count()
 
         build_ext.build_extensions(self)
 
@@ -2159,7 +2198,15 @@ def _write_ninja_file_and_compile_objects(
         with_cuda = any(map(_is_cuda_file, sources))
     if with_sycl is None:
         with_sycl = any(map(_is_sycl_file, sources))
-    build_file_path = os.path.join(build_directory, 'build.ninja')
+    # One file per extension, not one per directory: every extension compiles
+    # into the same build_directory, so a shared name lets concurrent builds
+    # overwrite each other's plan. The first object's stem is unique per
+    # extension and stable across runs, which keeps ninja's incremental state.
+    ninja_name = 'build.ninja'
+    if objects:
+        stem = os.path.splitext(os.path.basename(objects[0]))[0]
+        ninja_name = f'build.{stem}.ninja'
+    build_file_path = os.path.join(build_directory, ninja_name)
     if verbose:
         print(f'Emitting ninja build file {build_file_path}...', file=sys.stderr)
 
@@ -2193,7 +2240,8 @@ def _write_ninja_file_and_compile_objects(
         verbose,
         # It would be better if we could tell users the name of the extension
         # that failed to build but there isn't a good way to get it here.
-        error_prefix='Error compiling objects for extension')
+        error_prefix='Error compiling objects for extension',
+        build_file_name=ninja_name)
 
 
 def _write_ninja_file_and_build_library(
@@ -2501,8 +2549,11 @@ def _get_vc_env(vc_arch: str) -> dict[str, str]:
         return _msvccompiler._get_vc_env(vc_arch)
 
 
-def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
+def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str,
+                     build_file_name: str = 'build.ninja') -> None:
     command = ['ninja', '-v']
+    if build_file_name != 'build.ninja':
+        command.extend(['-f', build_file_name])
     num_workers = _get_num_workers(verbose)
     if num_workers is not None:
         command.extend(['-j', str(num_workers)])

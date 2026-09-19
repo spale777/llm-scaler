@@ -165,10 +165,16 @@ ext_modules.append(
         include_dirs=[
             root / "csrc" / "eagle",
         ],
+        # -vc-codegen is required here: sycl-post-link splits these 17 kernels
+        # into two ESIMD images, and without it ocloc rejects the bundle as
+        # carrying more than one module with an entry point. Every kernel in
+        # this module is ESIMD, so selecting the vector backend for the whole
+        # image costs nothing.
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", f"-device {BMG_DEVICES}",
+                     "-fsycl-targets=spir64_gen",
+                     "-Xs", f"-device {BMG_DEVICES} -options -vc-codegen",
                      f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],

@@ -156,7 +156,12 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", f"-device {BMG_DEVICES} -options -cl-intel-enable-auto-fma", f"-I{torch_include}"],
+            # -vc-codegen is required: sycl-post-link splits this module's
+            # kernels into several ESIMD images, and without it ocloc rejects
+            # the bundle as carrying more than one module with an entry point.
+            # It selects the vector backend, which refuses the OpenCL option
+            # -cl-intel-enable-auto-fma, so the two cannot both be passed.
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel", "-fsycl-targets=spir64_gen", "-funroll-loops", "-Xs", f"-device {BMG_DEVICES} -options -vc-codegen", f"-I{torch_include}"],
         },
         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
         py_limited_api=False,
